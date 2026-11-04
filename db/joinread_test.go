@@ -176,22 +176,22 @@ func TestNarrowedReadMatchesWholeRead(t *testing.T) {
 func TestNarrowedReadActuallyNarrows(t *testing.T) {
 	spec := readProjectionSpecs()["condition reads an unprojected attribute"]
 	p := planJoinRead(spec)
-	if p.left == nil || p.right == nil {
-		t.Fatalf("expected both sides narrowed, got left=%v right=%v", p.left, p.right)
+	if p[0] == nil || p[1] == nil {
+		t.Fatalf("expected both sides narrowed, got left=%v right=%v", p[0], p[1])
 	}
 	for _, want := range []string{"ClusterId", "Owner", "RequestMemory"} {
-		if !hasProjAttr(p.left, want) {
-			t.Errorf("left read projection %v is missing %s", p.left, want)
+		if !hasProjAttr(p[0], want) {
+			t.Errorf("left read projection %v is missing %s", p[0], want)
 		}
 	}
 	for _, want := range []string{"ClusterId", "NumShadowStarts", "RequestMemory"} {
-		if !hasProjAttr(p.right, want) {
-			t.Errorf("right read projection %v is missing %s", p.right, want)
+		if !hasProjAttr(p[1], want) {
+			t.Errorf("right read projection %v is missing %s", p[1], want)
 		}
 	}
 	// Filler is read by nothing and carried by nothing.
-	if hasProjAttr(p.left, "Filler") || hasProjAttr(p.right, "Filler") {
-		t.Errorf("read projection carries an attribute nothing asked for: left=%v right=%v", p.left, p.right)
+	if hasProjAttr(p[0], "Filler") || hasProjAttr(p[1], "Filler") {
+		t.Errorf("read projection carries an attribute nothing asked for: left=%v right=%v", p[0], p[1])
 	}
 }
 
@@ -201,8 +201,8 @@ func TestNarrowedReadActuallyNarrows(t *testing.T) {
 func TestDeclinedTermReadsWholeAds(t *testing.T) {
 	spec := readProjectionSpecs()["a declined term"]
 	p := planJoinRead(spec)
-	if p.left != nil || p.right != nil {
-		t.Fatalf("a declined term must take both projections down, got left=%v right=%v", p.left, p.right)
+	if p[0] != nil || p[1] != nil {
+		t.Fatalf("a declined term must take both projections down, got left=%v right=%v", p[0], p[1])
 	}
 }
 
@@ -211,10 +211,10 @@ func TestDeclinedTermReadsWholeAds(t *testing.T) {
 func TestWholeAdProjectionIsNotNarrowed(t *testing.T) {
 	spec := readProjectionSpecs()["left side carries the whole ad"]
 	p := planJoinRead(spec)
-	if p.left != nil {
-		t.Errorf("a nil output projection must read the whole ad, got %v", p.left)
+	if p[0] != nil {
+		t.Errorf("a nil output projection must read the whole ad, got %v", p[0])
 	}
-	if p.right == nil {
+	if p[1] == nil {
 		t.Error("the other side should still be narrowed")
 	}
 }
@@ -225,10 +225,10 @@ func TestNonLiteralEquiHalfDeclinesOneSide(t *testing.T) {
 	spec := readProjectionSpecs()["plain equi"]
 	spec.Equi = []JoinEqui{{Left: `strcat(Owner, "")`, Right: "ClusterId"}}
 	p := planJoinRead(spec)
-	if p.left != nil {
-		t.Errorf("an unanalysable left half must read the whole left ad, got %v", p.left)
+	if p[0] != nil {
+		t.Errorf("an unanalysable left half must read the whole left ad, got %v", p[0])
 	}
-	if p.right == nil {
+	if p[1] == nil {
 		t.Error("the right half is a bare name; that side should stay narrow")
 	}
 }

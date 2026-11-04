@@ -95,6 +95,21 @@ type blockVecSource struct {
 
 	// dictBuf is the parse buffer for PRUNING, which reads a dictionary and does not retain it.
 	dictBuf [][]byte
+
+	// refs memoizes attribute-name resolution across the blocks of one scan (see resolveRef).
+	refs []colRef
+}
+
+// colRef is one attribute name's resolution, held across blocks.
+//
+// The name is interned once for the whole scan; the field index is recomputed when the schema under
+// it changes, which is once per segment rather than once per block.
+type colRef struct {
+	name   string
+	id     uint32
+	known  bool      // name is interned at all; a name that is not cannot be any schema's field
+	schema *adSchema // the schema idx was computed against
+	idx    int       // index into schema.fields, or -1 when the schema does not carry the field
 }
 
 // LoadColumn resolves an attribute to a field of this block's schema and loads it as a vector.
@@ -107,12 +122,11 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *
 		return false
 	}
 	dst.Dict, dst.Raw = nil, nil // a slot reused from the stack must not carry a previous block's column
-	id, ok := s.c.intern.LookupID(name)
-	if !ok {
+	id, idx, known := s.resolveRef(name)
+	if !known {
 		return false
 	}
-	idx, ok := s.blk.schema.byID[id]
-	if !ok {
+	if idx < 0 {
 		// Not a base field. A group schema may carry it, in which case the column is presented at
 		// full length with non-members undefined (see loadGroupColumn).
 		if loaded, handled := s.loadGroupColumn(name, dst); handled {
@@ -130,6 +144,52 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *
 		return s.loadNum(idx, f, id, dst)
 	}
 	return false
+}
+
+// resolveRef resolves an attribute name to its interned id and this block's field index, memoized
+// across the blocks of a scan.
+//
+// known=false means the name is not interned at all, so no schema can carry it. idx=-1 means it is
+// interned but not a base field of this block's schema, which is the group-column case.
+//
+// WHY A MEMO AND NOT THE TWO LOOKUPS. A scan rebinds this source once per block, and the vector
+// executor asks for each column it has not cached once per block as well, so both lookups ran on
+// every block of every segment. Neither answer changes that often: the intern id does not change at
+// all within a scan, and the field index changes only when the schema does, which is once per
+// segment. On the OSPool scan fixture the interning alone was 11% of the single-term scan, three
+// quarters of it hashing the same attribute name 1759 times, the rest taking the table's read lock
+// to do it.
+//
+// A LINEAR SCAN, not a map: a query names a handful of attributes, and the executor hands back the
+// same string value every time, so the comparison settles on identical string headers rather than
+// on a hash and a memcmp.
+func (s *blockVecSource) resolveRef(name string) (id uint32, idx int, known bool) {
+	for i := range s.refs {
+		r := &s.refs[i]
+		if r.name != name {
+			continue
+		}
+		if !r.known {
+			return 0, -1, false
+		}
+		if r.schema != s.blk.schema {
+			r.schema, r.idx = s.blk.schema, -1
+			if j, ok := s.blk.schema.byID[r.id]; ok {
+				r.idx = j
+			}
+		}
+		return r.id, r.idx, true
+	}
+	r := colRef{name: name, idx: -1}
+	r.id, r.known = s.c.intern.LookupID(name)
+	if r.known {
+		r.schema = s.blk.schema
+		if j, ok := s.blk.schema.byID[r.id]; ok {
+			r.idx = j
+		}
+	}
+	s.refs = append(s.refs, r)
+	return r.id, r.idx, r.known
 }
 
 // loadStr loads a string column, aliasing rather than copying -- copying is what a string predicate cannot

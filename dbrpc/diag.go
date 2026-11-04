@@ -924,9 +924,13 @@ func schemaRebuildAction(t schemaScanTable, args []string, hotTopN int) (string,
 			"accelerator is unavailable here (encryption at rest)")
 	}
 	info := t.SchemaScanInfo()
+	// Report the row-native backlog alongside coverage. Coverage alone reads as "this table is
+	// columnar now" while the rewrite that actually moves attributes out of the records can still
+	// have most of the table to go, and reads fall back to whole records until it gets there.
 	return fmt.Sprintf("schema rebuilt: %d field(s), %d hot, %d/%d sealed segments covered, %d still "+
-		"on an earlier schema (maintenance converges them)",
-		info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments, info.StaleSegments), nil
+		"row-native, %d still on an earlier schema (maintenance converges them)",
+		info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments,
+		info.SealedSegments-info.ColumnarSegments, info.StaleSegments), nil
 }
 
 // schemaGroupsAction reports the candidate group schemas: attribute sets the base schema does not
