@@ -39,70 +39,155 @@ import (
 // A test that sets it must not run in parallel with another that does not.
 var forceWholeRead bool
 
-// joinReadProjection is what each side must be read with: a list of attribute names, or nil
-// for "the whole ad", which is both the safe answer and the old behaviour.
-type joinReadProjection struct {
-	left, right []string
-}
+// joinReadProjection is what each side must be read with, indexed by side: a list of
+// attribute names, or nil for "the whole ad", which is both the safe answer and the old
+// behaviour.
+type joinReadProjection [][]string
 
 // planJoinRead works out what each side has to carry.
 //
 // The sources of a reference to a side, which must be complete or the result is wrong:
 //
 //   - the output projection, which is what the caller asked to see;
-//   - the ON terms and the residual WHERE, written over the joined row, where a side is
-//     read as `alias.Attr`;
-//   - that side's half of each equality, written against the side's own ad, which the hash
-//     evaluates before any pair exists.
+//   - every step's ON terms and the residual WHERE, written over the joined row, where a
+//     side is read as `alias.Attr`;
+//   - each equality's two halves: the one reading the accumulated row, which names a side
+//     the same way the ON terms do, and the one reading the step's own table, written
+//     against that table's ad.
 //
-// A nil output projection means the caller wants the whole ad out, so there is nothing to
-// narrow to and the side is read whole.
+// A nil output projection on a side means the caller wants that side's whole ad, so there is
+// nothing to narrow it to and it is read whole.
 func planJoinRead(spec JoinSpec) joinReadProjection {
-	var p joinReadProjection
+	sides, steps, err := spec.chain()
+	if err != nil {
+		return make(joinReadProjection, 2)
+	}
+	whole := make(joinReadProjection, len(sides))
 	if forceWholeRead {
-		return p
+		return whole
 	}
-	if spec.Left.Project == nil && spec.Right.Project == nil {
-		return p
+	anyProjected := false
+	for _, sd := range sides {
+		if sd.Project != nil {
+			anyProjected = true
+		}
 	}
-	aliases := []string{spec.Left.Alias, spec.Right.Alias}
-	left, right := newAttrSet(), newAttrSet()
-	sides := [2]*attrSet{left, right}
+	if !anyProjected {
+		return whole
+	}
+	aliases := make([]string, len(sides))
+	for i, sd := range sides {
+		aliases[i] = sd.Alias
+	}
+	sets := make([]*attrSet, len(sides))
+	for i := range sets {
+		sets[i] = newAttrSet()
+	}
 
-	// The ON and WHERE terms read either side, so one declined term takes BOTH sides'
-	// projections away: the term may have been reaching into either.
-	for _, src := range append(append([]string{}, spec.Cond...), spec.Post...) {
-		q, err := vm.ParseAliases(src, aliases)
-		if err != nil || !q.AliasNative() {
-			return joinReadProjection{}
+	ok := make([]bool, len(sides))
+	for i := range ok {
+		ok[i] = true
+	}
+
+	// A term written over the joined row can read ANY side, so one declined term takes
+	// EVERY side's projection away: the term may have been reaching into any of them.
+	overRow := append([]string{}, spec.Post...)
+	for i := range steps {
+		st := &steps[i]
+		overRow = append(overRow, st.Cond...)
+	}
+	for _, src := range overRow {
+		if strings.TrimSpace(src) == "" {
+			continue
+		}
+		q, qerr := vm.ParseAliases(src, aliases)
+		if qerr != nil || !q.AliasNative() {
+			return whole
 		}
 		for _, r := range q.AliasRefs() {
-			if r.Alias < 0 || r.Alias >= len(sides) {
-				return joinReadProjection{}
+			if r.Alias < 0 || r.Alias >= len(sets) {
+				return whole
 			}
-			sides[r.Alias].add(r.Name)
+			sets[r.Alias].add(r.Name)
 		}
 	}
 
-	// Each equality half reads only its own side, so a half this cannot account for costs
-	// that side's projection and leaves the other narrow.
-	leftOK, rightOK := true, true
-	for _, e := range spec.Equi {
-		if !addSideRefs(left, e.Left) {
-			leftOK = false
-		}
-		if !addSideRefs(right, e.Right) {
-			rightOK = false
+	// An equality's halves are NOT terms over the joined row, and the difference matters:
+	// each half reads a known part of it, so a half this cannot account for costs only
+	// what that half could have read rather than every side's projection.
+	for i := range steps {
+		st := &steps[i]
+		side := sideIndexOf(sides, st.Side.Alias)
+		for _, e := range st.Equi {
+			// The table half reads this step's own table, written against that table's ad.
+			if !addSideRefs(sets[side], e.Right) {
+				ok[side] = false
+			}
+			if side == 1 {
+				// At the first step the row half may be bare -- written against the FROM
+				// side's own ad -- or qualified. Try the qualified reading first, so a
+				// chain that qualifies every step is read as narrowly as one that does
+				// not; fall back to the bare reading, which is the two-table spelling.
+				if q, qerr := vm.ParseAliases(e.Left, aliases); qerr == nil && q.AliasNative() {
+					if refs := q.AliasRefs(); len(refs) > 0 {
+						for _, r := range refs {
+							if r.Alias < 0 || r.Alias >= len(sets) {
+								return whole
+							}
+							sets[r.Alias].add(r.Name)
+						}
+						continue
+					}
+				}
+				if !addSideRefs(sets[0], e.Left) {
+					ok[0] = false
+				}
+				continue
+			}
+			// Past the first step the row half is qualified over the row, and can reach
+			// any side already folded in -- so a half this cannot read takes those sides'
+			// projections and leaves the later ones narrow.
+			q, qerr := vm.ParseAliases(e.Left, aliases)
+			if qerr != nil || !q.AliasNative() {
+				for i := 0; i < side; i++ {
+					ok[i] = false
+				}
+				continue
+			}
+			refs := q.AliasRefs()
+			if len(refs) == 0 {
+				for i := 0; i < side; i++ {
+					ok[i] = false
+				}
+				continue
+			}
+			for _, r := range refs {
+				if r.Alias < 0 || r.Alias >= len(sets) {
+					return whole
+				}
+				sets[r.Alias].add(r.Name)
+			}
 		}
 	}
 
-	if leftOK {
-		p.left = sides[0].union(spec.Left.Project)
+	out := make(joinReadProjection, len(sides))
+	for i := range sides {
+		if ok[i] {
+			out[i] = sets[i].union(sides[i].Project)
+		}
 	}
-	if rightOK {
-		p.right = sides[1].union(spec.Right.Project)
+	return out
+}
+
+// sideIndexOf finds a side by its alias. The chain built the alias list, so a miss cannot
+// happen; it answers 0 rather than panicking, which costs a wider read rather than a crash.
+func sideIndexOf(sides []JoinSide, alias string) int {
+	for i, s := range sides {
+		if strings.EqualFold(s.Alias, alias) {
+			return i
+		}
 	}
-	return p
+	return 0
 }
 
 // addSideRefs adds the attributes src reads on its own side, reporting false if it cannot

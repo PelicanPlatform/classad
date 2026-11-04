@@ -108,6 +108,13 @@ const (
 	// an error.
 	FeatValueDict Feature = "valuedict"
 
+	// FeatJoinChain is the join over a CHAIN of tables (opJoinChain), and FeatJoinChainWire
+	// is its wire-form reply (opJoinChainWire). Both postdate advertisement, so a peer that
+	// says nothing does not have them -- and a peer advertising FeatJoin says nothing about
+	// either, because a two-table join is what a build without chains has.
+	FeatJoinChain     Feature = "joinchain"
+	FeatJoinChainWire Feature = "joinchainwire"
+
 	// FeatEvalTypes is the EVALUATED half of the attribute type report (opAttrTypes with
 	// attrFlagEvaluate). Postdates advertisement, so silence is a no.
 	//
@@ -146,6 +153,8 @@ var serverFeatures = []Feature{
 	FeatTxnRead,
 	FeatJoin,
 	FeatJoinWire,
+	FeatJoinChain,
+	FeatJoinChainWire,
 	FeatQueryValues,
 	FeatValueDict,
 	FeatEvalTypes,
@@ -182,6 +191,19 @@ func (s *Server) SessionAttrs() map[string]string {
 		// kind of yes.
 		if f == FeatJoinWire {
 			if _, ok := s.cat.(joinWireCatalog); !ok {
+				continue
+			}
+		}
+		// A chain needs the same catalog AND a join that accepts more than two tables.
+		// The second is not implied by the first: a catalog from an older build has the
+		// same Join method and would answer a chain request with a different query.
+		if f == FeatJoinChain {
+			if _, ok := s.cat.(joinCatalog); !ok || !catalogJoinsChains(s.cat) {
+				continue
+			}
+		}
+		if f == FeatJoinChainWire {
+			if _, ok := s.cat.(joinWireCatalog); !ok || !catalogJoinsChains(s.cat) {
 				continue
 			}
 		}

@@ -134,11 +134,11 @@ func TestAliasedCondHoldsDeclines(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := &joinRow{ad: ad}
-	if _, ok := a.holds(row, row); ok {
+	if _, ok := a.holds([]*joinRow{row, row}); ok {
 		t.Fatal("holds accepted a term EvalAliased declined; the caller would keep an undefined answer")
 	}
 	// And the whole point: compileAliasedCond would not have produced this.
-	if compileAliasedCond([]string{`strcat(j.Owner, "x") == "alicex"`}, "j", "h") != nil {
+	if compileAliasedCond([]string{`strcat(j.Owner, "x") == "alicex"`}, []string{"j", "h"}) != nil {
 		t.Fatal("compileAliasedCond admitted a term that is not AliasNative")
 	}
 }
