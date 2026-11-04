@@ -51,32 +51,30 @@ import (
 //
 // ok=false is never an error: it means one of the sides cannot be spliced -- it arrived
 // decoded, or the caller wants its whole ad -- and the caller forms the row the ordinary way.
-func (p *joinPlan) spliceComposite(dst []byte, l, r *joinRow) ([]byte, bool) {
-	lb, lok := l.memberBody(p.leftProject)
-	if !lok {
-		return dst, false
-	}
-	rb, rok := r.memberBody(p.rightProject)
-	if !rok {
-		return dst, false
-	}
+func (p *joinPlan) spliceComposite(dst []byte, rows []*joinRow) ([]byte, bool) {
+	// Narrow every side first: one side that cannot be spliced takes the whole row down the
+	// fallback, and finding that out after writing a header would mean unwinding it.
+	bodies := make([]memberBody, len(rows))
 	n := 0
-	if lb.ok {
-		n++
-	}
-	if rb.ok {
-		n++
+	for i, r := range rows {
+		b, ok := r.memberBody(p.projects[i])
+		if !ok {
+			return dst, false
+		}
+		bodies[i] = b
+		if b.ok {
+			n++
+		}
 	}
 	// An inline-names header: self-contained, so the row decodes with no intern table, which
 	// is what a row crossing a wire has to be.
 	dst = append(dst, wireMagic, wireVersion, wireFlagInlineNames)
 	dst = binary.AppendUvarint(dst, 0)         // hot index: empty, see above
 	dst = binary.AppendUvarint(dst, uint64(n)) // attribute count
-	if lb.ok {
-		dst = appendMemberEntry(dst, p.leftAlias, lb)
-	}
-	if rb.ok {
-		dst = appendMemberEntry(dst, p.rightAlias, rb)
+	for i, b := range bodies {
+		if b.ok {
+			dst = appendMemberEntry(dst, p.aliases[i], b)
+		}
 	}
 	return dst, true
 }
@@ -204,8 +202,16 @@ var ErrJoinWireRedactNeedsProjection = errors.New(
 // beside it rather than replacing it because a joined row's consumer decides what it wants:
 // one that sorts or filters wants an object, and one that relays wants bytes.
 func (cat *Catalog) JoinWire(spec JoinSpec, want JoinLimits, redact bool, stats *JoinStats) (iter.Seq[[]byte], error) {
-	if redact && (spec.Left.Project == nil || spec.Right.Project == nil) {
-		return nil, ErrJoinWireRedactNeedsProjection
+	sides, steps, err := spec.chain()
+	if err != nil {
+		return nil, err
+	}
+	if redact {
+		for _, sd := range sides {
+			if sd.Project == nil {
+				return nil, ErrJoinWireRedactNeedsProjection
+			}
+		}
 	}
 	// Redact the PROJECTIONS, not the finished rows. spec is a value, so narrowing them here
 	// narrows what each member carries without touching what the join reads: planJoinRead
@@ -213,16 +219,22 @@ func (cat *Catalog) JoinWire(spec JoinSpec, want JoinLimits, redact bool, stats 
 	// attribute still decides which rows match -- it just does not leave the store.
 	spec.Left.Project = publicProjection(spec.Left.Project, redact)
 	spec.Right.Project = publicProjection(spec.Right.Project, redact)
+	if len(steps) > 0 && len(spec.Steps) > 0 {
+		spec.Steps = append([]JoinStep(nil), spec.Steps...)
+		for i := range spec.Steps {
+			spec.Steps[i].Side.Project = publicProjection(spec.Steps[i].Side.Project, redact)
+		}
+	}
 	limits := DefaultJoinLimits().clamp(want)
 	var buf []byte
-	return joinStream(cat, spec, limits, stats, func(p *joinPlan, l, r *joinRow) ([]byte, bool) {
-		if b, ok := p.spliceComposite(buf[:0], l, r); ok {
+	return joinStream(cat, spec, limits, stats, func(p *joinPlan, rows []*joinRow) ([]byte, bool) {
+		if b, ok := p.spliceComposite(buf[:0], rows); ok {
 			buf = b
 			return b, true
 		}
 		// A side this cannot splice: build the row and encode it, which is the same ad by a
 		// longer road.
-		buf = encodeCompositeInline(buf[:0], p.composite(l, r))
+		buf = encodeCompositeInline(buf[:0], p.composite(rows))
 		return buf, true
 	})
 }

@@ -859,23 +859,37 @@ func copyVec(dst, src *Vec) bool {
 	return true
 }
 
+// fitVec returns a vector of length n holding no form, reusing v's buffers when they are big enough.
+//
+// REUSE IS BY CAPACITY, NOT BY LENGTH. A batch is one block's records and the grouping policy makes
+// that count vary from block to block, so a check that reallocated whenever the length changed would
+// reallocate on nearly every block. Reslicing serves a shorter batch from the same buffers, a longer
+// one still allocates, and the vector settles at the widest block the scan meets.
+//
+// Only I and Hi are measured. newVec makes all five buffers at once and make() returns capacity equal
+// to the length asked for, so one slice of each width answers for the rest.
+//
+// Dict is cleared as well as Raw: these buffers are pooled across queries, so a vector that served a
+// dictionary-encoded column would otherwise still point at that block's dictionary. Harmless today --
+// a resolver is only consulted for a VsDictCode element and nothing else writes one -- but a stale
+// pointer to another table's dictionary is not a thing to leave lying in a reused buffer.
+func fitVec(v *Vec, n int) *Vec {
+	if v == nil || cap(v.I) < n || cap(v.Hi) < maskWords(n) {
+		return newVec(n)
+	}
+	v.n = n
+	v.I, v.S, v.St = v.I[:n], v.S[:n], v.St[:n]
+	v.Hi, v.Lo = v.Hi[:maskWords(n)], v.Lo[:maskWords(n)]
+	v.Mask, v.Const, v.Raw, v.Dict = false, false, nil, nil
+	return v
+}
+
 func (s *VecScratch) push() *Vec {
 	if s.depth == len(s.stack) {
-		s.stack = append(s.stack, newVec(s.n))
+		s.stack = append(s.stack, nil)
 	}
-	v := s.stack[s.depth]
-	if cap(v.I) < s.n || cap(v.Hi) < maskWords(s.n) {
-		v = newVec(s.n)
-		s.stack[s.depth] = v
-	}
-	v.n = s.n
-	v.I, v.S, v.St = v.I[:s.n], v.S[:s.n], v.St[:s.n]
-	v.Hi, v.Lo = v.Hi[:maskWords(s.n)], v.Lo[:maskWords(s.n)]
-	// Dict as well as Raw: the stack is pooled across queries, so a slot that served a dictionary-encoded
-	// column would otherwise still point at that block's dictionary. Harmless today -- a resolver is only
-	// consulted for a VsDictCode element and nothing else writes one -- but a stale pointer to another
-	// table's dictionary is not a thing to leave lying in a reused buffer.
-	v.Mask, v.Const, v.Raw, v.Dict = false, false, nil, nil
+	v := fitVec(s.stack[s.depth], s.n)
+	s.stack[s.depth] = v
 	s.depth++
 	return v
 }

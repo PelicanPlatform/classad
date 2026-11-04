@@ -103,7 +103,7 @@ func TestSpliceIsTakenForTheOrdinaryShape(t *testing.T) {
 	if side == nil {
 		t.Fatal("the fixture produced no row")
 	}
-	if _, ok := p.spliceComposite(nil, side, nil); !ok {
+	if _, ok := p.spliceComposite(nil, []*joinRow{side, nil}); !ok {
 		t.Fatal("the splice declined a narrowed wire row, which is the shape it exists for")
 	}
 	if side.ad != nil {
@@ -115,18 +115,18 @@ func TestSpliceIsTakenForTheOrdinaryShape(t *testing.T) {
 // silent: a side with no bytes has nothing to copy, and a whole-ad projection has no narrowed
 // body. Each must decline so the caller builds the row the ordinary way.
 func TestSpliceDeclinesWhatItCannotCopy(t *testing.T) {
-	p := &joinPlan{leftAlias: "h", rightAlias: "e",
-		leftProject: []string{"ClusterId"}, rightProject: []string{"NumShadowStarts"}}
+	p := &joinPlan{aliases: []string{"h", "e"},
+		projects: [][]string{{"ClusterId"}, {"NumShadowStarts"}}}
 
 	ad, err := classad.Parse(`[ ClusterId = 1 ]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := p.spliceComposite(nil, &joinRow{ad: ad}, nil); ok {
+	if _, ok := p.spliceComposite(nil, []*joinRow{{ad: ad}, nil}); ok {
 		t.Error("a side that arrived decoded has no bytes to splice; it must decline")
 	}
 
-	whole := &joinPlan{leftAlias: "h", rightAlias: "e"} // nil projections: the whole ad
+	whole := &joinPlan{aliases: []string{"h", "e"}, projects: make([][]string, 2)} // nil projections: the whole ad
 	cat := rowFormFixture(t)
 	d, _ := cat.Table("history")
 	rows, qerr := d.QueryRawWireRefs("ClusterId == 1", []string{"ClusterId"}, false)
@@ -138,7 +138,7 @@ func TestSpliceDeclinesWhatItCannotCopy(t *testing.T) {
 		side = r
 		break
 	}
-	if _, ok := whole.spliceComposite(nil, side, nil); ok {
+	if _, ok := whole.spliceComposite(nil, []*joinRow{side, nil}); ok {
 		t.Error("a whole-ad projection has no narrowed body to copy; it must decline")
 	}
 }
@@ -238,8 +238,8 @@ func TestSpliceDeclinesAnInternedRow(t *testing.T) {
 	if _, ok := row.memberBody([]string{"ClusterId", "Owner"}); ok {
 		t.Fatal("memberBody accepted an interned row; it would have spliced an empty member")
 	}
-	p := &joinPlan{leftAlias: "h", rightAlias: "e", leftProject: []string{"ClusterId"}}
-	if _, ok := p.spliceComposite(nil, row, nil); ok {
+	p := &joinPlan{aliases: []string{"h", "e"}, projects: [][]string{{"ClusterId"}, nil}}
+	if _, ok := p.spliceComposite(nil, []*joinRow{row, nil}); ok {
 		t.Fatal("the splice accepted an interned row")
 	}
 }

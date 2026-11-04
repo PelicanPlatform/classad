@@ -570,39 +570,6 @@ func columnSource(ref tableRef, constraint string, attrs []string, redact bool, 
 	return true
 }
 
-// appendBatch appends row r of a column batch, boxing each cell as the encoder holds them.
-//
-// STRINGS ARE COPIED. The encoder holds its values until a flush that may be several batches
-// away, and a batch's string is an unsafe.String over the block's decompressed region rather than
-// a copy of it -- so retaining one pins that whole region until the batch is encoded and sent.
-//
-// It is a RETENTION fix rather than a correctness one, and worth saying so: a probe that retained
-// 20000 of them, under a block cache far too small to hold the table, read back every value
-// correctly. What it was holding to do that is the point.
-func (e *valueEncoder) appendBatch(b *collections.Batch, row int) {
-	for i := range e.cols {
-		v := classad.NewUndefinedValue()
-		if i < len(b.Cols) {
-			col := &b.Cols[i]
-			switch col.Kind[row] {
-			case collections.ValueInt:
-				v = classad.NewIntValue(col.Int(row))
-			case collections.ValueReal:
-				v = classad.NewRealValue(col.Float(row))
-			case collections.ValueBool:
-				v = classad.NewBoolValue(col.Bool(row))
-			case collections.ValueString:
-				v = classad.NewStringValue(e.intern(col.Text(row)))
-			case collections.ValueUndefined:
-			default:
-				v = classad.NewErrorValue()
-			}
-		}
-		e.cols[i] = append(e.cols[i], v)
-	}
-	e.rows++
-}
-
 // valueEncoder accumulates one batch column by column. Values are held as classad.Value until
 // the batch is complete, because a column's kind is a property of the whole batch: deciding it
 // from the first row would let one odd row at the front demote a column that is otherwise
@@ -641,6 +608,39 @@ type valueEncoder struct {
 	// KB by append, reallocating and copying about a dozen times on the way -- half of the
 	// read's allocated bytes, all of it binary.AppendUint64 growing the slice.
 	frameCap int
+}
+
+// appendBatch appends row r of a column batch, boxing each cell as the encoder holds them.
+//
+// STRINGS ARE COPIED. The encoder holds its values until a flush that may be several batches
+// away, and a batch's string is an unsafe.String over the block's decompressed region rather than
+// a copy of it -- so retaining one pins that whole region until the batch is encoded and sent.
+//
+// It is a RETENTION fix rather than a correctness one, and worth saying so: a probe that retained
+// 20000 of them, under a block cache far too small to hold the table, read back every value
+// correctly. What it was holding to do that is the point.
+func (e *valueEncoder) appendBatch(b *collections.Batch, row int) {
+	for i := range e.cols {
+		v := classad.NewUndefinedValue()
+		if i < len(b.Cols) {
+			col := &b.Cols[i]
+			switch col.Kind[row] {
+			case collections.ValueInt:
+				v = classad.NewIntValue(col.Int(row))
+			case collections.ValueReal:
+				v = classad.NewRealValue(col.Float(row))
+			case collections.ValueBool:
+				v = classad.NewBoolValue(col.Bool(row))
+			case collections.ValueString:
+				v = classad.NewStringValue(e.intern(col.Text(row)))
+			case collections.ValueUndefined:
+			default:
+				v = classad.NewErrorValue()
+			}
+		}
+		e.cols[i] = append(e.cols[i], v)
+	}
+	e.rows++
 }
 
 // valueExc is one cell that did not pack into its column's dense form. At package level rather
@@ -883,8 +883,8 @@ func (e *valueEncoder) buildStringDict(vals []classad.Value) ([]int32, []string)
 		if v.Type() != classad.StringValue {
 			continue // an exception; it ships in the exception list either way
 		}
-		str, _ := v.StringValue()
-		plain += len(str) + 2 // the string plus its length prefix, near enough
+		str, _ := v.StringValue() //nolint:errcheck // the guard above established the type
+		plain += len(str) + 2     // the string plus its length prefix, near enough
 		c, ok := index[str]
 		if !ok {
 			c = int32(len(dict))

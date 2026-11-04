@@ -217,7 +217,7 @@ func TestInternCopiesOncePerDistinctValue(t *testing.T) {
 // sameStringData reports whether two strings share a backing array, which is how "the same copy"
 // is checked without comparing contents that are equal by construction.
 func sameStringData(a, b string) bool {
-	if len(a) != len(b) || len(a) == 0 {
+	if len(a) != len(b) || a == "" {
 		return a == b
 	}
 	return unsafe.StringData(a) == unsafe.StringData(b)
