@@ -97,8 +97,8 @@ func BenchmarkGet(b *testing.B) {
 				ad.InsertAttrString("Cmd", "/bin/sleep")
 				ad.InsertAttr("RequestCpus", int64(1+i%4))
 				ad.InsertAttr("QDate", int64(1790000000+i))
-				if err := c.Put(keys[i], ad); err != nil {
-					b.Fatal(err)
+				if putErr := c.Put(keys[i], ad); putErr != nil {
+					b.Fatal(putErr)
 				}
 			}
 			c.Close()

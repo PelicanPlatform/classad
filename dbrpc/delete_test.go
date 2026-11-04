@@ -18,8 +18,8 @@ func TestRPCDeleteWhere(t *testing.T) {
 	_ = tx.NewClassAd(context.Background(), "a", `Name = "a"`+"\n"+`State = "Idle"`)
 	_ = tx.NewClassAd(context.Background(), "b", `Name = "b"`+"\n"+`State = "Claimed"`)
 	_ = tx.NewClassAd(context.Background(), "c", `Name = "c"`+"\n"+`State = "Idle"`)
-	if err := tx.Commit(context.Background()); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(context.Background()); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// Bulk delete-by-constraint in one server-side call.

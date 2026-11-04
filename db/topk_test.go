@@ -27,8 +27,8 @@ func TestArchiveTopK(t *testing.T) {
 			status = 4 // the filtered subset
 			match++
 		}
-		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nProcId = %d\nJobStatus = %d", i, proc, status)); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nProcId = %d\nJobStatus = %d", i, proc, status)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 
@@ -90,8 +90,8 @@ func TestMutableTopK(t *testing.T) {
 		}
 		tx.NewClassAd(fmt.Sprintf("%d.0", i), mustAd(t, fmt.Sprintf("ClusterId = %d\nJobStatus = %d", i, st)))
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	rows, err := d.TopK("JobStatus == 4", []string{"ClusterId"}, "ClusterId", true, 2)
 	if err != nil {

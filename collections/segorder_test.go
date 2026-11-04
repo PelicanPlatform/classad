@@ -34,8 +34,8 @@ func TestSegmentOrderIsContentNotFilename(t *testing.T) {
 	const n = 400
 	for i := 0; i < n; i++ {
 		ad, _ := classad.ParseOld(fmt.Sprintf("ClusterId = %d\nPad = %q", i, strings.Repeat("z", 60)))
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 	newestBefore := newestClusterID(t, a)
@@ -58,11 +58,11 @@ func TestSegmentOrderIsContentNotFilename(t *testing.T) {
 	renamed := fmt.Sprintf("seg-%d.d%d.dat", nn+1000, od)
 	for _, suffix := range []string{"", ".idx"} {
 		src := filepath.Join(shardDir, oldest+suffix)
-		if _, err := os.Stat(src); err != nil {
+		if _, statErr := os.Stat(src); statErr != nil {
 			continue
 		}
-		if err := os.Rename(src, filepath.Join(shardDir, renamed+suffix)); err != nil {
-			t.Fatal(err)
+		if renameErr := os.Rename(src, filepath.Join(shardDir, renamed+suffix)); renameErr != nil {
+			t.Fatal(renameErr)
 		}
 	}
 

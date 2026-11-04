@@ -43,12 +43,12 @@ func TestRebuildDirSurvivesHashCollisions(t *testing.T) {
 	// Three versions of every key, so the winner map sees each hash many times over.
 	for v := 1; v <= 3; v++ {
 		for i := range keys {
-			ad, err := classad.Parse(fmt.Sprintf(`[ Owner="u%d"; Version=%d ]`, i, v))
-			if err != nil {
-				t.Fatal(err)
+			ad, perr := classad.Parse(fmt.Sprintf(`[ Owner="u%d"; Version=%d ]`, i, v))
+			if perr != nil {
+				t.Fatal(perr)
 			}
-			if err := c.Put(fmt.Appendf(nil, "k%02d", i), ad); err != nil {
-				t.Fatal(err)
+			if putErr := c.Put(fmt.Appendf(nil, "k%02d", i), ad); putErr != nil {
+				t.Fatal(putErr)
 			}
 		}
 	}
@@ -57,13 +57,13 @@ func TestRebuildDirSurvivesHashCollisions(t *testing.T) {
 			t.Fatalf("k%02d: delete reported nothing removed", i)
 		}
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Drop the snapshot so the reopen takes the record walk (rebuildDir), not the fast path.
-	if err := os.Remove(filepath.Join(dir, "0", dirSnapName)); err != nil {
-		t.Fatal(err)
+	if removeErr := os.Remove(filepath.Join(dir, "0", dirSnapName)); removeErr != nil {
+		t.Fatal(removeErr)
 	}
 	var scanned int
 	onDirSnapLoad = func(ok bool) {

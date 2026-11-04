@@ -201,11 +201,11 @@ func (d *decoder) adBody(depth int) (*ast.ClassAd, error) {
 		return nil, err
 	}
 	for i := uint64(0); i < hotCount; i++ {
-		if _, err := d.uvarint(); err != nil { // internID
-			return nil, err
+		if _, idErr := d.uvarint(); idErr != nil { // internID
+			return nil, idErr
 		}
-		if _, err := d.uvarint(); err != nil { // offset
-			return nil, err
+		if _, offErr := d.uvarint(); offErr != nil { // offset
+			return nil, offErr
 		}
 	}
 	attrCount, err := d.uvarint()

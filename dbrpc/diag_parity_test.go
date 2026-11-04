@@ -65,8 +65,8 @@ func TestDiagnosticsFieldsPopulatedForBothKinds(t *testing.T) {
 			t.Fatalf("staging ad %d failed", i)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
 		SegmentSize: 1 << 16, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"RequestMemory"},

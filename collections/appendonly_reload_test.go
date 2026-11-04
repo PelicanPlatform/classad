@@ -22,12 +22,12 @@ func TestAppendOnlyReload(t *testing.T) {
 		if perr != nil {
 			t.Fatal(perr)
 		}
-		if err := c.Put([]byte("dup"), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte("dup"), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	c2, err := Open(Options{AppendOnly: true, Dir: dir, SegmentSize: 1 << 14})

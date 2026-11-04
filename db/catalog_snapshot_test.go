@@ -78,8 +78,8 @@ func TestCatalogSnapshotCrossPool(t *testing.T) {
 	a, _ := src.CreateTable("a")
 	fillTable(t, a, "x", 40)
 	var snap bytes.Buffer
-	if err := src.Snapshot(&snap); err != nil {
-		t.Fatal(err)
+	if snapshotErr := src.Snapshot(&snap); snapshotErr != nil {
+		t.Fatal(snapshotErr)
 	}
 	src.Close()
 

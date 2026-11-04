@@ -20,8 +20,8 @@ func TestTruncatePersistent(t *testing.T) {
 	}
 	const n = 300
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	if c.Len() != n {
@@ -49,15 +49,15 @@ func TestTruncatePersistent(t *testing.T) {
 
 	// Still writable, and reopen recovers exactly the post-truncate writes.
 	for i := 0; i < 10; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("new%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("new%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	if c.Len() != 10 {
 		t.Fatalf("Len after re-put = %d, want 10", c.Len())
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	c2, err := Open(Options{Shards: 2, Dir: dir, SegmentSize: 1 << 13})
 	if err != nil {

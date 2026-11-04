@@ -185,8 +185,8 @@ func TestPrivateConstraintGateIsStatic(t *testing.T) {
 	}
 	tx := d.Begin()
 	tx.NewClassAdOld("j1", "Cpus = 4\nClaimId = \""+privateSecret+"\"\nLeak = ClaimId")
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	s := NewServer(d)
 	cconn, sconn := netPipe()

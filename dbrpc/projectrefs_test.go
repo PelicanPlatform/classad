@@ -139,11 +139,11 @@ func TestQueryRawProjectRefsMatchesPlainForLiterals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.NewClassAd(ctx, "a", "Owner = \"alice\"\nMemory = 2048\n"); err != nil {
-		t.Fatal(err)
+	if newClassAdErr := tx.NewClassAd(ctx, "a", "Owner = \"alice\"\nMemory = 2048\n"); newClassAdErr != nil {
+		t.Fatal(newClassAdErr)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	plain, err := c.QueryRawProject(ctx, DefaultTable, "true", []string{"Owner"}, 0)

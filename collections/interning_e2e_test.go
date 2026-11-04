@@ -29,14 +29,14 @@ func TestInterningEndToEnd(t *testing.T) {
 		return fmt.Sprintf(`[Id=%d; Val=%d; Name="host-%d.example.org"; Rev=%d; Req=(Val>=50)]`, i, i%100, i, rev)
 	}
 	for i := 0; i < n; i++ {
-		if err := c.Put(key(i), mustAd(t, ad(i, 0))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put(key(i), mustAd(t, ad(i, 0))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	// Update every key (creates superseded versions -> dead space -> compaction rewrites).
 	for i := 0; i < n; i++ {
-		if err := c.Put(key(i), mustAd(t, ad(i, 1))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put(key(i), mustAd(t, ad(i, 1))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	// Force every shard to compact (bypass the dead-ratio threshold) so the transcode runs
@@ -130,8 +130,8 @@ func TestInterningEndToEnd(t *testing.T) {
 
 	assertInterned("post-compact", c)
 	verify("post-compact", c)
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: recovery must restore the dictionaries; every read path must still be correct.

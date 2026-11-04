@@ -37,8 +37,8 @@ func TestArchiveSchemaRequireAdmin(t *testing.T) {
 		Require []string               `json:"require"`
 		Skipped []db.SchemaRequireSkip `json:"skipped"`
 	}
-	if err := json.Unmarshal([]byte(msg), &rep); err != nil {
-		t.Fatalf("schema.require did not return JSON: %v (%q)", err, msg)
+	if unmarshalErr := json.Unmarshal([]byte(msg), &rep); unmarshalErr != nil {
+		t.Fatalf("schema.require did not return JSON: %v (%q)", unmarshalErr, msg)
 	}
 	if len(rep.Require) != 1 || rep.Require[0] != "wallclock" {
 		t.Errorf("listed set = %v, want [wallclock]", rep.Require)
@@ -80,8 +80,8 @@ func TestTableSchemaRequireAdmin(t *testing.T) {
 	defer func() { c.Close(); s.Close(); d.Close() }()
 	ctx := context.Background()
 
-	if _, err := c.Admin(ctx, "schema.require.add", "ResidentSetSize"); err != nil {
-		t.Fatalf("schema.require.add on a mutable table: %v", err)
+	if _, adminErr := c.Admin(ctx, "schema.require.add", "ResidentSetSize"); adminErr != nil {
+		t.Fatalf("schema.require.add on a mutable table: %v", adminErr)
 	}
 	if got := d.SchemaRequireAttrs(); len(got) != 1 || got[0] != "residentsetsize" {
 		t.Fatalf("required set = %v, want [residentsetsize]", got)

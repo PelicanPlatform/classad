@@ -77,8 +77,8 @@ func TestUnprotectedMasterPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Put("k1", ad); err != nil {
-		t.Fatal(err)
+	if putErr := d.Put("k1", ad); putErr != nil {
+		t.Fatal(putErr)
 	}
 	d.Close()
 
@@ -141,17 +141,17 @@ func TestSnapshotUnprotectedWithoutPoolKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 20; i++ {
-		ad, err := classad.ParseOld(fmt.Sprintf("Cpus = %d\nOwner = \"alice\"", i))
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.ParseOld(fmt.Sprintf("Cpus = %d\nOwner = \"alice\"", i))
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := d.Put(fmt.Sprintf("k%d", i), ad); err != nil {
-			t.Fatal(err)
+		if putErr := d.Put(fmt.Sprintf("k%d", i), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	var buf bytes.Buffer
-	if err := d.Snapshot(&buf); err != nil {
-		t.Fatalf("Snapshot: %v", err)
+	if snapshotErr := d.Snapshot(&buf); snapshotErr != nil {
+		t.Fatalf("Snapshot: %v", snapshotErr)
 	}
 	d.Close()
 
@@ -162,8 +162,8 @@ func TestSnapshotUnprotectedWithoutPoolKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d2.Close()
-	if err := d2.Restore(&buf); err != nil {
-		t.Fatalf("Restore of an unprotected snapshot failed: %v", err)
+	if restoreErr := d2.Restore(&buf); restoreErr != nil {
+		t.Fatalf("Restore of an unprotected snapshot failed: %v", restoreErr)
 	}
 	n := 0
 	seq, err := d2.Query("Cpus >= 0")
@@ -196,8 +196,8 @@ func TestOpenMigratesALegacyStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Put("k1", ad); err != nil {
-		t.Fatal(err)
+	if putErr := d.Put("k1", ad); putErr != nil {
+		t.Fatal(putErr)
 	}
 	d.Close()
 

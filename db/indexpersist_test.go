@@ -20,8 +20,8 @@ func TestIndexConfigPersistsAcrossReopen(t *testing.T) {
 			ad, _ := classad.ParseOld("RequestCpus = 4\nRequestMemory = 4096\nOwner = \"alice\"")
 			tx.NewClassAd(key(i), ad)
 		}
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
+		if commitErr := tx.Commit(); commitErr != nil {
+			t.Fatal(commitErr)
 		}
 	}
 	seed(d)
@@ -84,8 +84,8 @@ func TestIndexProvenancePersistsAcrossReopen(t *testing.T) {
 		ad, _ := classad.ParseOld("Owner = \"alice\"\nGPUs = true")
 		tx.NewClassAd(key(i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	d.AddIndex([]string{"Owner"}, nil)      // human
 	d.c.AddAutoIndex([]string{"GPUs"}, nil) // auto

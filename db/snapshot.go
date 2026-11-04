@@ -88,8 +88,8 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := writeChunk(bw, rowsJSON); err != nil {
-			return nil, err
+		if writeErr := writeChunk(bw, rowsJSON); writeErr != nil {
+			return nil, writeErr
 		}
 		if snapKey, err = crypt.NewDEK(); err != nil {
 			return nil, err
@@ -101,11 +101,11 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := writeChunk(bw, nonce); err != nil {
-			return nil, err
+		if writeErr := writeChunk(bw, nonce); writeErr != nil {
+			return nil, writeErr
 		}
-		if err := writeChunk(bw, wrapped); err != nil {
-			return nil, err
+		if writeErr := writeChunk(bw, wrapped); writeErr != nil {
+			return nil, writeErr
 		}
 	}
 

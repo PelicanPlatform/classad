@@ -26,8 +26,8 @@ func TestTopKOrderThreshold(t *testing.T) {
 		ad := classad.New()
 		_ = ad.Set("ClusterId", cid)
 		_ = ad.Set("ProcId", int64(proc))
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 		if proc < 5 {
 			match = append(match, cid)

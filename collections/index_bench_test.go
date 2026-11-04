@@ -24,14 +24,14 @@ func benchSelective(b *testing.B, withIndex bool) {
 	const n = 50000
 	const owners = 1000 // high cardinality -> `Owner == x` matches ~n/owners = 50
 	for i := 0; i < n; i++ {
-		ad, err := classad.Parse(fmt.Sprintf(
+		ad, perr := classad.Parse(fmt.Sprintf(
 			`[ ID=%d; Owner="user%d"; Arch="X86_64"; Cpus=%d; Memory=%d; State="Unclaimed" ]`,
 			i, i%owners, i%16, (i%32)*512))
-		if err != nil {
-			b.Fatal(err)
+		if perr != nil {
+			b.Fatal(perr)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
-			b.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); putErr != nil {
+			b.Fatal(putErr)
 		}
 	}
 	if withIndex {

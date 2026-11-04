@@ -28,16 +28,16 @@ func TestTableMemoryOps(t *testing.T) {
 	defer func() { dc.Close(); wc.Close(); s.Close(); cat.Close() }()
 
 	// CreateTableInMemory yields a RAM-only table even on a persistent catalog.
-	if err := dc.CreateTableInMemory(ctx, "ephemeral"); err != nil {
-		t.Fatalf("CreateTableInMemory: %v", err)
+	if createTableInMemoryErr := dc.CreateTableInMemory(ctx, "ephemeral"); createTableInMemoryErr != nil {
+		t.Fatalf("CreateTableInMemory: %v", createTableInMemoryErr)
 	}
 	if d, ok := cat.Table("ephemeral"); !ok || !d.InMemory() {
 		t.Fatalf("ephemeral not created in-memory (ok=%v)", ok)
 	}
 
 	// A persistent table with data, then converted to RAM-only.
-	if err := dc.CreateTable(ctx, "jobs"); err != nil {
-		t.Fatal(err)
+	if createTableErr := dc.CreateTable(ctx, "jobs"); createTableErr != nil {
+		t.Fatal(createTableErr)
 	}
 	if d, _ := cat.Table("jobs"); d.InMemory() {
 		t.Fatal("jobs should start persistent")
@@ -47,17 +47,17 @@ func TestTableMemoryOps(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = tx.NewClassAd(ctx, "1", `Owner = "alice"`)
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// A WRITE-level session may NOT convert (DAEMON-gated).
-	if err := wc.ConvertTableToMemory(ctx, "jobs"); err == nil {
+	if convertTableToMemoryErr := wc.ConvertTableToMemory(ctx, "jobs"); convertTableToMemoryErr == nil {
 		t.Fatal("ConvertTableToMemory on a WRITE connection should be refused")
 	}
 	// The DAEMON session may, and the data is preserved.
-	if err := dc.ConvertTableToMemory(ctx, "jobs"); err != nil {
-		t.Fatalf("ConvertTableToMemory (privileged): %v", err)
+	if convertTableToMemoryErr := dc.ConvertTableToMemory(ctx, "jobs"); convertTableToMemoryErr != nil {
+		t.Fatalf("ConvertTableToMemory (privileged): %v", convertTableToMemoryErr)
 	}
 	if d, _ := cat.Table("jobs"); !d.InMemory() {
 		t.Fatal("jobs should be in-memory after convert")

@@ -56,8 +56,8 @@ func TestArchiveSchemaScanReported(t *testing.T) {
 	defer func() { c.Close(); s.Close(); cat.Close() }()
 
 	ctx := context.Background()
-	if err := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{SegmentSize: 1 << 16}); err != nil {
-		t.Fatal(err)
+	if createArchiveTableErr := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{SegmentSize: 1 << 16}); createArchiveTableErr != nil {
+		t.Fatal(createArchiveTableErr)
 	}
 	seedHistory(t, c, "history", 3000)
 

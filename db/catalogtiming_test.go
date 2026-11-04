@@ -19,15 +19,15 @@ func TestCatalogOnOpenStepReportsEachTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"jobs", "history_t"} {
-		if _, err := cat.EnsureTable(name); err != nil {
-			t.Fatal(err)
+		if _, ensureTableErr := cat.EnsureTable(name); ensureTableErr != nil {
+			t.Fatal(ensureTableErr)
 		}
 	}
-	if _, err := cat.CreateArchiveTable("hist", ArchiveConfig{SegmentSize: 1 << 16}); err != nil {
-		t.Fatal(err)
+	if _, createArchiveTableErr := cat.CreateArchiveTable("hist", ArchiveConfig{SegmentSize: 1 << 16}); createArchiveTableErr != nil {
+		t.Fatal(createArchiveTableErr)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Guarded: the catalog opens tables concurrently, so OnOpenStep is
@@ -82,17 +82,17 @@ func TestCatalogParallelOpenIsCorrect(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if _, err := cat.EnsureTable(fmt.Sprintf("t%02d", i)); err != nil {
-			t.Fatal(err)
+		if _, ensureTableErr := cat.EnsureTable(fmt.Sprintf("t%02d", i)); ensureTableErr != nil {
+			t.Fatal(ensureTableErr)
 		}
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := cat.CreateArchiveTable(fmt.Sprintf("a%d", i), ArchiveConfig{SegmentSize: 1 << 16}); err != nil {
-			t.Fatal(err)
+		if _, createArchiveTableErr := cat.CreateArchiveTable(fmt.Sprintf("a%d", i), ArchiveConfig{SegmentSize: 1 << 16}); createArchiveTableErr != nil {
+			t.Fatal(createArchiveTableErr)
 		}
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// EVERY table must land in the map, under its own name. Results are collected into a slice and inserted
@@ -139,22 +139,22 @@ func TestCatalogParallelOpenFailureClosesTheRest(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 6; i++ {
-		if _, err := cat.EnsureTable(fmt.Sprintf("t%d", i)); err != nil {
-			t.Fatal(err)
+		if _, ensureTableErr := cat.EnsureTable(fmt.Sprintf("t%d", i)); ensureTableErr != nil {
+			t.Fatal(ensureTableErr)
 		}
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Make one table unopenable by replacing its directory with a file, so the parallel batch has both
 	// successes and a failure.
 	bad := filepath.Join(dir, tablesSubdir, "t3")
-	if err := os.RemoveAll(bad); err != nil {
-		t.Fatal(err)
+	if removeAllErr := os.RemoveAll(bad); removeAllErr != nil {
+		t.Fatal(removeAllErr)
 	}
-	if err := os.WriteFile(bad, []byte("not a directory"), 0o640); err != nil {
-		t.Fatal(err)
+	if writeFileErr := os.WriteFile(bad, []byte("not a directory"), 0o640); writeFileErr != nil {
+		t.Fatal(writeFileErr)
 	}
 
 	// A file is skipped rather than opened (the loop requires a directory), so this must still SUCCEED with

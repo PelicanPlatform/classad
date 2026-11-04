@@ -115,9 +115,9 @@ func TestRedactedRawReadSurvivesWithoutTheCollectionKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 400; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
-			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.Compact()
@@ -299,9 +299,9 @@ func TestFullDecodeRedactedReadHoldsNoKey(t *testing.T) {
 	}
 	defer c.Close()
 	for i := 0; i < 200; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
-			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	q, err := vm.Parse("Cpus >= 0")
@@ -379,9 +379,9 @@ func TestWatchAndTxnRedactedHoldNoKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 20; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
-			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 

@@ -348,12 +348,12 @@ func TestArchiveAggregateWithStatsOff(t *testing.T) {
 	defer func() { c.Close(); s.Close(); cat.Close() }()
 
 	ctx := context.Background()
-	if err := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{ZoneAttrs: []string{"ClusterId"}}); err != nil {
-		t.Fatalf("CreateArchiveTable: %v", err)
+	if createArchiveTableErr := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{ZoneAttrs: []string{"ClusterId"}}); createArchiveTableErr != nil {
+		t.Fatalf("CreateArchiveTable: %v", createArchiveTableErr)
 	}
 	for i, o := range []string{"alice", "bob", "alice"} {
-		if err := c.ArchiveAppend(ctx, "history", fmt.Sprintf("ClusterId = %d\nOwner = %q", i, o)); err != nil {
-			t.Fatalf("ArchiveAppend: %v", err)
+		if archiveAppendErr := c.ArchiveAppend(ctx, "history", fmt.Sprintf("ClusterId = %d\nOwner = %q", i, o)); archiveAppendErr != nil {
+			t.Fatalf("ArchiveAppend: %v", archiveAppendErr)
 		}
 	}
 	count := []AggSpec{{Func: AggCount, Arg: "*"}}

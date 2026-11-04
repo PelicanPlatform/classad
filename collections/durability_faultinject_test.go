@@ -180,10 +180,10 @@ func TestSegmentAllocFailureIsGraceful(t *testing.T) {
 			failing = true
 		}
 		key := fmt.Sprintf("k%d", i)
-		err := c.Put([]byte(key), mustAd(t, fmt.Sprintf(`[Id=%d;pad=%q]`, i, pad(200))))
-		if err != nil {
-			if !errors.Is(err, enospc) {
-				t.Fatalf("Put(%s) failed with %v, want the injected ENOSPC", key, err)
+		perr := c.Put([]byte(key), mustAd(t, fmt.Sprintf(`[Id=%d;pad=%q]`, i, pad(200))))
+		if perr != nil {
+			if !errors.Is(perr, enospc) {
+				t.Fatalf("Put(%s) failed with %v, want the injected ENOSPC", key, perr)
 			}
 			failedKey = key
 			break
@@ -222,7 +222,7 @@ func TestSegmentAllocFailureIsGraceful(t *testing.T) {
 	// because the write reports failure but a small record that fits the active segment still lands,
 	// we keep the value in-range/correct so it cannot be mistaken for corruption on reopen.
 	failing = false
-	if err := c.Put([]byte("k0"), mustAd(t, `[Id=0]`)); err == nil {
+	if putErr := c.Put([]byte("k0"), mustAd(t, `[Id=0]`)); putErr == nil {
 		t.Error("segment-allocation error should be sticky (fail-stop until restart); Put unexpectedly succeeded")
 	}
 

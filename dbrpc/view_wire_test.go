@@ -25,8 +25,8 @@ func TestViewWire(t *testing.T) {
 		key, owner string
 	}{{"1", "alice"}, {"2", "alice"}, {"3", "bob"}} {
 		ad, _ := classad.ParseOld("Owner = \"" + j.owner + "\"")
-		if err := base.Put(j.key, ad); err != nil {
-			t.Fatal(err)
+		if putErr := base.Put(j.key, ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	s := NewServerCatalog(cat)
@@ -42,8 +42,8 @@ func TestViewWire(t *testing.T) {
 		Metrics:     []db.ViewMetric{{Func: db.ViewCount, Arg: "*", Alias: "metric_jobs"}},
 		Cardinality: 100,
 	}
-	if err := c.CreateView(ctx, "usage", spec); err != nil {
-		t.Fatalf("CreateView: %v", err)
+	if createViewErr := c.CreateView(ctx, "usage", spec); createViewErr != nil {
+		t.Fatalf("CreateView: %v", createViewErr)
 	}
 
 	// Listed as a view, not a table.
@@ -94,8 +94,8 @@ func TestViewSealedUnionWire(t *testing.T) {
 		qdate int
 	}{{"1", 3600}, {"2", 3700}, {"3", 7200}} { // buckets 3600 (x2), 7200 (x1)
 		ad, _ := classad.ParseOld("QDate = " + strconv.Itoa(j.qdate))
-		if err := base.Put(j.key, ad); err != nil {
-			t.Fatal(err)
+		if putErr := base.Put(j.key, ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	s := NewServerCatalog(cat)
@@ -111,8 +111,8 @@ func TestViewSealedUnionWire(t *testing.T) {
 		Metrics:     []db.ViewMetric{{Func: db.ViewCount, Arg: "*", Alias: "metric_jobs"}},
 		Cardinality: 100,
 	}
-	if err := c.CreateView(ctx, "jobs_ts", spec); err != nil {
-		t.Fatalf("CreateView: %v", err)
+	if createViewErr := c.CreateView(ctx, "jobs_ts", spec); createViewErr != nil {
+		t.Fatalf("CreateView: %v", createViewErr)
 	}
 
 	// Seal bucket 3600 (now=7200 => seal starts <= 3600); bucket 7200 stays live.

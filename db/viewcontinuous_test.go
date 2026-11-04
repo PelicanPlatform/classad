@@ -113,8 +113,8 @@ func TestContinuousAggregateReloadNoDuplicate(t *testing.T) {
 	base.Put("1", jobTS(t, 3600))
 	base.Put("2", jobTS(t, 3700))
 	base.Put("3", jobTS(t, 7200))
-	if err := cat.CreateView("jobs_ts", continuousSpec()); err != nil {
-		t.Fatal(err)
+	if createViewErr := cat.CreateView("jobs_ts", continuousSpec()); createViewErr != nil {
+		t.Fatal(createViewErr)
 	}
 	waitSeries(t, cat, "jobs_ts", 2)
 	v, _ := cat.View("jobs_ts")
@@ -122,8 +122,8 @@ func TestContinuousAggregateReloadNoDuplicate(t *testing.T) {
 	if got := len(archiveAds(t, v)); got != 2 {
 		t.Fatalf("archive before reload = %d, want 2", got)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: the watermark is loaded, so the rebuild's replay drops both sealed buckets;

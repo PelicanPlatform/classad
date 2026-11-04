@@ -35,8 +35,8 @@ func TestExporterWire(t *testing.T) {
 		Kind:   "kafka",
 		Config: json.RawMessage(`{"brokers":["b:9092"],"topic":"htc.jobs"}`),
 	}
-	if err := priv.CreateExporter(ctx, def); err != nil {
-		t.Fatalf("CreateExporter: %v", err)
+	if createExporterErr := priv.CreateExporter(ctx, def); createExporterErr != nil {
+		t.Fatalf("CreateExporter: %v", createExporterErr)
 	}
 
 	// List (name+kind, no config).
@@ -50,17 +50,17 @@ func TestExporterWire(t *testing.T) {
 	if err != nil || !ok || string(got.Config) != string(def.Config) {
 		t.Fatalf("GetExporter = %+v, %v, %v", got, ok, err)
 	}
-	if _, ok, _ := priv.GetExporter(ctx, "ghost"); ok {
+	if _, getExporterOK, _ := priv.GetExporter(ctx, "ghost"); getExporterOK {
 		t.Fatal("GetExporter of a missing exporter should report not-found")
 	}
 
 	// State: absent, then set, then read back.
-	if _, ok, err := priv.GetExporterState(ctx, "jobs"); err != nil || ok {
-		t.Fatalf("fresh exporter state: ok=%v err=%v", ok, err)
+	if _, getExporterStateOK, stateErr := priv.GetExporterState(ctx, "jobs"); stateErr != nil || getExporterStateOK {
+		t.Fatalf("fresh exporter state: getExporterStateOK=%v err=%v", getExporterStateOK, stateErr)
 	}
 	state := []byte{0x00, 0x01, 0xff, 0x2a} // opaque binary blob
-	if err := priv.PutExporterState(ctx, "jobs", state); err != nil {
-		t.Fatalf("PutExporterState: %v", err)
+	if putExporterStateErr := priv.PutExporterState(ctx, "jobs", state); putExporterStateErr != nil {
+		t.Fatalf("PutExporterState: %v", putExporterStateErr)
 	}
 	blob, ok, err := priv.GetExporterState(ctx, "jobs")
 	if err != nil || !ok || !bytes.Equal(blob, state) {

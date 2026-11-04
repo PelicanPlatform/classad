@@ -179,14 +179,14 @@ func TestBucketedAggregateExcludesNonFiniteExpressions(t *testing.T) {
 		"Stamp = -1.0e999",      // -Inf
 		"Stamp = \"yesterday\"", // the control: a non-number already dropped
 	} {
-		ad, err := classad.ParseOld(src)
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.ParseOld(src)
+		if perr != nil {
+			t.Fatal(perr)
 		}
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	want := map[string]int{
 		strconv.FormatInt(base, 10):           2,

@@ -29,13 +29,13 @@ func TestDiagnosticsCarriesDerivedSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 500; i++ {
-		if err := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf(
-			"Cpus = %d\nMemory = %d\nOwner = \"u%d\"", 1+i%8, 1024+(i%16)*256, i%5)); err != nil {
-			t.Fatal(err)
+		if newClassAdErr := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf(
+			"Cpus = %d\nMemory = %d\nOwner = \"u%d\"", 1+i%8, 1024+(i%16)*256, i%5)); newClassAdErr != nil {
+			t.Fatal(newClassAdErr)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	// Build the accelerator; without it there is no schema to report and the assertion below
 	// would pass vacuously.

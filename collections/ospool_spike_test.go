@@ -32,8 +32,8 @@ func loadOSPoolAds(tb testing.TB) ([]*classad.ClassAd, *classad.ClassAd) {
 		if strings.TrimSpace(blk) == "" {
 			continue
 		}
-		ad, err := classad.ParseOld(blk)
-		if err != nil {
+		ad, perr := classad.ParseOld(blk)
+		if perr != nil {
 			continue
 		}
 		hasReq := false
