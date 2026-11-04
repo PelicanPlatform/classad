@@ -886,13 +886,20 @@ func TestSchemaReviewGate(t *testing.T) {
 	}
 }
 
-// TestBaseSchemaDriftConvergesSidecars: an in-memory table, whose accelerator is sidecar blocks only,
-// takes in an attribute that has become common, rebuilds its blocks onto the new schema a budget at
-// a time, and answers exactly at every pass.
+// driftBudget is the per-mechanism segment budget TestBaseSchemaDriftConvergesSidecars runs under.
+const driftBudget = 1
+
+// TestBaseSchemaDriftConvergesSidecars: an in-memory table takes in an attribute that has become
+// common, brings its sealed segments onto the new schema a budget at a time, and answers exactly at
+// every pass.
 func TestBaseSchemaDriftConvergesSidecars(t *testing.T) {
 	defer func(d time.Duration) { schemaReviewInterval = d }(schemaReviewInterval)
 	schemaReviewInterval = 0
-	c := New(Options{Shards: 1, SegmentSize: 1 << 13, ColumnarSegmentBudget: 1})
+	// 2 KiB segments so the few hundred ads written before the first enable leave ENOUGH stale
+	// segments to span several passes at this budget. One pass now converges three of them (see the
+	// bound below), so at the 8 KiB this used to use the whole backlog went in a single pass and the
+	// "across passes" guard below had nothing to guard.
+	c := New(Options{Shards: 1, SegmentSize: 1 << 11, ColumnarSegmentBudget: driftBudget})
 	ref := New(Options{Shards: 1})
 	defer c.Close()
 	defer ref.Close()
@@ -936,8 +943,19 @@ func TestBaseSchemaDriftConvergesSidecars(t *testing.T) {
 		}
 		before := payloads(c)
 		c.BuildAndEnableSchemaScan(2000, 8)
-		if n := changedPayloads(before, payloads(c)); n > 1 {
-			t.Fatalf("pass %d rebuilt %d sidecar blocks, budget 1", pass, n)
+		// The budget is per MECHANISM, and one pass runs three of them: ColumnarizeSealed rewrites
+		// a segment that is still row-native, recolumnarizeStale brings an already-rewritten one
+		// onto the new schema, and rebuildStaleSidecars rebuilds the block of one that was never
+		// rewritten. Each takes at most ColumnarSegmentBudget, so a pass touches at most three
+		// times that -- not once that, which is what this asserted while an in-memory table had
+		// only the third mechanism and the other two silently did nothing.
+		//
+		// Three times the budget is still the bound that matters: it fails the moment any of the
+		// three stops honouring the budget at all, which is the regression (an unbudgeted rebuild
+		// of the whole table in one pass) this is here to catch.
+		if n := changedPayloads(before, payloads(c)); n > 3*driftBudget {
+			t.Fatalf("pass %d rebuilt %d payloads, budget %d across three mechanisms",
+				pass, n, driftBudget)
 		}
 		for name, fn := range map[string]func(*vm.Query) (int, bool){
 			"CountQuery": c.CountQuery, "VectorEvalCount": c.VectorEvalCount, "ColumnarEvalCount": c.ColumnarEvalCount,
