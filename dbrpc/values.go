@@ -620,6 +620,34 @@ type valueEncoder struct {
 	// release. A lookup with a borrowed string is fine: it hashes and compares without
 	// retaining.
 	owned map[string]string
+
+	// Per-column scratch, reused across columns and across batches. None of it escapes: each is
+	// consumed into the frame before the next column touches it, and the frame holds bytes, not
+	// these slices. Encoding used to allocate the whole set per COLUMN -- 474 times over a
+	// six-column read of 160k rows -- which was 41% of the read's allocated bytes.
+	valid    []byte
+	ints     []int64
+	reals    []float64
+	strs     []string
+	boolBits []byte
+	excs     []valueExc
+	// Dictionary scratch, same reasoning; see buildStringDict.
+	dictIndex map[string]int32
+	dictCodes []int32
+	dictStrs  []string
+
+	// frameCap is the largest frame this encoder has produced, so the next is allocated at that
+	// size instead of growing into it. A frame started at respHead's 16 bytes and reached ~100
+	// KB by append, reallocating and copying about a dozen times on the way -- half of the
+	// read's allocated bytes, all of it binary.AppendUint64 growing the slice.
+	frameCap int
+}
+
+// valueExc is one cell that did not pack into its column's dense form. At package level rather
+// than declared inside encode so the encoder can hold the slice across calls.
+type valueExc struct {
+	row int
+	v   classad.Value
 }
 
 // ownedStringCap bounds the intern table. A column whose values are nearly all distinct -- a
@@ -692,6 +720,14 @@ func chooseKind(vals []classad.Value) ValueKind {
 }
 
 func (e *valueEncoder) encode(b []byte) []byte {
+	// One allocation at the size the last frame reached, rather than a dozen as this one grows
+	// into it. Only ever grows, so a batch bigger than any before it still appends its way up
+	// once and raises the mark for the next.
+	if n := e.frameCap; n > cap(b) {
+		nb := make([]byte, len(b), n)
+		copy(nb, b)
+		b = nb
+	}
 	b = putI32(b, int32(e.rows))
 	b = putI32(b, int32(len(e.cols)))
 	validBytes := (e.rows + 7) / 8
@@ -700,22 +736,20 @@ func (e *valueEncoder) encode(b []byte) []byte {
 		var codes []int32
 		var dictStrs []string
 		if kind == KindString && e.dict {
-			if codes, dictStrs = buildStringDict(vals); dictStrs != nil {
+			if codes, dictStrs = e.buildStringDict(vals); dictStrs != nil {
 				kind = KindStringDict
 			}
 		}
 		b = append(b, byte(kind))
-		valid := make([]byte, validBytes)
-		var ints []int64
-		var reals []float64
-		var strs []string
-		var boolBits []byte
+		// Reused, so it has to be CLEARED: setBit only ever sets, and a stale bit would mark a
+		// cell valid that this column never packed.
+		valid := grow(e.valid, validBytes)
+		clear(valid)
+		e.valid = valid
+		ints, reals := e.ints[:0], e.reals[:0]
+		strs, boolBits := e.strs[:0], e.boolBits[:0]
+		excs := e.excs[:0]
 		nbool := 0
-		type exc struct {
-			row int
-			v   classad.Value
-		}
-		var excs []exc
 		for i, v := range vals {
 			packed := false
 			switch kind {
@@ -758,7 +792,7 @@ func (e *valueEncoder) encode(b []byte) []byte {
 			if packed {
 				setBit(valid, i)
 			} else {
-				excs = append(excs, exc{row: i, v: v})
+				excs = append(excs, valueExc{row: i, v: v})
 			}
 		}
 		b = putBytes(b, valid)
@@ -803,8 +837,23 @@ func (e *valueEncoder) encode(b []byte) []byte {
 			b = putI32(b, int32(x.row))
 			b = appendExcValue(b, x.v)
 		}
+		// Keep whatever capacity the appends won, for the next column and the next batch. The
+		// strings and values held here are the batch's own and are dropped by reset(); nothing
+		// outside has a reference, because the frame took bytes.
+		e.ints, e.reals, e.strs, e.boolBits, e.excs = ints, reals, strs, boolBits, excs
+	}
+	if len(b) > e.frameCap {
+		e.frameCap = len(b)
 	}
 	return b
+}
+
+// grow returns s re-sliced to n, allocating only when it does not already have the room.
+func grow(s []byte, n int) []byte {
+	if cap(s) >= n {
+		return s[:n]
+	}
+	return make([]byte, n)
 }
 
 // buildStringDict builds the dictionary and per-cell codes for a string column, or returns a nil
@@ -818,10 +867,17 @@ func (e *valueEncoder) encode(b []byte) []byte {
 // The test is the honest one -- the dictionary form must be SMALLER -- so a column of long,
 // nearly-distinct values ships plainly rather than paying for a dictionary and a code per row to
 // save allocations the receiver was going to make anyway.
-func buildStringDict(vals []classad.Value) ([]int32, []string) {
-	index := make(map[string]int32, 16)
-	var dict []string
-	codes := make([]int32, 0, len(vals))
+func (e *valueEncoder) buildStringDict(vals []classad.Value) ([]int32, []string) {
+	// Reused across columns and batches. The map must be CLEARED -- a code left from another
+	// column would be read as this dictionary's index and ship the wrong string.
+	if e.dictIndex == nil {
+		e.dictIndex = make(map[string]int32, 16)
+	} else {
+		clear(e.dictIndex)
+	}
+	index := e.dictIndex
+	dict := e.dictStrs[:0]
+	codes := e.dictCodes[:0]
 	plain, dictBytes, codeBytes := 0, 0, 0
 	for _, v := range vals {
 		if v.Type() != classad.StringValue {
@@ -839,6 +895,9 @@ func buildStringDict(vals []classad.Value) ([]int32, []string) {
 		codes = append(codes, c)
 		codeBytes += uvarintLen(uint64(c))
 	}
+	// Keep the capacity whichever way the payoff test goes: a column that declines the form
+	// still built these, and the next column should not have to allocate them again.
+	e.dictCodes, e.dictStrs = codes, dict
 	if len(codes) == 0 {
 		return nil, nil
 	}
