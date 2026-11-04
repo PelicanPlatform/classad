@@ -513,7 +513,13 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 	// stored, which this op never promised to do either way -- but under a LIMIT the order
 	// decides WHICH rows come back, and silently returning a different subset is more than a
 	// reordering. A limited read also stops early, so it is the one case with nothing to win.
-	if limit <= 0 && columnSource(ref, constraint, attrs, redact, ctx, enc, flush, &n, &colStats) {
+	// The column path writes a frame per batch chunk, straight from the producer's columns;
+	// flush above is the row-at-a-time path's, which the record scan below still uses.
+	emit := func(b *collections.Batch, lo, hi int) {
+		enc.frame = enc.encodeBatchFrame(appendRespHead(enc.frame[:0], reqID, stStream), b, lo, hi)
+		write(enc.frame)
+	}
+	if limit <= 0 && columnSource(ref, constraint, attrs, redact, ctx, enc, emit, &n, &colStats) {
 		write(respHead(reqID, stStreamEnd))
 		return
 	}
@@ -542,7 +548,8 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 // The decision is made before the first batch (see db.ErrColumnsUnsupported), which is what lets
 // this be a clean fall-through rather than a half-sent reply.
 func columnSource(ref tableRef, constraint string, attrs []string, redact bool, ctx context.Context,
-	enc *valueEncoder, flush func(), n *int, colStats *collections.ColumnScanStats) bool {
+	enc *valueEncoder, emit func(b *collections.Batch, lo, hi int), n *int,
+	colStats *collections.ColumnScanStats) bool {
 	var seq iter.Seq[*collections.Batch]
 	var err error
 	switch ref.kind {
@@ -562,15 +569,15 @@ func columnSource(ref tableRef, constraint string, attrs []string, redact bool, 
 			// a truncated reply must not read as a complete one.
 			return true
 		}
-		for r := range b.N {
-			enc.appendBatch(b, r)
-			*n++
-			if enc.rows >= ValueBatchRows {
-				flush()
-			}
+		// Straight from the producer's columns into the frame, never through classad.Value.
+		// Chunked at the same row cap the row-at-a-time path flushes on, so a large batch
+		// still arrives as several frames rather than one oversized one.
+		for lo := 0; lo < b.N; lo += ValueBatchRows {
+			hi := min(lo+ValueBatchRows, b.N)
+			emit(b, lo, hi)
+			*n += hi - lo
 		}
 	}
-	flush()
 	return true
 }
 
@@ -635,6 +642,9 @@ type valueEncoder struct {
 	strs     []string
 	boolBits []byte
 	excs     []valueExc
+	// excRows is the direct path's exception list: row indexes only, since the cell is read
+	// back out of the batch column rather than carried.
+	excRows []int
 	// Dictionary scratch, same reasoning; see buildStringDict.
 	dictIndex map[string]int32
 	dictCodes []int32
