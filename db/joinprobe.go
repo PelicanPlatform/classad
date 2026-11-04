@@ -75,45 +75,172 @@ var (
 	minProbeRows = 1024
 )
 
-// joinProbe is the decision to narrow the hashed side, and what it was based on.
-type joinProbe struct {
-	attr string // the bare attribute the constraint names
-	rows int    // rows the hashed side holds in total
-	keys int    // distinct key values the streamed side turned out to hold
+// joinProbes is what the probe decision came to for a whole chain: the FROM side if it had to
+// be held to reach the decision, and the membership constraint each step's table is narrowed
+// by.
+type joinProbes struct {
+	// held is the FROM side's rows, materialized to count their keys. Non-nil means the
+	// caller must stream the FROM side from here rather than from the source, so the scan
+	// is not paid twice.
 	held []*joinRow
-	cons string // the membership constraint
+	// rescan says the decision consumed part of the FROM side and then gave up, so the
+	// source has to be resolved again.
+	rescan bool
+	// cons maps a step's index to the constraint its table is read with.
+	cons map[int]string
 }
 
-// planIndexProbe decides whether to narrow the hashed side's scan, and if so materializes
-// the streamed side and builds the constraint.
+// probeCandidate is one step that passed every gate a scan is not needed for.
+type probeCandidate struct {
+	step     int
+	attr     string
+	rows     int
+	segments int
+	lits     []string
+	seen     map[string]bool
+}
+
+// planIndexProbes decides, for every step at once, whether to narrow that step's table scan
+// to the key values the FROM side actually holds.
 //
-// It returns why not when it declines, because a plan that silently did not use an index is
+// WHY EVERY STEP AND NOT JUST THE FIRST. The keys a step would be narrowed to come from the
+// accumulated row, and for a chain joined on one key -- which is the shape these tables are
+// in -- every step's row half reads the FROM side alone. So ONE scan of the FROM side yields
+// the key set for every step, and the second and third tables get an index-driven access path
+// on the same terms the second always had. A client cannot do this for the third table
+// without first materializing the join of the first two.
+//
+// A step whose row half reads a side an earlier step folds in is declined, and says so: its
+// key set is not known until that step has run, and guessing it from the FROM side would
+// narrow a scan on the strength of values that may not survive.
+//
+// It returns why it declined, per step, because a plan that silently did not use an index is
 // indistinguishable from one that had none to use.
 //
-// The streamed side has to be materialized to count its keys exactly, which is a cost this
-// pays before it knows the answer. So the gates that need no scan come first: one equality
-// on a bare attribute, an index covering it, no constraint of the hashed side's own, and a
-// hashed side big enough to be worth avoiding. Only then is the other side read.
-func (cat *Catalog) planIndexProbe(p *joinPlan, spec JoinSpec, scanSeq iter.Seq[*joinRow]) (*joinProbe, string) {
-	if len(p.equiLeft) != 1 {
-		if len(p.equiLeft) == 0 {
-			return nil, "the condition has no equality to probe an index with"
+// The gates that need no scan come first -- one equality on a bare attribute, an index
+// covering it, no constraint of the step's own, and a table big enough to be worth avoiding --
+// because the scan that follows is a cost paid before the answer is known.
+func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.Seq[*joinRow],
+	stats *JoinStats) *joinProbes {
+	out := &joinProbes{cons: map[int]string{}}
+	stats.ProbeSteps = make([]JoinProbeStat, len(p.steps))
+	var cands []*probeCandidate
+	for i, sp := range p.steps {
+		attr, rows, segments, why := cat.probeGate(sp, sides[sp.side])
+		stats.ProbeSteps[i] = JoinProbeStat{Alias: p.aliases[sp.side], Why: why}
+		if why != "" {
+			continue
 		}
-		return nil, fmt.Sprintf("the condition has %d equality terms and a membership "+
-			"constraint can narrow on only one", len(p.equiLeft))
+		stats.ProbeSteps[i].Attr = attr
+		cands = append(cands, &probeCandidate{
+			step: i, attr: attr, rows: rows, segments: segments, seen: map[string]bool{},
+		})
 	}
-	attr, ok := bareAttr(p.equiRight[0])
+	if len(cands) == 0 {
+		stats.syncFirstProbe()
+		return out
+	}
+
+	// Now the part that costs a scan. The FROM side is held either way from here: if every
+	// probe is declined below, it is handed back to be streamed from memory, so the scan is
+	// not wasted.
+	//
+	// Holding it is a real cost, bounded by MaxHashRows -- the same bound the hashed sides
+	// have -- so a join that takes this path holds one more bounded side than it otherwise
+	// would. That is the price of the decision, and it is why every gate that can be
+	// checked without reading a row is checked above.
+	held := make([]*joinRow, 0, 256)
+	rows := make([]*joinRow, p.nSides())
+	for ad := range scanSeq {
+		held = append(held, ad)
+		if len(held) > p.limits.MaxHashRows {
+			why := fmt.Sprintf("the FROM side holds more than %d rows, so holding it to "+
+				"collect its keys would cost what hashing the other side costs",
+				p.limits.MaxHashRows)
+			for _, c := range cands {
+				stats.ProbeSteps[c.step].Why = why
+			}
+			stats.syncFirstProbe()
+			out.rescan = true
+			return out
+		}
+		rows[0] = ad
+		for _, c := range cands {
+			if len(c.lits) > maxProbeKeys {
+				continue // already past the cap; keep reading so the held side stays complete
+			}
+			sp := p.steps[c.step]
+			v, ok := p.rowHalfValue(sp, rows)
+			if !ok {
+				continue
+			}
+			lit, ok := joinKeyLiteral(v)
+			if !ok {
+				// No usable key value: this row matches nothing through the equality, so
+				// it contributes no term -- and must not narrow the table on its behalf.
+				continue
+			}
+			if !c.seen[lit] {
+				c.seen[lit] = true
+				c.lits = append(c.lits, lit)
+			}
+		}
+	}
+	out.held = held
+
+	for _, c := range cands {
+		lookups := c.segments * len(c.lits)
+		st := &stats.ProbeSteps[c.step]
+		switch {
+		case len(c.lits) == 0:
+			st.Why = "no row of the FROM side has a usable key value"
+			continue
+		case len(c.lits) > maxProbeKeys:
+			st.Why = fmt.Sprintf("the FROM side has more than %d distinct keys", maxProbeKeys)
+			continue
+		case lookups*probeLookupCost > c.rows:
+			st.Why = fmt.Sprintf("%d keys across %d segments is %d index lookups against a "+
+				"%d-row scan, which costs more than it saves", len(c.lits), c.segments, lookups, c.rows)
+			continue
+		}
+		sort.Strings(c.lits) // so the same join builds the same constraint
+		terms := make([]string, len(c.lits))
+		for i, l := range c.lits {
+			terms[i] = c.attr + " == " + l
+		}
+		out.cons[c.step] = "(" + strings.Join(terms, " || ") + ")"
+		st.Keys = len(c.lits)
+	}
+	stats.syncFirstProbe()
+	return out
+}
+
+// probeGate applies every test that can be made without reading a row, and names the attribute
+// a constraint would be built on when they all pass.
+func (cat *Catalog) probeGate(sp *joinStepPlan, side JoinSide) (attr string, rows, segments int, why string) {
+	if len(sp.equiSide) != 1 {
+		if len(sp.equiSide) == 0 {
+			return "", 0, 0, "the condition has no equality to probe an index with"
+		}
+		return "", 0, 0, fmt.Sprintf("the condition has %d equality terms and a membership "+
+			"constraint can narrow on only one", len(sp.equiSide))
+	}
+	if !sp.rowReadsOnlySide0 {
+		return "", 0, 0, "the equality's row half reads a side an earlier step folds in, so " +
+			"its key values are not known from a scan of the FROM side"
+	}
+	attr, ok := bareAttr(sp.equiSide[0])
 	if !ok {
-		return nil, "the equality's hashed half is computed, so there is no attribute to name"
+		return "", 0, 0, "the equality's table half is computed, so there is no attribute to name"
 	}
-	if strings.TrimSpace(spec.Right.Constraint) != "" {
+	if strings.TrimSpace(side.Constraint) != "" {
 		// Its own constraint already narrows it, so the table's row count overstates what
 		// the scan reads and the trade cannot be priced from it.
-		return nil, "the hashed side carries its own constraint, which the row count does not describe"
+		return "", 0, 0, "the hashed side carries its own constraint, which the row count does not describe"
 	}
-	rows, segments, indexed, configured, ok := cat.joinSideStats(spec.Right.Table, attr)
+	rows, segments, indexed, configured, ok := cat.joinSideStats(side.Table, attr)
 	if !ok {
-		return nil, "the hashed side's size could not be learned"
+		return "", 0, 0, "the hashed side's size could not be learned"
 	}
 	if !indexed {
 		// Configured-but-not-built is reported as its own case, because it is the one a
@@ -121,77 +248,41 @@ func (cat *Catalog) planIndexProbe(p *joinPlan, spec JoinSpec, scanSeq iter.Seq[
 		// the attribute, and a constraint naming it still parses and still filters -- over
 		// a full scan, at a cost that grows with the key count.
 		if configured {
-			return nil, fmt.Sprintf("%s.%s is configured for an index but none is built "+
+			return "", 0, 0, fmt.Sprintf("%s.%s is configured for an index but none is built "+
 				"yet (postings appear as segments seal), so a membership constraint would "+
-				"filter a full scan rather than replace it", spec.Right.Alias, attr)
+				"filter a full scan rather than replace it", side.Alias, attr)
 		}
-		return nil, fmt.Sprintf("no index covers %s.%s, so a membership constraint would "+
-			"filter a full scan rather than replace it", spec.Right.Alias, attr)
+		return "", 0, 0, fmt.Sprintf("no index covers %s.%s, so a membership constraint would "+
+			"filter a full scan rather than replace it", side.Alias, attr)
 	}
 	if rows < minProbeRows {
-		return nil, fmt.Sprintf("the hashed side holds %d rows, below the %d where "+
+		return "", 0, 0, fmt.Sprintf("the hashed side holds %d rows, below the %d where "+
 			"narrowing is worth deciding", rows, minProbeRows)
 	}
+	return attr, rows, segments, ""
+}
 
-	// Now the part that costs a scan. The streamed side is held either way from here: if the
-	// probe is declined below, it is handed back to be streamed from memory, so the scan is
-	// not wasted.
-	//
-	// Holding it is a real cost, and the one it is bounded by is MaxHashRows -- the same
-	// bound the hashed side has -- so a join that takes this path can hold two bounded
-	// sides rather than one. That is the price of the decision, and it is why every gate
-	// that can be checked without reading a row is checked above.
-	held := make([]*joinRow, 0, 256)
-	seen := make(map[string]bool, 256)
-	var lits []string
-	for ad := range scanSeq {
-		held = append(held, ad)
-		if len(held) > p.limits.MaxHashRows {
-			return nil, fmt.Sprintf("the streamed side holds more than %d rows, so holding "+
-				"it to collect its keys would cost what hashing the other side costs",
-				p.limits.MaxHashRows)
+// rowHalfValue evaluates the accumulated row's half of a step's single equality, which is
+// what a probe narrows the step's table to.
+func (p *joinPlan) rowHalfValue(sp *joinStepPlan, rows []*joinRow) (classad.Value, bool) {
+	if len(sp.equiRow) != 1 {
+		return classad.Value{}, false
+	}
+	// The same bare-attribute shortcut the hash key uses: the probe reads one half of every
+	// scanned row, so decoding each one to read one attribute is the cost this scan exists
+	// to avoid.
+	if name := sp.equiRowAttr[0]; name != "" {
+		if rows[0] == nil {
+			return classad.Value{}, false
 		}
-		if len(lits) > maxProbeKeys {
-			continue // already past the cap; keep reading so the held side stays complete
-		}
-		// The same bare-attribute shortcut the hash key uses: the probe reads the FIRST
-		// equality half of every streamed row, so decoding each one to read one attribute
-		// is the cost this scan exists to avoid.
-		var kv classad.Value
-		if name := p.equiLeftAttr[0]; name != "" {
-			kv = ad.eval(name)
-		} else {
-			kv = p.equiLeft[0].Eval(ad.record())
-		}
-		lit, ok := joinKeyLiteral(kv)
-		if !ok {
-			// No usable key value: this row matches nothing through the equality, so it
-			// contributes no term -- and must not narrow the other side on its behalf.
-			continue
-		}
-		if !seen[lit] {
-			seen[lit] = true
-			lits = append(lits, lit)
+		return rows[0].eval(name), true
+	}
+	if al := sp.rowAliased[0]; al != nil {
+		if v, ok := al.eval(rows); ok {
+			return v, true
 		}
 	}
-	probe := &joinProbe{attr: attr, rows: rows, keys: len(lits), held: held}
-	lookups := segments * len(lits)
-	switch {
-	case len(lits) == 0:
-		return probe, "no row of the streamed side has a usable key value"
-	case len(lits) > maxProbeKeys:
-		return probe, fmt.Sprintf("the streamed side has more than %d distinct keys", maxProbeKeys)
-	case lookups*probeLookupCost > rows:
-		return probe, fmt.Sprintf("%d keys across %d segments is %d index lookups against a "+
-			"%d-row scan, which costs more than it saves", len(lits), segments, lookups, rows)
-	}
-	sort.Strings(lits) // so the same join builds the same constraint
-	terms := make([]string, len(lits))
-	for i, l := range lits {
-		terms[i] = attr + " == " + l
-	}
-	probe.cons = "(" + strings.Join(terms, " || ") + ")"
-	return probe, ""
+	return sp.equiRow[0].Eval(p.rowHalfScope(sp, rows)), true
 }
 
 // joinSideStats reports what the decision needs about the side about to be hashed: how many
@@ -299,15 +390,4 @@ func quoteClassAdString(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
-}
-
-// adsSeq streams a materialized side.
-func adsSeq(ads []*classad.ClassAd) iter.Seq[*classad.ClassAd] {
-	return func(yield func(*classad.ClassAd) bool) {
-		for _, ad := range ads {
-			if !yield(ad) {
-				return
-			}
-		}
-	}
 }

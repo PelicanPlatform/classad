@@ -386,7 +386,40 @@ const (
 	// render. The join still runs over the FULL rows: redacting before the condition would
 	// make which rows match depend on who asked.
 	opJoinWire op = 71
+
+	// opJoinChain is opJoin over a CHAIN of tables rather than a pair: the FROM side, then
+	// one step per table folded in after it, each with its own kind, ON terms and
+	// equalities.
+	//
+	// Separate from opJoin rather than a longer opJoin, because opJoin's body is two sides
+	// and an older server reading a third would not find one. The prefix is shared through
+	// the FROM side, which is what lets one encoder and one decoder serve both -- two
+	// spellings of the same plan drifting apart is the failure that property prevents.
+	//
+	// The kind byte is written and ignored: a chain's kinds are per step, and the byte stays
+	// only so the prefix is the same bytes in the same order as opJoin's.
+	// [kind u8][limit i32][maxHash i32][maxPairs i32][maxRows i32]
+	//   [fromTable][fromAlias][fromConstraint][fromNAttrs i32]{[attr]}
+	//   [nPost i32]{[expr]}
+	//   [nSteps i32]{[kind u8][table][alias][constraint][nAttrs i32]{[attr]}
+	//                [nCond i32]{[expr]}[nEqui i32]{[rowHalf][tableHalf]}}
+	//     -> stream of [adText]
+	//
+	// The two halves of an equality are in DIFFERENT scopes, and the wire carries them that
+	// way: the table half is a bare path over the step's own table, and the row half is
+	// written over the accumulated row, so past the first step it is qualified by an alias.
+	opJoinChain op = 72
+
+	// opJoinChainWire is opJoinChain with its rows in WIRE FORM, batched many per frame:
+	// the request frame is opJoinChain's with a redact byte appended, and the reply is
+	// opJoinWire's.
+	opJoinChainWire op = 73
 )
+
+// joinOpCarriesChain reports whether an opcode's body is a chain of steps rather than a pair
+// of sides. It is the one place the two body layouts are told apart, so the encoder and the
+// decoder cannot disagree about which they are looking at.
+func joinOpCarriesChain(o op) bool { return o == opJoinChain || o == opJoinChainWire }
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
 // scan) -- the seven scan counts, then the four index-probe counts, then the answering tier.
@@ -546,6 +579,10 @@ func (o op) String() string {
 		return "Join"
 	case opJoinWire:
 		return "JoinWire"
+	case opJoinChain:
+		return "JoinChain"
+	case opJoinChainWire:
+		return "JoinChainWire"
 	}
 	return "op(unknown)"
 }

@@ -42,7 +42,7 @@ func TestSegmentFallocateReservesBlocks(t *testing.T) {
 	if err := unix.Stat(segPath, &st); err != nil {
 		t.Fatal(err)
 	}
-	allocated := int64(st.Blocks) * 512 // st_blocks is in 512-byte units
+	allocated := st.Blocks * 512 // st_blocks is in 512-byte units
 	// The segment was created 1 MiB. fallocate reserves (approximately) all of it; a sparse Truncate
 	// would leave only the touched pages allocated (a few KiB). Require most of it to be committed.
 	if allocated < st.Size*9/10 {

@@ -811,9 +811,13 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opQueryRawWireOpts:
 		sc.s.streamQueryRawWireOpts(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opJoin:
-		sc.s.streamJoin(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamJoin(sc.ctx, reqID, body, priv, false, sc.write, sc.qlog)
 	case opJoinWire:
-		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, false, sc.write, sc.qlog)
+	case opJoinChain:
+		sc.s.streamJoin(sc.ctx, reqID, body, priv, true, sc.write, sc.qlog)
+	case opJoinChainWire:
+		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, true, sc.write, sc.qlog)
 	case opQueryValues:
 		sc.s.streamQueryValues(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchSorted:

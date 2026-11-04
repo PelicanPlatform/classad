@@ -389,7 +389,7 @@ func (p *columnProducer) run(q *vm.Query, redact bool) {
 	cs := &colScope{bc: p.bc, c: c}
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: p.bc}
-	scratch := vecScratchPool.Get().(*vm.VecScratch)
+	scratch := vecScratchPool.Get().(*vm.VecScratch) //nolint:errcheck // the pool's New returns exactly this type
 	defer func() {
 		scratch.Release()
 		vecScratchPool.Put(scratch)
