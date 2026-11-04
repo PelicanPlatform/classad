@@ -37,7 +37,19 @@ func candFixture(tb testing.TB, n int) *Collection {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	c := New(Options{Shards: 1, SegmentSize: 1 << 16, Codec: cd})
+	// SIDECAR TIER, deliberately: ColumnarSegmentBudget -1 keeps the sealed segments ROW-NATIVE.
+	//
+	// The narrowing tests built on this fixture pin what the columns may conclude from an escape --
+	// above all that an attribute holding an EXPRESSION makes the query the evaluator's, because a
+	// node cannot be compared without evaluating it. That is true of a sidecar block, whose columns
+	// hold literals and nothing else.
+	//
+	// It is NOT true of a columnarized segment. Its payload also carries a COMPUTED cell: the
+	// rewrite evaluates the expression once and stores the value beside the column (colcomputed.go),
+	// so the columns can answer and the answer is right. Running these assertions against that tier
+	// would be asserting a property it deliberately does not have. See
+	// TestColumnarNativeAnswersExpressionValuedFields for what that tier is held to instead.
+	c := New(Options{Shards: 1, SegmentSize: 1 << 16, Codec: cd, ColumnarSegmentBudget: -1})
 	for i := 0; i < n; i++ {
 		// A real where the column is an integer one is what escaping is for, and unlike an
 		// out-of-slot integer it cannot be absorbed by the encoder widening the slot.

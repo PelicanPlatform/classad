@@ -30,7 +30,15 @@ func groupFixture(tb testing.TB, n int) (*Collection, uint32) {
 	// all, and every assertion below would pass against the row fallback) while still holding many
 	// more than colGroupRows records each -- which is the case row groups exist for. At ~200 bytes
 	// a record, 64 KiB is a few hundred records per segment, so a segment spans several groups.
-	store := New(Options{Shards: 1, SegmentSize: 1 << 16})
+	// SIDECAR TIER, deliberately: ColumnarSegmentBudget -1 keeps the sealed segments ROW-NATIVE so
+	// they carry a sidecar columnar block built beside the records they describe.
+	//
+	// That is the tier this fixture's assertions are about. Row GROUPING is a property of the sidecar
+	// block builder -- regroupSegments rebuilds a block from the segment's records at a chosen group
+	// size and compares the answers -- and a columnarized segment has no records left to rebuild from:
+	// its schema'd values live only in its payload, so a block rebuilt from the arena would describe a
+	// handful of leftover attributes. The sweep would then compare two wrong answers.
+	store := New(Options{Shards: 1, SegmentSize: 1 << 16, ColumnarSegmentBudget: -1})
 	for i := 0; i < n; i++ {
 		src := fmt.Sprintf("Cpus = %d\nMemory = %d\nProcId = %d\nOwner = \"u%d\"\nMachine = \"m%04d.example.org\"",
 			1+i%16, 1024+(i%64)*512, i%10, i%32, i)
@@ -59,7 +67,10 @@ func groupFixture(tb testing.TB, n int) (*Collection, uint32) {
 // testdata is not present.
 func fatFixture(tb testing.TB, n int) (*Collection, uint32) {
 	tb.Helper()
-	store := New(Options{Shards: 1, SegmentSize: 1 << 22})
+	// SIDECAR TIER, for the reason groupFixture gives: this fixture is measured through regroup,
+	// which rebuilds a block from the segment's RECORDS, and a columnarized segment no longer keeps
+	// the values that block would have to describe.
+	store := New(Options{Shards: 1, SegmentSize: 1 << 22, ColumnarSegmentBudget: -1})
 	for i := 0; i < n; i++ {
 		var b []byte
 		b = append(b, fmt.Sprintf("Cpus = %d\nMemory = %d\nProcId = %d\n", 1+i%16, 1024+(i%64)*512, i%10)...)

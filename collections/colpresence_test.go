@@ -103,7 +103,11 @@ func TestPresenceCountMatchesRowPath(t *testing.T) {
 // rest of the ad, so it cannot be classified from its node -- the columnar path must DECLINE and let
 // the caller evaluate, rather than guess that "present" means "defined".
 func TestPresenceCountDeclinesOnExpression(t *testing.T) {
-	c := New(Options{Shards: 1, SegmentSize: 1 << 16})
+	// SIDECAR TIER: the escape-bitmap presence path reads "this record escaped this field" out of a
+	// block whose columns hold literals, where an escape may mean missing OR exceptional and an
+	// expression can be neither -- so it must decline. A columnarized segment carries the
+	// expression's computed value and can decide, which is a different question than this one.
+	c := New(Options{Shards: 1, SegmentSize: 1 << 16, ColumnarSegmentBudget: -1})
 	defer c.Close()
 	for i := 0; i < 3000; i++ {
 		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nOwner = \"u%d\"", i/10, i%10, i%32)
