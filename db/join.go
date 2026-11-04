@@ -298,7 +298,22 @@ type joinPlan struct {
 	postAlias *aliasedCond
 	limit     int
 	limits    JoinLimits
+	// Scratch for spliceComposite, which runs once per OUTPUT row. A plan is compiled per
+	// query and its rows are yielded to one consumer in order, so this is per-query state,
+	// not shared. bodies and entBufs are reused across rows; member0 holds the FROM side's
+	// narrowed bytes for as long as the walk stays on one scan row (see scanRow).
+	bodies        []memberBody
+	entBufs       [][]byte
+	member0       memberBody
+	member0OK     bool
+	member0Cached bool
 }
+
+// scanRow marks the start of a new FROM-side row, dropping what spliceComposite cached for
+// side 0. The scanned side is constant beneath one walk; this is what says when it stops
+// being, and it is called even when the walk emits nothing, so a row that matches no
+// candidate cannot leave a stale member behind for the next one.
+func (p *joinPlan) scanRow() { p.member0Cached = false }
 
 // nSides is how many tables the row is made of.
 func (p *joinPlan) nSides() int { return len(p.aliases) }
@@ -786,6 +801,7 @@ func runJoin[T any](p *joinPlan, hashSeqs []iter.Seq[*joinRow], scanSeq iter.Seq
 		for l := range scanSeq {
 			stats.ScanRows++
 			rows[0] = l
+			p.scanRow()
 			if walk(0) {
 				return
 			}

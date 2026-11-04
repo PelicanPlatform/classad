@@ -54,10 +54,34 @@ import (
 func (p *joinPlan) spliceComposite(dst []byte, rows []*joinRow) ([]byte, bool) {
 	// Narrow every side first: one side that cannot be spliced takes the whole row down the
 	// fallback, and finding that out after writing a header would mean unwinding it.
-	bodies := make([]memberBody, len(rows))
+	if cap(p.bodies) < len(rows) {
+		p.bodies = make([]memberBody, len(rows))
+		p.entBufs = make([][]byte, len(rows))
+	}
+	bodies := p.bodies[:len(rows)]
 	n := 0
 	for i, r := range rows {
-		b, ok := r.memberBody(p.projects[i])
+		// SIDE 0 IS NARROWED ONCE PER SCAN ROW, NOT ONCE PER OUTPUT ROW. It is the FROM
+		// side, and the walk holds it fixed while it emits every row that joins to it --
+		// k of them at expansion k -- so re-deriving its bytes per output row re-answers
+		// the same LookupByName calls k times. scanRow says when it stops being the same
+		// row; nothing here infers that from a pointer, because the scan is free to hand
+		// back one reused joinRow or one reused byte arena and both would compare equal.
+		if i == 0 && p.member0Cached {
+			if !p.member0OK {
+				return dst, false
+			}
+			bodies[0] = p.member0
+			if p.member0.ok {
+				n++
+			}
+			continue
+		}
+		b, ok := r.memberBodyInto(p.entBufs[i], p.projects[i])
+		p.entBufs[i] = b.entries // keep the grown buffer, whatever came of it
+		if i == 0 {
+			p.member0, p.member0OK, p.member0Cached = b, ok, true
+		}
 		if !ok {
 			return dst, false
 		}
@@ -106,6 +130,15 @@ type memberBody struct {
 // whole point -- an attribute holding an expression is copied as the expression it is, with
 // no AST built for it.
 func (r *joinRow) memberBody(attrs []string) (memberBody, bool) {
+	return r.memberBodyInto(nil, attrs)
+}
+
+// memberBodyInto is memberBody writing into a caller-owned buffer, so a scan that narrows a
+// side per row reuses one allocation instead of growing a fresh entries slice from nil every
+// time. The returned entries alias buf, so a caller that caches them must not pass that same
+// buffer back until it is done with them -- spliceComposite keeps one buffer PER SIDE for
+// exactly that reason.
+func (r *joinRow) memberBodyInto(buf []byte, attrs []string) (memberBody, bool) {
 	if r == nil {
 		return memberBody{}, true // an absent side splices as no member
 	}
@@ -123,6 +156,7 @@ func (r *joinRow) memberBody(attrs []string) (memberBody, bool) {
 		return memberBody{}, false
 	}
 	var out memberBody
+	out.entries = buf[:0]
 	for _, name := range attrs {
 		node, found := r.w.LookupByName(name)
 		if !found {
