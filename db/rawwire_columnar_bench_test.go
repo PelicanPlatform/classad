@@ -16,25 +16,43 @@ import (
 // build one: "No query, so every record is a candidate for the columnar projection". Of the three
 // siblings, only the unconstrained WIRE read goes without.
 //
-// That looks like a plain omission. It is not, and this benchmark exists to stop it being
-// "fixed" as one.
+// It IS a real gap, and the first version of this comment got the reason wrong. The numbers and
+// the correction are both kept, because the mistake is the instructive part.
 //
 // MEASURED, 30 iterations x 3, best of each arm, over a columnarized archive:
 //
-//	n        true-shortcut          equivalent predicate      allocations
-//	20,000   17.0 ms                13.7 ms  (1.24x FASTER)   265k -> 20k   (13x fewer)
-//	100,000  29.3 ms  (2.37x FASTER) 69.5 ms                  371k -> 100k  (3.7x fewer)
+//	n        true-shortcut           equivalent predicate     allocations
+//	20,000   17.0 ms                 13.7 ms  (1.24x faster)  265k -> 20k   (13x fewer)
+//	100,000  29.3 ms  (2.37x faster) 69.5 ms                  371k -> 100k  (3.7x fewer)
 //
-// The columnar path allocates far less at BOTH sizes and is faster at one of them. Routing the
-// no-WHERE read through it -- the obvious reading of the three siblings -- would make the 100k
-// case 2.4x slower.
+// Read alone that says the columnar projection loses at scale, and that routing the no-WHERE read
+// through it would be a 2.4x regression at 100k. That reading is WRONG: the two arms do not get
+// the same parallelism.
 //
-// WHAT THE PER-RECORD NUMBERS SAY. The shortcut costs 0.85 us/record at 20k and 0.29 us/record at
-// 100k; the columnar path is flat at 0.69 and 0.70. One of them is getting something back from
-// size and the other is not, which is the shape of a fan-out engaging on one path only. Both
-// gates read identically (qsem != nil && len(tasks) >= 2 && totalBytes >= parallelMinBytes), so
-// that is a hypothesis this benchmark does NOT settle -- the fan-out counters are unexported, and
-// confirming it needs a test inside collections.
+// An archive sets ReverseScan ("newest-first Query, matching condor_history order"), and
+// reverseScan is documented to force "serial scans (no fan-out), since fan-out has no
+// cross-segment order". The CONSTRAINED wire read honours that -- its gate ends `&& !c.reverseScan`
+// -- so on an archive it is ALWAYS serial. runParallelWireScan, which serves the unconstrained
+// read, carries no such gate and fans out regardless. So the 100k row above is serial columnar
+// against parallel non-columnar, and the fan-out is doing the winning.
+//
+// Same benchmark at -cpu=1, where neither arm can use more than one P:
+//
+//	n        true-shortcut   equivalent predicate
+//	20,000   24.5 ms         14.8 ms  (1.65x faster)
+//	100,000  73.6 ms         77.0 ms  (about even)
+//
+// The shortcut loses 2.5x without parallelism (29.3 -> 73.6); the columnar path barely moves
+// (69.5 -> 77.0) because it never had any. Like for like the columnar projection is better at
+// 20k, even at 100k, and allocates 3.7x to 13x less throughout.
+//
+// SO THE HEADROOM IS THE COMBINATION NOTHING CURRENTLY OFFERS: the columnar projection with the
+// fan-out. The unconstrained read has fan-out without the projection; the constrained read has
+// the projection without fan-out, on archives, for every filtered history query there is.
+//
+// A caveat on what could not be controlled here: CatalogConfig.QueryParallelism does NOT reach
+// archives -- CreateArchiveTable calls openArchiveTable directly and never goes through
+// tableConfig -- so setting it to 1 is a no-op and -cpu=1 is the only lever that works.
 //
 // The control predicate names JobStatus, which is NOT value-indexed here. An earlier version used
 // `ClusterId >= 0` and measured the shortcut 2.9x faster at 100k -- because ClusterId IS
