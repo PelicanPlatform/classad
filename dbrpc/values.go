@@ -495,7 +495,11 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 		if enc.rows == 0 {
 			return
 		}
-		write(enc.encode(respHead(reqID, stStream)))
+		// Into the encoder's own buffer, which keeps the capacity the last batch reached.
+		// write is synchronous and may not retain the frame, so by the time the next batch
+		// overwrites it this one has gone out.
+		enc.frame = enc.encode(appendRespHead(enc.frame[:0], reqID, stStream))
+		write(enc.frame)
 		enc.reset()
 	}
 
@@ -636,11 +640,13 @@ type valueEncoder struct {
 	dictCodes []int32
 	dictStrs  []string
 
-	// frameCap is the largest frame this encoder has produced, so the next is allocated at that
-	// size instead of growing into it. A frame started at respHead's 16 bytes and reached ~100
-	// KB by append, reallocating and copying about a dozen times on the way -- half of the
-	// read's allocated bytes, all of it binary.AppendUint64 growing the slice.
-	frameCap int
+	// frame is the one buffer every batch of a scan is encoded into, reused rather than
+	// allocated per batch. A frame used to start at respHead's 16 bytes and reach ~100 KB by
+	// append, reallocating and copying about a dozen times on the way.
+	//
+	// Safe because MsgConn.WriteMsg may not retain what it is given (see conn.go) and the mux
+	// serializes writers, so the previous frame has gone out before this one is built.
+	frame []byte
 }
 
 // valueExc is one cell that did not pack into its column's dense form. At package level rather
@@ -720,14 +726,6 @@ func chooseKind(vals []classad.Value) ValueKind {
 }
 
 func (e *valueEncoder) encode(b []byte) []byte {
-	// One allocation at the size the last frame reached, rather than a dozen as this one grows
-	// into it. Only ever grows, so a batch bigger than any before it still appends its way up
-	// once and raises the mark for the next.
-	if n := e.frameCap; n > cap(b) {
-		nb := make([]byte, len(b), n)
-		copy(nb, b)
-		b = nb
-	}
 	b = putI32(b, int32(e.rows))
 	b = putI32(b, int32(len(e.cols)))
 	validBytes := (e.rows + 7) / 8
@@ -841,9 +839,6 @@ func (e *valueEncoder) encode(b []byte) []byte {
 		// strings and values held here are the batch's own and are dropped by reset(); nothing
 		// outside has a reference, because the frame took bytes.
 		e.ints, e.reals, e.strs, e.boolBits, e.excs = ints, reals, strs, boolBits, excs
-	}
-	if len(b) > e.frameCap {
-		e.frameCap = len(b)
 	}
 	return b
 }
