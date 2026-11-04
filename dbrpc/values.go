@@ -495,7 +495,11 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 		if enc.rows == 0 {
 			return
 		}
-		write(enc.encode(respHead(reqID, stStream)))
+		// Into the encoder's own buffer, which keeps the capacity the last batch reached.
+		// write is synchronous and may not retain the frame, so by the time the next batch
+		// overwrites it this one has gone out.
+		enc.frame = enc.encode(appendRespHead(enc.frame[:0], reqID, stStream))
+		write(enc.frame)
 		enc.reset()
 	}
 
@@ -509,7 +513,22 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 	// stored, which this op never promised to do either way -- but under a LIMIT the order
 	// decides WHICH rows come back, and silently returning a different subset is more than a
 	// reordering. A limited read also stops early, so it is the one case with nothing to win.
-	if limit <= 0 && columnSource(ref, constraint, attrs, redact, ctx, enc, flush, &n, &colStats) {
+	// The column path writes a frame per batch chunk, straight from the producer's columns;
+	// flush above is the row-at-a-time path's, which the record scan below still uses.
+	emit := func(b *collections.Batch, lo, hi int) {
+		enc.frame = enc.encodeBatchFrame(appendRespHead(enc.frame[:0], reqID, stStream), b, lo, hi)
+		write(enc.frame)
+	}
+	// The accumulated columns are the same shape as a batch's, so the one frame writer serves
+	// both; see accumulate.
+	emitAcc := func() {
+		if enc.accRows == 0 {
+			return
+		}
+		emit(&collections.Batch{N: enc.accRows, Cols: enc.acc}, 0, enc.accRows)
+		enc.accReset()
+	}
+	if limit <= 0 && columnSource(ref, constraint, attrs, redact, ctx, enc, emit, emitAcc, &n, &colStats) {
 		write(respHead(reqID, stStreamEnd))
 		return
 	}
@@ -538,7 +557,8 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 // The decision is made before the first batch (see db.ErrColumnsUnsupported), which is what lets
 // this be a clean fall-through rather than a half-sent reply.
 func columnSource(ref tableRef, constraint string, attrs []string, redact bool, ctx context.Context,
-	enc *valueEncoder, flush func(), n *int, colStats *collections.ColumnScanStats) bool {
+	enc *valueEncoder, emit func(b *collections.Batch, lo, hi int), emitAcc func(), n *int,
+	colStats *collections.ColumnScanStats) bool {
 	var seq iter.Seq[*collections.Batch]
 	var err error
 	switch ref.kind {
@@ -558,15 +578,25 @@ func columnSource(ref tableRef, constraint string, attrs []string, redact bool, 
 			// a truncated reply must not read as a complete one.
 			return true
 		}
-		for r := range b.N {
-			enc.appendBatch(b, r)
-			*n++
-			if enc.rows >= ValueBatchRows {
-				flush()
+		// Straight from the producer's columns, never through classad.Value. A batch that
+		// completes a frame on its own is written from the BORROWED columns, with nothing
+		// copied; what is left over is accumulated for the next frame.
+		for lo := 0; lo < b.N; {
+			want := ValueBatchRows - enc.accRows
+			hi := min(lo+want, b.N)
+			if enc.accRows == 0 && hi-lo == ValueBatchRows {
+				emit(b, lo, hi) // a whole frame, borrowed
+			} else {
+				enc.accumulate(b, lo, hi)
+				if enc.accRows >= ValueBatchRows {
+					emitAcc()
+				}
 			}
+			*n += hi - lo
+			lo = hi
 		}
 	}
-	flush()
+	emitAcc()
 	return true
 }
 
@@ -587,6 +617,35 @@ type valueEncoder struct {
 	// release. A lookup with a borrowed string is fine: it hashes and compares without
 	// retaining.
 	owned map[string]string
+
+	// Per-column scratch, reused across columns and across batches. None of it escapes: each is
+	// consumed into the frame before the next column touches it, and the frame holds bytes, not
+	// these slices. Encoding used to allocate the whole set per COLUMN -- 474 times over a
+	// six-column read of 160k rows -- which was 41% of the read's allocated bytes.
+	valid    []byte
+	ints     []int64
+	reals    []float64
+	strs     []string
+	boolBits []byte
+	excs     []valueExc
+	// excRows is the direct path's exception list: row indexes only, since the cell is read
+	// back out of the batch column rather than carried.
+	excRows []int
+	// acc accumulates the producer's columns across batches; see accumulate.
+	acc     []collections.Column
+	accRows int
+	// Dictionary scratch, same reasoning; see buildStringDict.
+	dictIndex map[string]int32
+	dictCodes []int32
+	dictStrs  []string
+
+	// frame is the one buffer every batch of a scan is encoded into, reused rather than
+	// allocated per batch. A frame used to start at respHead's 16 bytes and reach ~100 KB by
+	// append, reallocating and copying about a dozen times on the way.
+	//
+	// Safe because MsgConn.WriteMsg may not retain what it is given (see conn.go) and the mux
+	// serializes writers, so the previous frame has gone out before this one is built.
+	frame []byte
 }
 
 // appendBatch appends row r of a column batch, boxing each cell as the encoder holds them.
@@ -620,6 +679,13 @@ func (e *valueEncoder) appendBatch(b *collections.Batch, row int) {
 		e.cols[i] = append(e.cols[i], v)
 	}
 	e.rows++
+}
+
+// valueExc is one cell that did not pack into its column's dense form. At package level rather
+// than declared inside encode so the encoder can hold the slice across calls.
+type valueExc struct {
+	row int
+	v   classad.Value
 }
 
 // ownedStringCap bounds the intern table. A column whose values are nearly all distinct -- a
@@ -700,22 +766,20 @@ func (e *valueEncoder) encode(b []byte) []byte {
 		var codes []int32
 		var dictStrs []string
 		if kind == KindString && e.dict {
-			if codes, dictStrs = buildStringDict(vals); dictStrs != nil {
+			if codes, dictStrs = e.buildStringDict(vals); dictStrs != nil {
 				kind = KindStringDict
 			}
 		}
 		b = append(b, byte(kind))
-		valid := make([]byte, validBytes)
-		var ints []int64
-		var reals []float64
-		var strs []string
-		var boolBits []byte
+		// Reused, so it has to be CLEARED: setBit only ever sets, and a stale bit would mark a
+		// cell valid that this column never packed.
+		valid := grow(e.valid, validBytes)
+		clear(valid)
+		e.valid = valid
+		ints, reals := e.ints[:0], e.reals[:0]
+		strs, boolBits := e.strs[:0], e.boolBits[:0]
+		excs := e.excs[:0]
 		nbool := 0
-		type exc struct {
-			row int
-			v   classad.Value
-		}
-		var excs []exc
 		for i, v := range vals {
 			packed := false
 			switch kind {
@@ -758,7 +822,7 @@ func (e *valueEncoder) encode(b []byte) []byte {
 			if packed {
 				setBit(valid, i)
 			} else {
-				excs = append(excs, exc{row: i, v: v})
+				excs = append(excs, valueExc{row: i, v: v})
 			}
 		}
 		b = putBytes(b, valid)
@@ -803,8 +867,20 @@ func (e *valueEncoder) encode(b []byte) []byte {
 			b = putI32(b, int32(x.row))
 			b = appendExcValue(b, x.v)
 		}
+		// Keep whatever capacity the appends won, for the next column and the next batch. The
+		// strings and values held here are the batch's own and are dropped by reset(); nothing
+		// outside has a reference, because the frame took bytes.
+		e.ints, e.reals, e.strs, e.boolBits, e.excs = ints, reals, strs, boolBits, excs
 	}
 	return b
+}
+
+// grow returns s re-sliced to n, allocating only when it does not already have the room.
+func grow(s []byte, n int) []byte {
+	if cap(s) >= n {
+		return s[:n]
+	}
+	return make([]byte, n)
 }
 
 // buildStringDict builds the dictionary and per-cell codes for a string column, or returns a nil
@@ -818,10 +894,17 @@ func (e *valueEncoder) encode(b []byte) []byte {
 // The test is the honest one -- the dictionary form must be SMALLER -- so a column of long,
 // nearly-distinct values ships plainly rather than paying for a dictionary and a code per row to
 // save allocations the receiver was going to make anyway.
-func buildStringDict(vals []classad.Value) ([]int32, []string) {
-	index := make(map[string]int32, 16)
-	var dict []string
-	codes := make([]int32, 0, len(vals))
+func (e *valueEncoder) buildStringDict(vals []classad.Value) ([]int32, []string) {
+	// Reused across columns and batches. The map must be CLEARED -- a code left from another
+	// column would be read as this dictionary's index and ship the wrong string.
+	if e.dictIndex == nil {
+		e.dictIndex = make(map[string]int32, 16)
+	} else {
+		clear(e.dictIndex)
+	}
+	index := e.dictIndex
+	dict := e.dictStrs[:0]
+	codes := e.dictCodes[:0]
 	plain, dictBytes, codeBytes := 0, 0, 0
 	for _, v := range vals {
 		if v.Type() != classad.StringValue {
@@ -839,6 +922,9 @@ func buildStringDict(vals []classad.Value) ([]int32, []string) {
 		codes = append(codes, c)
 		codeBytes += uvarintLen(uint64(c))
 	}
+	// Keep the capacity whichever way the payoff test goes: a column that declines the form
+	// still built these, and the next column should not have to allocate them again.
+	e.dictCodes, e.dictStrs = codes, dict
 	if len(codes) == 0 {
 		return nil, nil
 	}

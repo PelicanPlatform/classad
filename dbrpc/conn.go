@@ -12,6 +12,14 @@ import (
 // adapter (see cedaradapter); tests use a length-prefixed net.Pipe. WriteMsg may be
 // called concurrently with ReadMsg, but not concurrently with itself -- the mux
 // serializes writers.
+//
+// WRITEMSG MUST NOT RETAIN b. It may read it and copy from it, and must be finished
+// with it by the time it returns; the caller is free to overwrite it afterwards, and
+// the value stream does, reusing one buffer for every batch of a scan rather than
+// allocating a fresh frame each time. This is the ordinary io.Writer rule, written
+// down because something now depends on it: both implementations copy (pipeConn
+// writes it through, cedarConn hands it to CEDAR's SendMessage, which copies into the
+// stream's own frame buffer), and so does every test transport.
 type MsgConn interface {
 	WriteMsg(b []byte) error
 	ReadMsg() ([]byte, error)

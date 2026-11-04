@@ -2131,7 +2131,12 @@ func (s *Server) take(id uint64) (*serverTxn, bool) {
 // --- response frame builders ---
 
 func respHead(reqID uint64, status int32) []byte {
-	return putI32(putU64(make([]byte, 0, 16), reqID), status)
+	return appendRespHead(make([]byte, 0, 16), reqID, status)
+}
+
+// appendRespHead writes a response header into dst, for a caller holding its own frame buffer.
+func appendRespHead(dst []byte, reqID uint64, status int32) []byte {
+	return putI32(putU64(dst, reqID), status)
 }
 func resp(reqID uint64, status int32) []byte { return respHead(reqID, status) }
 func respErr(reqID uint64, msg string) []byte {

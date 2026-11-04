@@ -141,7 +141,7 @@ func TestStringDictionaryDeclinesWhereItWouldNotPay(t *testing.T) {
 	for i := range 500 {
 		vals = append(vals, classad.NewStringValue(fmt.Sprintf("a-very-long-and-distinct-value-%d", i)))
 	}
-	if codes, dict := buildStringDict(vals); dict != nil {
+	if codes, dict := newValueEncoder(1).buildStringDict(vals); dict != nil {
 		t.Errorf("a column of %d distinct values took the dictionary form (%d entries, %d codes)",
 			len(vals), len(dict), len(codes))
 	}
@@ -152,7 +152,7 @@ func TestStringDictionaryDeclinesWhereItWouldNotPay(t *testing.T) {
 	for i := range 500 {
 		repeat = append(repeat, classad.NewStringValue(fmt.Sprintf("user%d", i%8)))
 	}
-	codes, dict := buildStringDict(repeat)
+	codes, dict := newValueEncoder(1).buildStringDict(repeat)
 	if dict == nil {
 		t.Fatal("a column of 8 distinct values over 500 rows did not take the dictionary form")
 	}
