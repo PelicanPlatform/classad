@@ -237,3 +237,53 @@ func (e *valueEncoder) buildBatchStringDict(col *collections.Column, lo, hi int)
 	}
 	return codes, dict
 }
+
+// The accumulator: the producer's columns, OWNED, so a frame can span several batches.
+//
+// collections emits one batch per columnar block -- about 400 rows on a typical segment -- while a
+// frame carries ValueBatchRows. Framing per batch therefore fragments the stream: measured over a
+// 160,000-row six-column read it turned 79 frames into 383, and the per-frame work on both sides
+// cost 3.5x the allocations it saved. So batches are accumulated until they fill a frame.
+//
+// It is shaped as collections.Column because that is exactly what it holds, which lets the same
+// frame writer serve both: a borrowed batch straight from the producer, or this owned copy of
+// several. Kinds and numbers are bulk-copied; only strings are touched per cell, and only because
+// the accumulator outlives the batch whose region they alias.
+func (e *valueEncoder) accumulate(b *collections.Batch, lo, hi int) {
+	if e.acc == nil {
+		e.acc = make([]collections.Column, len(e.cols))
+	}
+	for ci := range e.acc {
+		dst := &e.acc[ci]
+		if ci >= len(b.Cols) {
+			// No such column in this batch: undefined for every row, as appendBatch reports.
+			for i := lo; i < hi; i++ {
+				dst.Kind = append(dst.Kind, collections.ValueUndefined)
+				dst.Num = append(dst.Num, 0)
+				dst.Str = append(dst.Str, "")
+			}
+			continue
+		}
+		src := &b.Cols[ci]
+		dst.Kind = append(dst.Kind, src.Kind[lo:hi]...)
+		dst.Num = append(dst.Num, src.Num[lo:hi]...)
+		for i := lo; i < hi; i++ {
+			s := ""
+			if src.Kind[i] == collections.ValueString {
+				s = e.intern(src.Str[i])
+			}
+			dst.Str = append(dst.Str, s)
+		}
+	}
+	e.accRows += hi - lo
+}
+
+// accReset drops the accumulated rows, keeping the capacity for the next frame.
+func (e *valueEncoder) accReset() {
+	for ci := range e.acc {
+		e.acc[ci].Kind = e.acc[ci].Kind[:0]
+		e.acc[ci].Num = e.acc[ci].Num[:0]
+		e.acc[ci].Str = e.acc[ci].Str[:0]
+	}
+	e.accRows = 0
+}

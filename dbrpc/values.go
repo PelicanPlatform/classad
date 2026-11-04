@@ -519,7 +519,16 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 		enc.frame = enc.encodeBatchFrame(appendRespHead(enc.frame[:0], reqID, stStream), b, lo, hi)
 		write(enc.frame)
 	}
-	if limit <= 0 && columnSource(ref, constraint, attrs, redact, ctx, enc, emit, &n, &colStats) {
+	// The accumulated columns are the same shape as a batch's, so the one frame writer serves
+	// both; see accumulate.
+	emitAcc := func() {
+		if enc.accRows == 0 {
+			return
+		}
+		emit(&collections.Batch{N: enc.accRows, Cols: enc.acc}, 0, enc.accRows)
+		enc.accReset()
+	}
+	if limit <= 0 && columnSource(ref, constraint, attrs, redact, ctx, enc, emit, emitAcc, &n, &colStats) {
 		write(respHead(reqID, stStreamEnd))
 		return
 	}
@@ -548,7 +557,7 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 // The decision is made before the first batch (see db.ErrColumnsUnsupported), which is what lets
 // this be a clean fall-through rather than a half-sent reply.
 func columnSource(ref tableRef, constraint string, attrs []string, redact bool, ctx context.Context,
-	enc *valueEncoder, emit func(b *collections.Batch, lo, hi int), n *int,
+	enc *valueEncoder, emit func(b *collections.Batch, lo, hi int), emitAcc func(), n *int,
 	colStats *collections.ColumnScanStats) bool {
 	var seq iter.Seq[*collections.Batch]
 	var err error
@@ -569,15 +578,25 @@ func columnSource(ref tableRef, constraint string, attrs []string, redact bool, 
 			// a truncated reply must not read as a complete one.
 			return true
 		}
-		// Straight from the producer's columns into the frame, never through classad.Value.
-		// Chunked at the same row cap the row-at-a-time path flushes on, so a large batch
-		// still arrives as several frames rather than one oversized one.
-		for lo := 0; lo < b.N; lo += ValueBatchRows {
-			hi := min(lo+ValueBatchRows, b.N)
-			emit(b, lo, hi)
+		// Straight from the producer's columns, never through classad.Value. A batch that
+		// completes a frame on its own is written from the BORROWED columns, with nothing
+		// copied; what is left over is accumulated for the next frame.
+		for lo := 0; lo < b.N; {
+			want := ValueBatchRows - enc.accRows
+			hi := min(lo+want, b.N)
+			if enc.accRows == 0 && hi-lo == ValueBatchRows {
+				emit(b, lo, hi) // a whole frame, borrowed
+			} else {
+				enc.accumulate(b, lo, hi)
+				if enc.accRows >= ValueBatchRows {
+					emitAcc()
+				}
+			}
 			*n += hi - lo
+			lo = hi
 		}
 	}
+	emitAcc()
 	return true
 }
 
@@ -645,6 +664,9 @@ type valueEncoder struct {
 	// excRows is the direct path's exception list: row indexes only, since the cell is read
 	// back out of the batch column rather than carried.
 	excRows []int
+	// acc accumulates the producer's columns across batches; see accumulate.
+	acc     []collections.Column
+	accRows int
 	// Dictionary scratch, same reasoning; see buildStringDict.
 	dictIndex map[string]int32
 	dictCodes []int32
