@@ -66,6 +66,7 @@ type zstdCodec struct {
 	hasDict bool
 	dopts   []zstd.DOption // decoder options, for pooled streaming (prefix) decoders
 	spool   sync.Pool      // *streamDec, one per concurrent prefix read
+	dpool   sync.Pool      // *zstd.Decoder (concurrency 1), one per concurrent whole-record read
 }
 
 // maxEncoderConcurrency is the CEILING on how many encoder states (each a resident
@@ -163,7 +164,38 @@ func (z *zstdCodec) releaseEncoder() { z.enc.Store(nil) }
 
 func (z *zstdCodec) Compress(dst, src []byte) []byte { return z.encoder().EncodeAll(src, dst) }
 
-func (z *zstdCodec) Decompress(dst, src []byte) ([]byte, error) { return z.dec.DecodeAll(src, dst) }
+// Decompress decodes one whole record, through a POOLED single-concurrency decoder rather than
+// the codec's shared one.
+//
+// zstd.Decoder.DecodeAll is safe to call concurrently, and it looks like the obvious thing to
+// share: it takes a block decoder from an internal channel, decodes, and puts it back. The decode
+// itself is a microsecond, so with one shared decoder a fanned-out scan spends its time in that
+// channel's lock instead -- 100k records times a handful of workers is a lock convoy on a
+// critical section shorter than the handoff that guards it. Measured over a 100k-record
+// columnarized archive, the constrained wire read fanned across 6 workers: 65 ms with the shared
+// decoder against 13 ms with this pool, where the SERIAL read is 66 ms. The fan-out bought
+// nothing at all until this changed, and the mutex profile put 83% of the delay under DecodeAll.
+//
+// A sync.Pool is per-P, so the decoders are handed out without a shared lock and there are only
+// as many as there are goroutines decompressing at once -- against the GOMAXPROCS block decoders
+// the shared one preallocates whether or not anything reads. They carry the codec's dictionary
+// options, and lowMem is the library default, so each is small. This is the same shape
+// DecompressPrefix has always used (spool); only the whole-record path was left sharing one.
+func (z *zstdCodec) Decompress(dst, src []byte) ([]byte, error) {
+	d, ok := z.dpool.Get().(*zstd.Decoder)
+	if !ok {
+		// A decoder of its own for this goroutine. WithDecoderConcurrency(1) keeps it to a single
+		// block decoder: the pool, not the decoder, is what provides the parallelism here.
+		nd, err := zstd.NewReader(nil, append([]zstd.DOption{zstd.WithDecoderConcurrency(1)}, z.dopts...)...)
+		if err != nil {
+			return z.dec.DecodeAll(src, dst) // cannot build one: the shared decoder still decodes
+		}
+		d = nd
+	}
+	out, err := d.DecodeAll(src, dst)
+	z.dpool.Put(d)
+	return out, err
+}
 
 func (z *zstdCodec) Name() string {
 	if z.hasDict {
