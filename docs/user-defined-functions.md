@@ -4,10 +4,8 @@ ClassAd ships a fixed set of built-in functions, and the database layer a fixed
 set of aggregates (`COUNT`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`). This
 page is about adding your own.
 
-**You need to be embedding the library in a Go program.** None of this is
-reachable from the REPL, from the Python driver, or from any other client yet —
-section 8 says exactly what is missing. Everything below is for the program that
-owns the process.
+**You need to be embedding the library in a Go program.** Everything below is
+for the program that owns the process.
 
 Every sample is an excerpt from a file `go test` runs; section 9 lists them.
 
@@ -401,33 +399,13 @@ anything else is an attribute. `want = RequestMemory` reads the attribute and
 binds a local; every later `want` is the local. `MY.want` always means the
 attribute.
 
-**What is not:** there is no parser, so the indentation-based syntax in the design
-document cannot be written down and run. Nothing outside `collections/vm` calls
-it, so it is not reachable from a query, a constraint, the REPL or Python. A
-script cannot define a named function, so it is not a fifth way to write a UDF —
+A script cannot define a named function, so it is not a fifth way to write a UDF,
 though a script can *call* one.
 
-The design, including the intended syntax and what remains, is in
+The indentation-based source syntax, and what remains to build, are in
 [docs/SCRIPTING_LANGUAGE_DESIGN.md](SCRIPTING_LANGUAGE_DESIGN.md).
 
-## 8. From a client: not yet
-
-None of this reaches the REPL, the Python driver, or any other client. Three
-separate things are missing, and they are independent:
-
-1. **Nothing loads a module from configuration.** `wasmudf` is a library; no
-   daemon calls it, and there is no setting that names a `.wasm` file to load at
-   start-up. A site admin has no way to install a function.
-2. **Aggregates cannot cross the wire.** An aggregate is identified on the RPC
-   protocol by a number, with no field for a name, so both ends refuse a
-   user-defined one. The SQL dialect has no syntax for one either.
-3. **ClassAd Script has no parser** (section 7).
-
-A *scalar* function is the closest to working: a `WHERE` clause is evaluated
-server-side, so a function registered in the server's own binary would already be
-callable from the REPL. Nothing registers one.
-
-## 9. Files
+## 8. Files
 
 | | |
 |---|---|
