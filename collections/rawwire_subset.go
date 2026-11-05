@@ -35,7 +35,9 @@ func (c *Collection) ScanRawWire(projection []string, redact bool) iter.Seq[[]by
 		// Decompression dominates a compressed scan and parallelizes across
 		// segments; the serial path below is the fallback (small scans, no budget,
 		// encrypted stores).
-		if c.runParallelWireScan(sel, sel.neededCount(), yield) {
+		// nil plan: this is the non-refs selector, whose closure rules differ, and giving it
+		// one is a separate question from the refs scan next door (see rawRefsProjPlan).
+		if c.runUnconstrainedWireFanout(nil, sel, redact, yield) {
 			return
 		}
 		emit := c.yieldWireRow(yield, sel)
@@ -68,12 +70,13 @@ func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact 
 		}
 		qp := c.newQueryPlan(q, proj, stats, redact)
 		rp := c.planReadQuery(qp)
-		// A full-scan constrained read fans out across segments, on the same terms the full-decode
-		// Query does: no index plan to walk (the fan-out visits whole segments), and no reverse
-		// order to preserve. The helper declines when the scan is too small or the worker budget
-		// is busy, and then the serial run below covers it -- the read is planned once either way.
-		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
-			if c.runParallelWireQuery(qp, sel, sel.neededCount(), yield) {
+		// A full-scan constrained read fans out across segments whenever there is no index plan
+		// to walk (the fan-out visits whole segments). A newest-first collection gets the ordered
+		// fan-out instead of the stealing one; see runWireFanout. The helper declines when the
+		// scan is too small or the worker budget is busy, and then the serial run below covers
+		// it -- the read is planned once either way.
+		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 {
+			if c.runWireFanout(qp, sel, sel.neededCount(), yield) {
 				return
 			}
 		}
