@@ -130,11 +130,11 @@ func ParseScriptBuilder(src string) (*Script, error) {
 // statement's expression can still be refused when it is LOWERED rather than when it is parsed --
 // the compiler is the only thing that knows which of its subtrees it delegates -- and an error
 // discovered then has to come back out with a position on it like every other.
-type stmt interface {
-	stmtNode()
-	at() int
-}
+type stmt interface{ at() int }
 
+// stmtAt is embedded in every statement to carry that position and to be the thing that makes it a
+// stmt. A separate empty marker method would say the same and be unreachable code, since the
+// position every statement has to answer for already distinguishes them.
 type stmtAt struct{ off int }
 
 func (s stmtAt) at() int { return s.off }
@@ -162,11 +162,6 @@ type resultStmt struct {
 	stmtAt
 	expr ast.Expr
 }
-
-func (*letStmt) stmtNode()    {}
-func (*ifStmt) stmtNode()     {}
-func (*whileStmt) stmtNode()  {}
-func (*resultStmt) stmtNode() {}
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -548,12 +543,6 @@ func (p *scriptParser) leadingWord(ln scriptLine) (string, int) {
 }
 
 func (p *scriptParser) text(from, to int) string {
-	if from < 0 {
-		from = 0
-	}
-	if to > len(p.clean) {
-		to = len(p.clean)
-	}
 	if from >= to {
 		return ""
 	}

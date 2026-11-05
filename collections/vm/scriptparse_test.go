@@ -355,6 +355,11 @@ func TestParseScriptErrors(t *testing.T) {
 		{"statements after result", "result = 1\nx = 2\n", 2, 1, "no statements may follow 'result'"},
 		{"result inside a block", "if MY.x:\n    result = 1\nresult = 2\n", 2, 5, "'result' must be a top-level statement"},
 		{"not a statement", "x = 1\nfoo(x)\nresult = x\n", 2, 1, "expected a statement"},
+		// A comparison is an expression, and an expression on its own is not a statement. These two
+		// are the mistakes that look most like assignments, so the operator has to be told apart
+		// from the assignment rather than merely found.
+		{"equality is not an assignment", "x = 1\nx == 2\nresult = x\n", 2, 1, "expected a statement"},
+		{"comparison is not an assignment", "x = 1\nx >= 2\nresult = x\n", 2, 1, "expected a statement"},
 		{"ad write", "MY.Foo = 1\nresult = 1\n", 1, 1, "writing to the ad is not implemented"},
 		{"dynamic write", "self[\"a\"] = 1\nresult = 1\n", 1, 1, "writing to the ad is not implemented"},
 		{"for is refused", "for x in MY.L:\n    y = x\nresult = y\n", 1, 1, "'for' is not implemented"},
@@ -395,6 +400,80 @@ func TestParseScriptErrors(t *testing.T) {
 	}
 }
 
+// TestParseScriptUnterminatedAtEndOfInput covers the lexical failures that run off the end of the
+// source rather than off the end of a line. They take a different branch from their mid-file
+// equivalents -- the scanner stops because there is no more input, not because it found a break --
+// and that branch is the one a file whose last line was being edited will reach.
+func TestParseScriptUnterminatedAtEndOfInput(t *testing.T) {
+	cases := []struct{ name, src, contains string }{
+		{"unclosed bracket, no trailing newline", "x = (1 + 2", "unclosed '('"},
+		{"unterminated string, no trailing newline", `x = "abc`, "unterminated string literal"},
+		{"unterminated quoted name, no trailing newline", "x = 'abc", "unterminated quoted attribute name"},
+		{"unterminated quoted name at a line break", "x = 'abc\nresult = x\n", "unterminated quoted attribute name"},
+		{"unterminated block comment", "x = 1 /* oops", "unterminated /* comment"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseScript(tc.src)
+			if err == nil {
+				t.Fatal("expected a rejection")
+			}
+			var se *ScriptSyntaxError
+			if !errors.As(err, &se) {
+				t.Fatalf("not a *ScriptSyntaxError: %T %v", err, err)
+			}
+			if se.Line < 1 || se.Column < 1 {
+				t.Errorf("error without a position: %d:%d", se.Line, se.Column)
+			}
+			if !strings.Contains(se.Msg, tc.contains) {
+				t.Errorf("message %q does not mention %q", se.Msg, tc.contains)
+			}
+		})
+	}
+}
+
+// TestParseScriptAssignmentTargets covers what may and may not stand on the left of an assignment.
+// The quoted form is the only way to bind a local whose name is a lowercase keyword, so its failure
+// modes are worth pinning as precisely as its successes.
+func TestParseScriptAssignmentTargets(t *testing.T) {
+	bad := []struct{ name, src, contains string }{
+		{"two words", "x y = 1\nresult = x\n", "expected a local name"},
+		{"nothing at all", "= 1\nresult = 1\n", "expected a local name"},
+		{"empty quoted name", "'' = 1\nresult = 1\n", "expected a quoted attribute name"},
+		{"trailing junk after a quoted name", "'a'b = 1\nresult = 1\n", "expected a quoted attribute name"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseScript(tc.src)
+			if err == nil {
+				t.Fatal("expected a rejection")
+			}
+			if !strings.Contains(err.Error(), tc.contains) {
+				t.Errorf("message %v does not mention %q", err, tc.contains)
+			}
+		})
+	}
+
+	good := []struct{ name, src, want string }{
+		// The assignment operator is found at bracket depth zero and outside quotes, so neither an
+		// `=` inside a string nor the ones inside an ad literal can be mistaken for it.
+		{"equals inside a string", "x = \"a=b\"\nresult = x\n", `"a=b"`},
+		{"equals inside an ad literal", "policy = [ a = 1; b = 2 ]\nresult = isClassAd(policy)\n", "true"},
+		{"escaped quote in a quoted name", "'a\\'b' = 41\nresult = 'a\\'b' + 1\n", "42"},
+		// A comment with no newline after it is the end of the input, not the end of a line.
+		{"comment at end of input", "result = 1\n# done", "1"},
+		// Nor does the last statement need a line terminator to be a statement.
+		{"no trailing newline", "x = 41\nresult = x + 1", "42"},
+	}
+	for _, tc := range good {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mustScript(t, tc.src).Run(mustAd(t, `[]`)).String(); got != tc.want {
+				t.Errorf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestScriptLocalCaptureIsTyped checks the refusal a caller might want to recognize rather than
 // print: a local read from inside a construct that is evaluated against the ad.
 func TestScriptLocalCaptureIsTyped(t *testing.T) {
@@ -414,6 +493,11 @@ func TestScriptLocalCaptureIsTyped(t *testing.T) {
 	}
 	if lc.Local != "x" {
 		t.Errorf("Local = %q, want x", lc.Local)
+	}
+	// Printed bare it names the package, the local and the subtree, because a builder caller has no
+	// line to be told about and the subtree is the only handle they have on it.
+	if msg := lc.Error(); !strings.HasPrefix(msg, "vm: script: ") || !strings.Contains(msg, "x ? 1 : 2") {
+		t.Errorf("Error() = %q", msg)
 	}
 
 	// The same expression with no local in it compiles, because nothing is captured: the delegated
