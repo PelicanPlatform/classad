@@ -11,9 +11,10 @@ import (
 // A SCRIPT: a sequence of local bindings followed by a result expression.
 //
 // This is the smallest thing that is a script rather than an expression, and it exists to settle the
-// binding model before any syntax or control flow is built on it. There is no parser: a script is
-// constructed through this API, because every question at this stage is about what a name means and
-// none of them are about how it is spelled.
+// binding model before any syntax or control flow was built on it. It predates the parser, which is
+// why it is a builder rather than a parse tree: every question it was written to settle is about
+// what a name means and none of them are about how it is spelled. ParseScript lowers source onto
+// this same API, so the two cannot disagree about a binding.
 //
 // WHAT A LOCAL IS. `x = Cpus + 1` binds a name that later statements read, and the scope never sees
 // it. A bare reference to a bound name is that local; a reference to anything else is an attribute,
