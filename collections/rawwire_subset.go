@@ -35,7 +35,9 @@ func (c *Collection) ScanRawWire(projection []string, redact bool) iter.Seq[[]by
 		// Decompression dominates a compressed scan and parallelizes across
 		// segments; the serial path below is the fallback (small scans, no budget,
 		// encrypted stores).
-		if c.runUnconstrainedWireFanout(sel, redact, yield) {
+		// nil plan: this is the non-refs selector, whose closure rules differ, and giving it
+		// one is a separate question from the refs scan next door (see rawRefsProjPlan).
+		if c.runUnconstrainedWireFanout(nil, sel, redact, yield) {
 			return
 		}
 		emit := c.yieldWireRow(yield, sel)

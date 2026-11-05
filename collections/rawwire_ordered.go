@@ -368,13 +368,20 @@ func (c *Collection) runWireFanout(qp queryPlan, sel *wireSubsetSelector, needed
 // read is made for this one: an ordered fan-out on a newest-first collection, the stealing one
 // otherwise.
 //
-// The plan passed is the plan the serial fallback below it uses -- no projection plan, so no
-// columnar projection -- because what this fixes is the ORDER, and giving the unconstrained read
-// the columnar projection is a separate change with its own crossover (it is 1.24x faster at 20k
-// rows and 2.4x slower at 100k when it cannot fan out).
-func (c *Collection) runUnconstrainedWireFanout(sel *wireSubsetSelector, redact bool, yield func([]byte) bool) bool {
+// The caller passes the plan its serial fallback uses, so the two agree whichever way the read
+// goes. For a refs scan that is now a real projection plan (see rawRefsProjPlan); it used to be
+// none, which cost the columnar projection on every record.
+//
+// An earlier version of this comment said that giving the unconstrained read the projection was a
+// separate change with its own crossover, "1.24x faster at 20k rows and 2.4x slower at 100k when
+// it cannot fan out". Both halves of that were artefacts. The slowdown was serial columnar being
+// compared against a parallel record scan, which this function is what fixes; and the small
+// margin was the fixture, whose ads carry eight attributes, so projecting three of them leaves
+// nothing to narrow. At the width a completed-job ad actually has, the projection is worth 8x in
+// time and 90x in allocations (see db.BenchmarkRawWireRefsByWidth).
+func (c *Collection) runUnconstrainedWireFanout(proj *projPlan, sel *wireSubsetSelector, redact bool, yield func([]byte) bool) bool {
 	if c.reverseScan {
-		return c.runOrderedWireQuery(queryPlan{sealed: sealedUseFor(redact)}, sel, sel.neededCount(), yield)
+		return c.runOrderedWireQuery(queryPlan{proj: proj, sealed: sealedUseFor(redact)}, sel, sel.neededCount(), yield)
 	}
 	return c.runParallelWireScan(sel, sel.neededCount(), yield)
 }
