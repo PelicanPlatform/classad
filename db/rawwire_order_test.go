@@ -7,11 +7,17 @@ import (
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
-// An archive sets ReverseScan ("newest-first Query, matching condor_history order"), and
-// reverseScan forces serial scans "since fan-out has no cross-segment order". The CONSTRAINED
-// wire read honours that gate; the unconstrained one (runParallelWireScan) has no such gate.
+// An archive is newest-first (ReverseScan, "matching condor_history order"). Both spellings of the
+// same read must say so, and for a while neither reliably did: reverseScan was documented to force
+// serial scans "since fan-out has no cross-segment order", so the CONSTRAINED read gave up its
+// fan-out to keep the order, while the unconstrained one carried no such gate and gave up the
+// ORDER to keep the fan-out -- silently, and only when the worker budget happened to be free. On a
+// 20k archive `true` yielded ClusterId 1376 first where `JobStatus >= 0` yielded 19999.
 //
-// So: do the two spellings of the same read agree on order?
+// Both now go through the ordered fan-out (collections.runWireFanout), which recovers the order
+// from the segments rather than from the records: the segments are dealt to the workers newest
+// first and the consumer drains them in that order, so nothing is compared and nothing is sorted.
+// This was an XFAIL that skipped while the defect stood. It is an assertion.
 func TestRawWireRefsOrderMatchesBetweenSpellings(t *testing.T) {
 	cat, a := archiveCountFixture(t, 20000)
 	defer cat.Close()
@@ -40,18 +46,9 @@ func TestRawWireRefsOrderMatchesBetweenSpellings(t *testing.T) {
 	predicate := first("JobStatus >= 0")
 	t.Logf("first ClusterId: `true` => %d, `JobStatus >= 0` => %d (newest is 19999)", shortcut, predicate)
 
-	// XFAIL, deliberately, and self-maintaining: it SKIPS while the defect is present and FAILS
-	// once it is fixed, so whoever fixes it is told to turn this back into a plain assertion
-	// rather than leaving a test that passes for the wrong reason.
 	if shortcut != predicate {
-		t.Skipf("KNOWN DEFECT: the two spellings of the same read disagree on order -- `true` "+
-			"yielded %d first, `JobStatus >= 0` yielded %d. The archive promises newest-first "+
-			"(ReverseScan, 'matching condor_history order'), and reverseScan is documented to "+
-			"force serial scans 'since fan-out has no cross-segment order'. The CONSTRAINED wire "+
-			"read honours that gate (`... && !c.reverseScan`); runParallelWireScan, which serves "+
-			"the unconstrained read, has no such gate and fans out anyway. Fixing it means either "+
-			"gating that fan-out too or restoring order after it -- both have a cost, which is why "+
-			"this records the defect rather than choosing.", shortcut, predicate)
+		t.Errorf("the two spellings of the same read disagree on order: `true` yielded %d first, "+
+			"`JobStatus >= 0` yielded %d", shortcut, predicate)
 	}
 	if shortcut != 19999 {
 		t.Errorf("newest-first: first ClusterId is %d, want 19999", shortcut)

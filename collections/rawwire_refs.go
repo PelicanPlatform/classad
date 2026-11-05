@@ -30,11 +30,18 @@ import (
 func (c *Collection) ScanRawWireRefs(projection []string, redact bool) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		sel := c.newWireSubsetSelectorRefs(projection, redact, true)
-		if c.runParallelWireScan(sel, sel.neededCount(), yield) {
+		// THE SAME PROJECTION PLAN THE CONSTRAINED SPELLING BUILDS, for the same reason and
+		// with the same safety argument (see QueryRawWireRefsStats below). Without it this
+		// scan reassembles every record and narrows it afterwards, so asking for NO filter
+		// cost multiples of asking for one that matches everything: measured over a 20k-row
+		// archive of 80-attribute ads projecting 3, `true` was 107-118 ms against 14 ms for
+		// `JobStatus >= 0`, byte for byte the same output.
+		proj := c.rawRefsProjPlan(projection)
+		if c.runUnconstrainedWireFanout(proj, sel, redact, yield) {
 			return
 		}
 		emit := c.yieldWireRow(yield, sel)
-		q := queryPlan{sealed: sealedUseFor(redact)}
+		q := queryPlan{proj: proj, sealed: sealedUseFor(redact)}
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
 				return
@@ -63,20 +70,33 @@ func (c *Collection) QueryRawWireRefsStats(q *vm.Query, projection []string, red
 		// projection of literals refers to nothing and never triggers that; a projection
 		// naming an expression that reaches outside itself falls back per record, which is
 		// exactly the behaviour passing no plan gave unconditionally.
-		var proj *projPlan
-		if len(projection) > 0 {
-			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
-			proj.closure = true
-		}
+		proj := c.rawRefsProjPlan(projection)
 		qp := c.newQueryPlan(q, proj, stats, redact)
 		rp := c.planReadQuery(qp)
-		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
-			if c.runParallelWireQuery(qp, sel, sel.neededCount(), yield) {
+		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 {
+			if c.runWireFanout(qp, sel, sel.neededCount(), yield) {
 				return
 			}
 		}
 		c.runQuery(qp, rp, c.yieldWireRow(yield, sel))
 	}
+}
+
+// rawRefsProjPlan is the projection plan both spellings of a refs scan use, or nil when the
+// caller asked for the whole ad and there is nothing to narrow to.
+//
+// It is MARKED as feeding a consumer that evaluates. That is what makes it safe: the scan
+// checks each projected record for being closed under its references and reassembles the ones
+// that are not (see adClosed). A projection of literals refers to nothing and never triggers
+// that; a projection naming an expression that reaches outside itself falls back per record,
+// which is exactly the behaviour passing no plan gave unconditionally.
+func (c *Collection) rawRefsProjPlan(projection []string) *projPlan {
+	if len(projection) == 0 {
+		return nil
+	}
+	proj := c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
+	proj.closure = true
+	return proj
 }
 
 // wireRefSet is ONE row assembly's reference closure: the attribute names an emitted

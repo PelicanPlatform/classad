@@ -54,6 +54,14 @@ import (
 // archives -- CreateArchiveTable calls openArchiveTable directly and never goes through
 // tableConfig -- so setting it to 1 is a no-op and -cpu=1 is the only lever that works.
 //
+// RESOLVED. The combination is now offered: the constrained read fans out on an archive while
+// keeping its order (runOrderedWireQuery), and the unconstrained read builds the same projection
+// plan its sibling always did (rawRefsProjPlan). The two spellings cost about the same here
+// because THIS fixture cannot show the difference -- archiveCountFixture ads carry eight
+// attributes, and projecting three of eight leaves nothing to narrow. At the width a real
+// completed-job ad has, the gap was 8x in time and 90x in allocations; see
+// BenchmarkRawWireRefsByWidth, which sweeps only the width.
+//
 // The control predicate names JobStatus, which is NOT value-indexed here. An earlier version used
 // `ClusterId >= 0` and measured the shortcut 2.9x faster at 100k -- because ClusterId IS
 // value-indexed, so that predicate changed the READ PLAN into an index scan rather than isolating

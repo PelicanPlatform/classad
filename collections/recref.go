@@ -276,35 +276,8 @@ var errFramingLost = errors.New("collections: a walk lost the records' framing a
 func forEachVisibleRefReverse(s0 uint64, wins []segWindow, fn func(recRef) bool) {
 	var offs []uint32 // reused across the windows this frames itself
 	for wi := len(wins) - 1; wi >= 0; wi-- {
-		w := wins[wi]
-		d := w.dict()
-		ro := reverseOffsets(w)
-		if ro == nil {
-			offs = offs[:0]
-			off := 0
-			for off < w.used {
-				o := uint32(off)
-				if end, ok := w.dmg.skip(o); ok {
-					off = int(end)
-					continue
-				}
-				total := recTotalLen(w.data, o)
-				if total == 0 {
-					break
-				}
-				offs = append(offs, o)
-				off += int(total)
-			}
-			noteFramingLost(w, off)
-			ro = offs
-		}
-		for i := len(ro) - 1; i >= 0; i-- {
-			o := ro[i]
-			if !recIsMarker(w.data, o) && w.visible(o, s0) {
-				if !fn(recRef{w: w, off: o, dict: d}) {
-					return
-				}
-			}
+		if !forEachVisibleWindowRefReverse(s0, wins[wi], &offs, fn) {
+			return
 		}
 	}
 }
@@ -461,4 +434,50 @@ func segStoredOrReassembledWhy(c *Collection, seg *segment, off uint32) ([]byte,
 		return nil, nil, false, failReassemble
 	}
 	return full, identityCodec{}, true, failNone
+}
+
+// forEachVisibleWindowRefReverse is forEachVisibleRefReverse over a SINGLE window, for the
+// per-segment workers of an ordered fan-out.
+//
+// forEachVisibleRefReverse owes its callers two reversals: the windows backward, and the records
+// backward inside each. Only the second one belongs to a window, and only the second one a worker
+// can do, because a worker sees one window and not the order of the rest. The first is the
+// consumer's, which drains the per-segment results newest segment first.
+//
+// The offset slice is the caller's, reused across the windows it frames, exactly as the serial
+// walk reuses one across its whole pass; offs may be nil on the first call. A worker keeps its own,
+// which is what makes this safe to call from several goroutines at once -- the only state it
+// shares is reverseOffsets' published table, which is read atomically and extended under the
+// segment's own lock.
+func forEachVisibleWindowRefReverse(s0 uint64, w segWindow, offs *[]uint32, fn func(recRef) bool) bool {
+	d := w.dict()
+	ro := reverseOffsets(w)
+	if ro == nil {
+		*offs = (*offs)[:0]
+		off := 0
+		for off < w.used {
+			o := uint32(off)
+			if end, ok := w.dmg.skip(o); ok {
+				off = int(end)
+				continue
+			}
+			total := recTotalLen(w.data, o)
+			if total == 0 {
+				break
+			}
+			*offs = append(*offs, o)
+			off += int(total)
+		}
+		noteFramingLost(w, off)
+		ro = *offs
+	}
+	for i := len(ro) - 1; i >= 0; i-- {
+		o := ro[i]
+		if !recIsMarker(w.data, o) && w.visible(o, s0) {
+			if !fn(recRef{w: w, off: o, dict: d}) {
+				return false
+			}
+		}
+	}
+	return true
 }
