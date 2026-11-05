@@ -414,6 +414,46 @@ const (
 	// the request frame is opJoinChain's with a redact byte appended, and the reply is
 	// opJoinWire's.
 	opJoinChainWire op = 73
+
+	// opAggregateNamed and opArchiveAggregateNamed are the extended aggregate opcodes with
+	// an aggregate NAME appended to each spec, which is what lets a user-defined aggregate
+	// (db.RegisterAggregate, named in a spec as db.AggUser plus db.AggSpec.UserFunc) cross
+	// the wire at all.
+	//
+	// Until these, it could not. Every aggregate on the wire was a function selector and an
+	// argument, with nowhere to put the name, so a spec asking for p95 arrived saying only
+	// "the selector past MAX, over Cpus" -- missing the one field identifying WHICH
+	// aggregate was meant. Both ends refused it rather than guess.
+	//
+	// They are separate opcodes for the reason the *Filtered pair are: the selector is a
+	// u8, so a server that does not know this extension decodes the frame happily, fails to
+	// match the unknown function, and answers that column "undefined". That is a different
+	// aggregate reported as success. An opcode a server does not know is refused as a bad
+	// request instead, before any row, which the client surfaces as
+	// ErrNamedAggregateUnsupported. A client sends one only when some spec actually names a
+	// user-defined aggregate, so every query expressible on the older opcodes stays
+	// byte-identical on the wire.
+	//
+	// The name is carried per spec rather than once per request because a request mixes
+	// them freely -- COUNT(*) beside p95(Cpus) beside p99(Cpus) -- and it is empty for
+	// every built-in, which costs those four bytes and keeps one decoder for the tail.
+	//
+	// An unknown name FAILS the query (db.ErrNoSuchAggregate, tagged so errors.Is reaches
+	// it through the *ServerError). It is deliberately not answered as undefined: a caller
+	// that asked for p95 and got a column of undefined has been answered wrongly, where one
+	// that got an error knows what happened.
+	//
+	// The archive form carries a trailing stats byte so the EXPLAIN ANALYZE variant does
+	// not need an opcode of its own -- the opcode space was already multiplying through the
+	// product of the aggregate options (see opQueryRawWireOpts), and what makes a new
+	// capability safe is the server refusing what it does not understand, which the new
+	// opcode already provides for everything inside the frame. It is trailing, not leading,
+	// so the frame's prefix is byte-for-byte the archive aggregate prefix every other
+	// archive opcode writes.
+	// [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name]}
+	opAggregateNamed op = 74
+	// [name][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name]}[stats u8]
+	opArchiveAggregateNamed op = 75
 )
 
 // joinOpCarriesChain reports whether an opcode's body is a chain of steps rather than a pair
@@ -583,6 +623,10 @@ func (o op) String() string {
 		return "JoinChain"
 	case opJoinChainWire:
 		return "JoinChainWire"
+	case opAggregateNamed:
+		return "AggregateNamed"
+	case opArchiveAggregateNamed:
+		return "ArchiveAggregateNamed"
 	}
 	return "op(unknown)"
 }

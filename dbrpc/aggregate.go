@@ -37,33 +37,45 @@ const (
 // With no group columns it returns a single row aggregating the whole match. The
 // aggregation happens on the server, so only the (small) grouped result crosses
 // the wire, not every matched ad.
+//
+// A spec may name a USER-DEFINED aggregate (db.AggUser plus db.AggSpec.UserFunc). It is
+// resolved in the SERVER's process, against what that server registered with
+// db.RegisterAggregate -- registering it in this process registers it for queries this
+// process answers, which is a different thing. A name the server does not know fails the
+// query with db.ErrNoSuchAggregate; a server too old to carry a name at all refuses with
+// ErrNamedAggregateUnsupported. Neither is ever answered as an undefined column.
 func (c *Client) Aggregate(ctx context.Context, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
 	return c.AggregateTable(ctx, DefaultTable, constraint, groupBy, aggs)
 }
 
 // AggregateTable is Aggregate on the named table.
 func (c *Client) AggregateTable(ctx context.Context, table, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
-	if err := refuseUserAggregates(aggs); err != nil {
+	form := aggSpecFormFor(aggs)
+	if err := c.refuseNamedAggregate(aggs, form); err != nil {
 		return nil, err
 	}
-	filtered := anyFiltered(aggs)
 	build := func(id uint64) []byte {
-		// A filtered request goes out on the newer opcode, whose group tuple carries a
-		// bucket width; an unfiltered one keeps the original frame byte for byte.
-		if filtered {
-			b := putStr(putStr(req(id, opAggregateFiltered), table), constraint)
+		// A request naming a user-defined aggregate goes out on the named opcode, a filtered
+		// one on the extended opcode, and each of those group tuples carries a bucket width;
+		// a request neither names nor filters keeps the original frame byte for byte.
+		if form >= aggSpecFiltered {
+			o := opAggregateFiltered
+			if form >= aggSpecNamed {
+				o = opAggregateNamed
+			}
+			b := putStr(putStr(req(id, o), table), constraint)
 			b = putI32(b, int32(len(groupBy)))
 			for _, g := range groupBy {
 				b = putU64(putStr(b, g), 0)
 			}
-			return putAggSpecs(b, aggs, true)
+			return putAggSpecs(b, aggs, form)
 		}
 		b := putStr(putStr(req(id, opAggregate), table), constraint)
 		b = putI32(b, int32(len(groupBy)))
 		for _, g := range groupBy {
 			b = putStr(b, g)
 		}
-		return putAggSpecs(b, aggs, false)
+		return putAggSpecs(b, aggs, form)
 	}
 	_, frames, strm, err := c.callStream(build)
 	if err != nil {
@@ -96,11 +108,15 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 			case stErr:
 				return out, statusErr(status, body)
 			case stBadReq:
-				// Only reachable for a filtered request: a server too old to know
-				// opAggregateFiltered refuses the opcode. There is deliberately no
-				// fallback -- retrying without the filters would answer a different
-				// question and report it as success.
-				if filtered {
+				// Only reachable for an extended request: a server too old to know
+				// opAggregateFiltered (or opAggregateNamed) refuses the opcode. There is
+				// deliberately no fallback -- retrying without the filters, or without the
+				// aggregate's name, would answer a different question and report it as
+				// success.
+				if form >= aggSpecNamed {
+					return nil, ErrNamedAggregateUnsupported
+				}
+				if form >= aggSpecFiltered {
 					return nil, ErrExtendedAggregateUnsupported
 				}
 				return out, fmt.Errorf("dbrpc: aggregate rejected as a bad request")
@@ -124,13 +140,16 @@ func (c *Client) AggregateBucketed(ctx context.Context, constraint string, group
 
 // AggregateBucketedTable is AggregateBucketed on the named table.
 func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
-	if err := refuseUserAggregates(aggs); err != nil {
+	form := aggSpecFormFor(aggs)
+	if err := c.refuseNamedAggregate(aggs, form); err != nil {
 		return nil, err
 	}
-	filtered := anyFiltered(aggs)
 	build := func(id uint64) []byte {
 		o := opAggregateBucketed
-		if filtered {
+		switch {
+		case form >= aggSpecNamed:
+			o = opAggregateNamed // same request shape, specs carry a filter and a name
+		case form >= aggSpecFiltered:
 			o = opAggregateFiltered // same request shape, specs carry a filter
 		}
 		b := putStr(putStr(req(id, o), table), constraint)
@@ -138,7 +157,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 		for _, g := range groups {
 			b = putU64(putStr(b, g.Attr), uint64(g.BucketWidth))
 		}
-		return putAggSpecs(b, aggs, filtered)
+		return putAggSpecs(b, aggs, form)
 	}
 	_, frames, strm, err := c.callStream(build)
 	if err != nil {
@@ -173,8 +192,12 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 			case stBadReq:
 				// A server too old to know the opcode rejects it as a bad request. The
 				// caller can fall back to client-side bucketing -- but NOT for a filtered
-				// request, where dropping the filters would change the answer.
-				if filtered {
+				// or named request, where dropping the filters or the aggregate's name
+				// would change the answer.
+				if form >= aggSpecNamed {
+					return nil, ErrNamedAggregateUnsupported
+				}
+				if form >= aggSpecFiltered {
 					return nil, ErrExtendedAggregateUnsupported
 				}
 				return nil, ErrBucketedUnsupported
@@ -199,7 +222,7 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 	for i := range groups {
 		groups[i] = GroupCol{Attr: r.str()}
 	}
-	aggs, ok := readAggSpecs(r, reqID, write, false)
+	aggs, ok := readAggSpecs(r, reqID, write, aggSpecBase)
 	if !ok {
 		return
 	}
@@ -209,17 +232,26 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 // streamAggregateBucketed is streamAggregate where each group column may carry a
 // bucket width (opAggregateBucketed).
 func (s *Server) streamAggregateBucketed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
-	s.streamAggregateWidths(ctx, reqID, r, includePrivate, false, write, qlog)
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecBase, write, qlog)
 }
 
 // streamAggregateFiltered is streamAggregateBucketed whose specs carry a per-aggregate
 // filter (opAggregateFiltered). The request shape is otherwise identical, so a filtered
 // plain aggregate rides the bucketed frame with every width zero.
 func (s *Server) streamAggregateFiltered(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
-	s.streamAggregateWidths(ctx, reqID, r, includePrivate, true, write, qlog)
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecFiltered, write, qlog)
 }
 
-func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate, filtered bool, write func([]byte), qlog func(QueryLog)) {
+// streamAggregateNamed is streamAggregateFiltered whose specs also carry the NAME of a
+// user-defined aggregate (opAggregateNamed). The request shape is otherwise identical, so a
+// named aggregate composes with bucketing and filtering in one request. The name is resolved
+// against this process's registry (db.RegisterAggregate) by the reduction engine, which fails
+// the query for one it does not know rather than answering that column undefined.
+func (s *Server) streamAggregateNamed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecNamed, write, qlog)
+}
+
+func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate bool, form aggSpecForm, write func([]byte), qlog func(QueryLog)) {
 	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -232,17 +264,29 @@ func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *rea
 		attr := r.str()
 		groups[i] = GroupCol{Attr: attr, BucketWidth: int64(r.u64())}
 	}
-	aggs, ok := readAggSpecs(r, reqID, write, filtered)
+	aggs, ok := readAggSpecs(r, reqID, write, form)
 	if !ok {
 		return
 	}
 	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write, qlog)
 }
 
+// aggSpecForm selects which of the three aggregate-spec tails a frame carries. It is one
+// value rather than a pair of booleans so that the encoder and the decoder cannot disagree
+// about a combination that does not exist: a named frame always carries filters too, because
+// the named opcodes are the extended frame plus a name, and nothing writes a name without one.
+type aggSpecForm int
+
+const (
+	aggSpecBase     aggSpecForm = iota // [func u8][arg]            -- opAggregate, opArchiveAggregate
+	aggSpecFiltered                    // [func u8][arg][filter]    -- the *Filtered opcodes
+	aggSpecNamed                       // [func u8][arg][filter][name] -- the *Named opcodes
+)
+
 // readAggSpecs reads the [nAgg]{[func u8][arg]} tail shared by the aggregate opcodes,
-// writing respBad and returning ok=false on a malformed frame. filtered selects the
-// [func u8][arg][filter] form the *Filtered opcodes carry.
-func readAggSpecs(r *reader, reqID uint64, write func([]byte), filtered bool) ([]AggSpec, bool) {
+// writing respBad and returning ok=false on a malformed frame. form selects the wider tails
+// the *Filtered and *Named opcodes carry.
+func readAggSpecs(r *reader, reqID uint64, write func([]byte), form aggSpecForm) ([]AggSpec, bool) {
 	nAgg := int(r.i32())
 	if nAgg < 0 || nAgg > 1024 {
 		write(respBad(reqID))
@@ -251,14 +295,23 @@ func readAggSpecs(r *reader, reqID uint64, write func([]byte), filtered bool) ([
 	aggs := make([]AggSpec, nAgg)
 	for i := range aggs {
 		aggs[i] = AggSpec{Func: AggFunc(r.u8()), Arg: r.str()}
-		if filtered {
+		if form >= aggSpecFiltered {
 			aggs[i].Filter = r.str()
 		}
-		// No frame carries an aggregate NAME, so a selector asking for a user-defined one
-		// cannot be satisfied by anything this reader produces: it would reach the engine as
-		// a lookup of the empty name. That is a malformed frame rather than a query that
-		// fails late, and a client built against this package refuses to send one.
-		if aggs[i].Func == db.AggUser {
+		if form >= aggSpecNamed {
+			// Empty for every built-in, and the aggregate's registered name for a
+			// user-defined one. The server resolves it against its own registry; it is not
+			// read as anything else, so a name sent beside a built-in selector is ignored
+			// rather than refused.
+			aggs[i].UserFunc = r.str()
+		}
+		// Only the named frame has a field to put an aggregate's name in. On the older
+		// frames a selector asking for a user-defined one cannot be satisfied by anything
+		// this reader produces -- it would reach the engine as a lookup of the empty name --
+		// and the same goes for a named frame that left the name blank. That is a malformed
+		// frame rather than a query that fails late, and a client built against this package
+		// sends a named aggregate only on an opcode that can carry its name.
+		if aggs[i].Func == db.AggUser && aggs[i].UserFunc == "" {
 			write(respBad(reqID))
 			return nil, false
 		}
@@ -270,21 +323,47 @@ func readAggSpecs(r *reader, reqID uint64, write func([]byte), filtered bool) ([
 	return aggs, true
 }
 
-// ErrUserAggregateUnsupported is returned when a request names a user-defined aggregate. The
-// reduction engine takes one, but no opcode here has a field to put its NAME in: every aggregate
-// frame is a function selector plus an argument, so a user-defined one would go out as "the
-// selector past MAX, argument such-and-such" and arrive without the one thing identifying which
-// aggregate was meant. Refusing locally is the whole point -- the alternative is a frame that
-// LOOKS well formed and asks the server for something unnameable.
-var ErrUserAggregateUnsupported = errors.New(
-	"dbrpc: a user-defined aggregate cannot be sent over this protocol; run it against the db package directly")
+// ErrNamedAggregateUnsupported is returned when a request names a user-defined aggregate
+// (db.RegisterAggregate, sent as db.AggUser plus db.AggSpec.UserFunc) and the server is too
+// old to know the opcode that carries the name.
+//
+// There is deliberately no fallback. A server that does not know the opcode refuses it before
+// any row; retrying on an older opcode would drop the name and ask for a selector the server
+// does not recognize, which it answers "undefined" rather than refusing -- a different
+// aggregate reported as success.
+var ErrNamedAggregateUnsupported = errors.New(
+	"dbrpc: server does not support user-defined (named) aggregates")
 
-// refuseUserAggregates rejects a request the wire cannot express.
-func refuseUserAggregates(aggs []AggSpec) error {
+// ErrUserAggregateUnsupported is the former name of ErrNamedAggregateUnsupported, from when no
+// opcode here had a field to put an aggregate's NAME in and the client refused to send one at
+// all. The name now crosses, so the only reason a user-defined aggregate still fails for want
+// of protocol is a server too old to know the opcode that carries it -- which is the closest
+// thing to what this meant, and is the same error value, so errors.Is against either matches.
+//
+// Deprecated: use ErrNamedAggregateUnsupported, which says which side is too old.
+var ErrUserAggregateUnsupported = ErrNamedAggregateUnsupported
+
+// refuseNamedAggregate stops a named request that cannot be served, before it costs a round
+// trip. A peer that advertised its features and did not name this one is a definite no, so
+// issuing the request to find out would be a wasted trip to a refusal we already have. A peer
+// that advertised NOTHING is unknown, not no -- it may be a build that predates advertisement
+// entirely -- so that one is still probed, and the stBadReq it may answer with maps to the
+// same error.
+func (c *Client) refuseNamedAggregate(aggs []AggSpec, form aggSpecForm) error {
+	if form < aggSpecNamed {
+		return nil
+	}
+	// A spec asking for a user-defined aggregate without naming one has nothing to resolve.
+	// Caught here rather than left to the server, which can only answer it as a malformed
+	// frame -- indistinguishable, to the client, from a server too old to know the opcode.
 	for _, a := range aggs {
-		if a.Func == db.AggUser {
-			return fmt.Errorf("%w: %q", ErrUserAggregateUnsupported, a.UserFunc)
+		if a.Func == db.AggUser && a.UserFunc == "" {
+			return fmt.Errorf("dbrpc: a user-defined aggregate over %q names no aggregate", a.Arg)
 		}
+	}
+	if c.Supports(FeatNamedAggregate) == SupportNo {
+		return fmt.Errorf("%w: the server advertised its features and this was not among them",
+			ErrNamedAggregateUnsupported)
 	}
 	return nil
 }
@@ -306,16 +385,59 @@ func anyFiltered(aggs []AggSpec) bool {
 	return false
 }
 
-// putAggSpecs writes the [nAgg]{[func u8][arg]([filter])} tail.
-func putAggSpecs(b []byte, aggs []AggSpec, filtered bool) []byte {
+// anyNamed reports whether some spec names a user-defined aggregate, which is what routes a
+// request onto the *Named opcodes. It implies anyFiltered -- db.AggUser sits past AggMax -- so
+// a named request is an extended one carrying one more field, never a narrower frame.
+func anyNamed(aggs []AggSpec) bool {
+	for _, a := range aggs {
+		if a.Func == db.AggUser {
+			return true
+		}
+	}
+	return false
+}
+
+// aggSpecFormFor picks the narrowest tail that expresses aggs, so a request stays
+// byte-identical to what an older client would have sent whenever it can.
+func aggSpecFormFor(aggs []AggSpec) aggSpecForm {
+	switch {
+	case anyNamed(aggs):
+		return aggSpecNamed
+	case anyFiltered(aggs):
+		return aggSpecFiltered
+	}
+	return aggSpecBase
+}
+
+// putAggSpecs writes the [nAgg]{[func u8][arg]([filter]([name]))} tail.
+func putAggSpecs(b []byte, aggs []AggSpec, form aggSpecForm) []byte {
 	b = putI32(b, int32(len(aggs)))
 	for _, a := range aggs {
 		b = putStr(putU8(b, byte(a.Func)), a.Arg)
-		if filtered {
+		if form >= aggSpecFiltered {
 			b = putStr(b, a.Filter)
+		}
+		if form >= aggSpecNamed {
+			b = putStr(b, a.UserFunc)
 		}
 	}
 	return b
+}
+
+// noSuchAggregatePrefix opens the message of a query naming an aggregate the server has no
+// registration for, which the client maps back to db.ErrNoSuchAggregate. A sentinel does not
+// survive the wire, and this one has to: "no such aggregate" is a client's own mistake, fixed
+// by registering the aggregate on the server or by spelling the name the way it was
+// registered, and it must be told apart from the server failing for any other reason.
+const noSuchAggregatePrefix = "no such aggregate: "
+
+// aggErrMsg is the message an aggregate's failure carries to the client, tagged when it is an
+// unknown aggregate name (the client cannot unwrap a message, only read its prefix).
+func aggErrMsg(err error) string {
+	if errors.Is(err, db.ErrNoSuchAggregate) {
+		return noSuchAggregatePrefix + err.Error()
+	}
+	return err.Error()
 }
 
 // ErrExtendedAggregateUnsupported is returned when the server is too old to know the
@@ -418,7 +540,7 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		}
 		rows, aerr := archAggregate(constraint, groupCols, aggs, stats)
 		if aerr != nil {
-			write(respErr(reqID, aerr.Error()))
+			write(respErr(reqID, aggErrMsg(aerr)))
 			return
 		}
 		obs.Rows = len(rows)
@@ -454,7 +576,7 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	}
 	rows, err := aggregate(constraint, groupCols, aggs, stats, func() bool { return cancelled(ctx) })
 	if err != nil {
-		write(respErr(reqID, err.Error()))
+		write(respErr(reqID, aggErrMsg(err)))
 		return
 	}
 	obs.Rows = len(rows)

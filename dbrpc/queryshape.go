@@ -285,7 +285,7 @@ func aggShape(aggs []AggSpec) string {
 		if arg != "*" {
 			arg = strings.ToLower(arg)
 		}
-		p := aggFuncName(a.Func) + "(" + arg + ")"
+		p := aggSpecFuncName(a) + "(" + arg + ")"
 		if a.Filter != "" {
 			p += " filter " + queryShape(a.Filter)
 		}
@@ -306,6 +306,19 @@ func (q QueryLog) GroupingText() string { return groupShape(q.Groups) }
 // AggregatesText renders the functions an observed query reduced over each group. Empty
 // for a plain read.
 func (q QueryLog) AggregatesText() string { return aggShape(q.Aggs) }
+
+// aggSpecFuncName names the function a spec reduces with, for a fingerprint. A user-defined
+// aggregate is named by its REGISTERED NAME rather than by its selector, because the selector
+// is the same for every one of them: without this, p95 and p99 over the same attribute collapse
+// into one shape, and a report whose whole job is to say which query is slow would be unable to
+// say which aggregate. The name is configured rather than supplied per query, so it discloses
+// no more than the attribute names this fingerprint already carries.
+func aggSpecFuncName(a AggSpec) string {
+	if a.Func == db.AggUser && a.UserFunc != "" {
+		return strings.ToLower(a.UserFunc)
+	}
+	return aggFuncName(a.Func)
+}
 
 // aggFuncName names an aggregate function for a fingerprint. An unknown selector renders
 // by number rather than as one of the known names: a function added to the wire after this

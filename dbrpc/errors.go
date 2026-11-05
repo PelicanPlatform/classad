@@ -26,6 +26,11 @@ import (
 //   - ErrTooDeep (a *ServerError): a write was refused because a value nests too deeply
 //     to store. Permanent: nothing of the write was applied and replaying it is refused
 //     identically, so drop the value (or the ad) and carry on. Never retry it.
+//   - db.ErrNoSuchAggregate (a *ServerError): the request named a user-defined aggregate
+//     the SERVER has no registration for. Registering it in the client's own process does
+//     not help -- the reduction runs where the data is. Deterministic; surface it rather
+//     than retry, and do not read it as the aggregate being unsupported by the protocol,
+//     which is ErrNamedAggregateUnsupported and a different fix.
 //   - context.Canceled / context.DeadlineExceeded: the caller's context ended while
 //     waiting. Surface it; do not retry against the caller's wishes.
 //
@@ -65,6 +70,8 @@ func (e *ServerError) Is(target error) bool {
 		return strings.HasPrefix(e.Msg, internalErrorPrefix)
 	case ErrTooDeep:
 		return strings.HasPrefix(e.Msg, tooDeepPrefix)
+	case db.ErrNoSuchAggregate:
+		return strings.HasPrefix(e.Msg, noSuchAggregatePrefix)
 	}
 	return false
 }
