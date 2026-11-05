@@ -3,6 +3,8 @@ package collections
 import (
 	"fmt"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // What the row-group policy costs on the REAL store aggregate path, over TWO ad shapes.
@@ -73,6 +75,7 @@ func regroup(tb testing.TB, c *Collection, g colGrouping) (blocks, recs int) {
 	if st == nil {
 		tb.Fatal("schema scan not enabled")
 	}
+	probe, probeExpr, want := regroupProbe(tb, c)
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		act := sh.act
@@ -82,10 +85,25 @@ func regroup(tb testing.TB, c *Collection, g colGrouping) (blocks, recs int) {
 			if seg == nil || seg == act || seg.used == 0 {
 				continue
 			}
+			if seg.columnarized() {
+				// The segment carries its OWN columnar payload and publishColNative installs that as
+				// the read block, so the width here was fixed when the segment was columnarized and
+				// is not this function's to change. Overwriting seg.colblk would not re-group it; it
+				// would replace a real payload with a side accelerator built from remnants.
+				tb.Fatalf("segment %d is columnar-native: its row group cannot be swept by rebuilding "+
+					"a side accelerator. Sweep Options.RowGroupBytes and re-columnarize instead.", seg.id)
+			}
 			d := seg.dict.Load()
-			bl, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, c.regionCodec(), st.schema, st.hot, g,
-				func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
-			seg.colblk.Store(&colSegment{blocks: bl, offsB: packU32s(offs)})
+			// The SAME build the read path uses (see Collection.buildColSegment). The id mapper is the
+			// part that cannot be left out: on an interned segment the rows are keyed by the segment's
+			// own dictionary, and building without it yields a block whose every field reads absent --
+			// a block that is the right shape, holds the right record count, and matches nothing.
+			bl, _, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.damaged(), seg.codec,
+				c.regionCodec(), st.schema, st.hot, c.groupsFor(st.schema), g,
+				func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) },
+				c.segIDMapper(d),
+				func(o uint32) bool { return recIsDelta(seg.data, o) })
+			seg.colblk.Store(&colSegment{blocks: bl, offsB: packU32s(offs), dictKeyed: d != nil})
 			blocks += len(bl)
 			recs += len(offs)
 		}
@@ -93,7 +111,41 @@ func regroup(tb testing.TB, c *Collection, g colGrouping) (blocks, recs int) {
 	if blocks == 0 {
 		tb.Fatal("regrouped no segment: there is no columnar path to measure")
 	}
+	if got, ok := c.VectorEvalCount(probe); !ok || got != want {
+		tb.Fatalf("regroup destroyed the accelerator: %q counted %d before and %d after (ok=%v). "+
+			"The blocks are the right shape and answer nothing, so every timing taken against them "+
+			"would be a scan of empty columns.", probeExpr, want, got, ok)
+	}
 	return blocks, recs
+}
+
+// regroupProbe returns a constraint over a column the base schema carries, and the answer the store
+// gives for it NOW, so regroup can prove it rebuilt something that still matches what it used to.
+//
+// Shape alone does not show this. A rebuild that drops the record payload still produces the right
+// number of blocks holding the right number of rows, still reports vecBlocks greater than zero, and
+// still prints a plausible ns/op -- while matching nothing and pruning nothing. assertNoRowWindows
+// guards the neighbouring precondition for the same reason; this guards the rebuild itself.
+func regroupProbe(tb testing.TB, c *Collection) (*vm.Query, string, int) {
+	tb.Helper()
+	st := c.schemaScan.Load()
+	for _, idx := range st.hot {
+		name, ok := c.intern.Name(st.schema.fields[idx].id)
+		if !ok {
+			continue
+		}
+		expr := name + " =!= undefined"
+		q, err := vm.Parse(expr)
+		if err != nil {
+			continue
+		}
+		n, ok := c.VectorEvalCount(q)
+		if ok && n > 0 {
+			return q, expr, n
+		}
+	}
+	tb.Fatal("no hot column answers a presence constraint, so a rebuild cannot be checked")
+	return nil, "", 0
 }
 
 // ospoolFixture loads the real OSPool slot corpus into a store with sealed segments -- ~561

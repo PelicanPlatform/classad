@@ -30,12 +30,20 @@ func sealActiveSegments(c *Collection) {
 
 // poolSampleFixture loads the committed real OSPool `condor_status -l` sample into a store with
 // sealed segments, which is the ad shape (~8.6 KB each) the production block width is set by.
-func poolSampleFixture(tb testing.TB) *Collection {
+func poolSampleFixture(tb testing.TB) *Collection { return poolSampleFixtureBytes(tb, 0) }
+
+// poolSampleFixtureBytes is poolSampleFixture at a chosen row-group budget (0: the default).
+//
+// The budget is the knob PRODUCTION has -- Options.RowGroupBytes -- and setting it before the data
+// is written is the only way to change the width of these blocks. A sealed segment here carries its
+// own columnar payload, whose row groups were decided when it was columnarized, so a width sweep has
+// to build the store at each budget rather than regroup one store repeatedly.
+func poolSampleFixtureBytes(tb testing.TB, rowGroupBytes int) *Collection {
 	tb.Helper()
 	sample := loadCorpus(tb)
 	// 8 MiB segments over ~8.6 KB ads: ~950 records per segment, so a whole-segment block holds
-	// several times the byte budget and the row-count policies are genuinely far apart.
-	c := New(Options{Shards: 1, SegmentSize: 1 << 23})
+	// several times the byte budget and the budgets below are genuinely far apart.
+	c := New(Options{Shards: 1, SegmentSize: 1 << 23, RowGroupBytes: rowGroupBytes})
 	batch := make([]AdUpdate, 0, 512)
 	for i := 0; i < 20000; i++ {
 		batch = append(batch, AdUpdate{Key: []byte(fmt.Sprintf("s%d", i)), Ad: sample[i%len(sample)]})
@@ -83,50 +91,7 @@ func assertNoRowWindows(tb testing.TB, c *Collection) {
 	}
 }
 
-// widthPolicies sweeps the row group across the whole range the vector executor can be handed, from
-// the production width up to the row backstop.
-//
-// CLASSAD_BENCH_WIDTH_REVERSE reverses the order, and a conclusion from one direction alone is not
-// one. The regimes run sequentially against one store, so the arm measured FIRST absorbs the
-// warm-up; that has produced a wrong conclusion in this package before (see colgroup_bench_test.go),
-// and the production default is not placed first here for that reason.
-func widthPolicies() []groupPolicy {
-	rows := []int{16, 64, 256, 1024, 4096, 8192}
-	if os.Getenv("CLASSAD_BENCH_WIDTH_REVERSE") != "" {
-		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
-			rows[i], rows[j] = rows[j], rows[i]
-		}
-	}
-	ps := make([]groupPolicy, 0, len(rows)+1)
-	for i, n := range rows {
-		if i == len(rows)/2 {
-			ps = append(ps, groupPolicy{"default", defaultColGrouping()})
-		}
-		ps = append(ps, groupPolicy{fmt.Sprintf("rows%04d", n), byRows(n)})
-	}
-	return ps
-}
-
-// BenchmarkVecScanBlockWidth measures the real vector scan over real OSPool ads as the block width
-// changes, which is the width the vector executor's batch IS. The cache is warmed first, so the
-// decompression the row group also governs is paid up front and what varies between arms is mostly
-// the width the executor runs its kernels at.
-//
-// This is the production-scale counterpart to BenchmarkTileHot in the vm package, which isolates the
-// register file. It answers the question the other way round: at the sixteen-record width the byte
-// budget actually produces, is anything being LOST by running the executor in such small batches?
-// Two expressions, a minimal constraint and a seven-term arithmetic chain, which vary the WORK per
-// record by about an order of magnitude. They do not vary register pressure, and that is worth
-// stating rather than quietly assuming otherwise: the chain holds THREE live vectors, the same as a
-// two-term conjunction, because the lowering is left-associative and each product is consumed by
-// the sum above it. Expression size does not buy register pressure here at all. Only script
-// bindings do, which is why the gradient lives in BenchmarkTileHot and not here.
-//
-// It is the noisier of the two by a long way -- decompression, block cache behaviour and ordering
-// all move with the row group, and only the last of them is controlled here -- so read it for the
-// order of magnitude and take the isolated sweep for the shape.
 func BenchmarkVecScanBlockWidth(b *testing.B) {
-	store := poolSampleFixture(b)
 	for _, e := range []struct{ name, expr string }{
 		// Hot columns only: the vector path declines a column that lives in the cold tail, so a
 		// constraint over Memory or Cpus on this corpus never reaches the executor at all.
@@ -138,19 +103,29 @@ func BenchmarkVecScanBlockWidth(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		for _, p := range widthPolicies() {
-			blocks, recs := regroup(b, store, p.g)
-			perBlock := float64(recs) / float64(blocks)
+		want := -1
+		for _, bud := range widthBudgets() {
+			store := poolSampleFixtureBytes(b, bud.bytes)
+			blocks, recs := blockStats(b, store)
 			coldCache(b, store)
-			store.VectorEvalCount(q) // two warm passes, per widthPolicies' note on ordering
+			store.VectorEvalCount(q) // two warm passes, per widthBudgets' note on ordering
 			store.VectorEvalCount(q)
-			b.Run(e.name+"/"+p.name, func(b *testing.B) {
-				// Assert WHICH PATH RAN before reporting anything. A constraint over a column in
-				// the cold tail declines the vector path on every block and falls back to colScope,
-				// which answers correctly and ~40x slower -- so without this the benchmark reports a
-				// number for a path it never took. It fails rather than warns because a warning in
-				// benchmark output is invisible beside the numbers.
-				store.VectorEvalCount(q)
+			b.Run(e.name+"/"+bud.name, func(b *testing.B) {
+				// Assert WHAT WAS COUNTED, not just which path ran. A fixture that answers nothing
+				// still reports vecBlocks greater than zero and still prints a plausible ns/op, so
+				// checking the path alone cannot tell a scan of real columns from a scan of empty
+				// ones -- and the count must not depend on the row group at all.
+				got, ok := store.VectorEvalCount(q)
+				if !ok {
+					b.Fatal("vector path declined")
+				}
+				if want < 0 {
+					want = got
+				}
+				if got != want {
+					b.Fatalf("counted %d at %s but %d at the first budget: the row group changed the "+
+						"ANSWER, so these timings are not of the same work", got, bud.name, want)
+				}
 				if sp := lastVecSplit.Load(); sp == nil || sp.vecBlocks == 0 {
 					b.Fatalf("no block took the vector path: %+v", sp)
 				}
@@ -161,8 +136,62 @@ func BenchmarkVecScanBlockWidth(b *testing.B) {
 					}
 				}
 				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(recs), "ns/elem")
-				b.ReportMetric(perBlock, "rec/blk")
+				b.ReportMetric(float64(recs)/float64(blocks), "rec/blk")
 			})
 		}
 	}
+}
+
+type widthBudget struct {
+	name  string
+	bytes int
+}
+
+// widthBudgets sweeps Options.RowGroupBytes around the production default.
+//
+// CLASSAD_BENCH_WIDTH_REVERSE reverses the order, and a conclusion from one direction alone is not
+// one: each arm builds its own store, so the arm measured FIRST absorbs the warm-up.
+func widthBudgets() []widthBudget {
+	out := []widthBudget{
+		{"b032k", 32 << 10},
+		{"b128k-default", 128 << 10},
+		{"b512k", 512 << 10},
+		{"b002m", 2 << 20},
+		{"b008m", 8 << 20},
+	}
+	if os.Getenv("CLASSAD_BENCH_WIDTH_REVERSE") != "" {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	return out
+}
+
+// blockStats reports the columnar blocks and records the store's sealed segments actually hold, so
+// an arm that did not move the width cannot be mistaken for one that did.
+func blockStats(tb testing.TB, c *Collection) (blocks, recs int) {
+	tb.Helper()
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		act := sh.act
+		segs := append([]*segment(nil), sh.segs...)
+		sh.mu.RUnlock()
+		for _, seg := range segs {
+			if seg == nil || seg == act || seg.used == 0 {
+				continue
+			}
+			cs := seg.colblk.Load()
+			if cs == nil {
+				continue
+			}
+			blocks += len(cs.blocks)
+			for _, bl := range cs.blocks {
+				recs += bl.n
+			}
+		}
+	}
+	if blocks == 0 {
+		tb.Fatal("no sealed segment carries a columnar block: there is no columnar path to measure")
+	}
+	return blocks, recs
 }
