@@ -87,10 +87,6 @@ type Script struct {
 	// fn is the state of the innermost inline expansion, nil outside one.
 	fn *inlineFrame
 
-	// fnNames is every folded name an inline expansion bound: a parameter or a body local. They
-	// are not attributes, so Compile strips them from the read set exactly as it strips locals.
-	fnNames map[string]bool
-
 	// expansions counts the inline expansions in this script, against maxInlineExpansions.
 	expansions int
 
@@ -103,10 +99,9 @@ type Script struct {
 // NewScript returns an empty script.
 func NewScript() *Script {
 	s := &Script{
-		c:       &compiler{p: &Program{}, seen: map[string]bool{}},
-		byName:  map[string]int32{},
-		funcs:   map[string]*funcDef{},
-		fnNames: map[string]bool{},
+		c:      &compiler{p: &Program{}},
+		byName: map[string]int32{},
+		funcs:  map[string]*funcDef{},
 	}
 	s.c.inlineCall = s.expandCall
 	s.c.isScriptFunc = s.isScriptFunc
@@ -179,7 +174,6 @@ func (s *Script) letNow(name string, expr ast.Expr) {
 			// its name says which instance it came from. Two calls to the same function have two
 			// registers named alike otherwise, and a register dump is then unreadable.
 			display = s.fn.prefix + name
-			s.fnNames[folded] = true
 		}
 		idx = int32(len(s.c.p.locals))
 		s.c.p.locals = append(s.c.p.locals, display)
@@ -322,9 +316,6 @@ func (s *Script) resultNow(expr ast.Expr) {
 // natively is delegated whole, so the tree-walker's own recursion limit governs it identically. A
 // script does not change that, because a statement's expression is still just an expression.
 func (s *Script) emitExpr(expr ast.Expr) {
-	// Accumulated across statements, as CompileProgram accumulates it for one expression. It
-	// over-approximates by including names that turn out to be locals; Compile removes those.
-	s.c.p.readAttrs = collectReads(expr, s.c.seen, s.c.p.readAttrs)
 	if astHeight(expr) >= maxNativeDepth {
 		s.c.delegate(expr)
 		return
@@ -350,24 +341,46 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 	if !s.hasRes {
 		return nil, ErrNoResult
 	}
-	// readAttrs is the union over the statements MINUS the locals: a local is not an attribute, and
-	// a planner told otherwise would look for a column that does not exist. collectReads has already
-	// accumulated every unscoped name, including the ones that turned out to be locals, because it
-	// walks the AST and the AST cannot tell them apart. A function's parameters and body locals are
-	// locals too -- of an inline expansion rather than of the script -- and are stripped for the
-	// same reason; their maps are gone by now, so each name was recorded as it was bound.
-	kept := s.c.p.readAttrs[:0]
-	for _, name := range s.c.p.readAttrs {
-		folded := foldLocal(name)
-		if _, isLocal := s.byName[folded]; isLocal || s.fnNames[folded] {
-			continue
-		}
-		kept = append(kept, name)
-	}
-	s.c.p.readAttrs = kept
+	s.c.p.readAttrs = s.scriptReads()
 	s.c.p.vops = vopPrefix(s.c.p.code)
 	s.c.p.refSlots, s.c.p.nColSlots = colSlots(s.c.p.refs)
 	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
+}
+
+// scriptReads is the set of attribute names the compiled script may read, in first-seen order.
+//
+// It is read off the COMPILED PROGRAM rather than off the statements' syntax, because the compiler
+// is the only thing that knows which bare names turned out to be attributes. Two sources, which
+// between them are every way a script reaches the ad:
+//
+//   - p.refs, the unscoped references emitted as OpLoadRef. A bare name that was a local is not
+//     among them: it compiled to OpLoadLocal instead.
+//   - the unscoped names inside p.nodes, the subtrees handed to the tree-walking evaluator, which
+//     resolves every one of them against the ad. A delegated subtree that reads a local is refused
+//     before this runs, so none of these is a local either.
+//
+// COLLECTING THE SYNTAX AND SUBTRACTING THE LOCALS IS A DIFFERENT ANSWER, and wrong in both
+// directions. `x = x + 1` reads the ATTRIBUTE x before it binds the local, so subtracting x drops a
+// read the script really makes and leaves a planner unaware of a column the script needs. And a
+// function's parameters and body locals belong to an expansion whose name map no longer exists by
+// the time this runs, so there is nothing left to subtract them by. Asking the program removes both
+// problems, because the program already distinguishes a load from the ad from a load from a
+// register.
+func (s *Script) scriptReads() []string {
+	seen := make(map[string]bool, len(s.c.p.refs))
+	var out []string
+	for i := range s.c.p.refs {
+		r := &s.c.p.refs[i]
+		if r.scope != ast.NoScope || seen[r.name] {
+			continue
+		}
+		seen[r.name] = true
+		out = append(out, r.name)
+	}
+	for _, n := range s.c.p.nodes {
+		out = collectReads(n, seen, out)
+	}
+	return out
 }
 
 // Run evaluates the script against scope and returns its result, under the default instruction

@@ -26,7 +26,7 @@ func CompileProgram(expr ast.Expr) *Program {
 
 // compileProgramAliases is CompileProgram with the join aliases of CompileAliases known.
 func compileProgramAliases(expr ast.Expr, aliases aliasIndex) *Program {
-	c := &compiler{p: &Program{}, seen: map[string]bool{}, aliases: aliases}
+	c := &compiler{p: &Program{}, aliases: aliases}
 	if astHeight(expr) >= maxNativeDepth {
 		// Pathologically deep expression: delegate the whole thing to the
 		// tree-walking evaluator so its recursion-depth guard (maxEvalDepth)
@@ -101,8 +101,7 @@ func astHeight(e ast.Expr) int {
 }
 
 type compiler struct {
-	p    *Program
-	seen map[string]bool
+	p *Program
 
 	// locals maps a folded local name to its index, for a SCRIPT. Nil for an ordinary expression, in
 	// which case every unscoped reference is an attribute. See Script.

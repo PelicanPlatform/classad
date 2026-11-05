@@ -215,7 +215,6 @@ func (s *Script) inline(fd *funcDef, v *ast.FunctionCall) {
 		s.c.emit(v.Args[i])
 		s.c.ins(OpStoreLocal, reg)
 		params[foldLocal(p)] = reg
-		s.fnNames[foldLocal(p)] = true
 	}
 
 	// An expansion inside a loop runs more than once, and its registers are the program's, written
