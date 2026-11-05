@@ -142,9 +142,10 @@ func (s *lineScanner) consumeLogicalLine(i int) (int, error) {
 			}
 			i = next
 		case c == '\\' && atEOL(s.src, i+1):
-			// Explicit line joining. The backslash and the break it hides are blanked together, so
-			// the two physical lines become one run of source with no newline in it at all and the
-			// offsets of everything after are untouched.
+			// Explicit line joining. The backslash is blanked and the break is stepped over
+			// without ending the line. The newline itself stays in the buffer, where it is
+			// whitespace to the ClassAd lexer like any other, and leaving it there is what keeps
+			// every later offset equal to its offset in the original source.
 			end := s.skipEOL(i + 1)
 			blank(s.clean, i, end)
 			i = end
