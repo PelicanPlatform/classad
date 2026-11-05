@@ -24,26 +24,28 @@ type Registry interface {
 	RegisterFunction(name string, minArgs, maxArgs int, fn func(args []classad.Value) classad.Value) error
 }
 
-// ErrRegistryUnavailable is returned by the classad registry adapter until
-// classad.RegisterFunction exists. See ClassAdRegistry.
+// ErrRegistryUnavailable was returned by the classad registry adapter while
+// classad.RegisterFunction did not yet exist.
+//
+// Deprecated: it exists, and ClassAdRegistry calls it. Nothing returns this any
+// more. It is kept because it is exported and a caller may still be testing for
+// it -- a caller that does will now simply never see it, where deleting it would
+// stop that caller compiling.
 var ErrRegistryUnavailable = errors.New("wasmudf: classad.RegisterFunction is not available in this classad version")
 
-// ClassAdRegistry returns the process-wide registry in package classad.
+// ClassAdRegistry returns the process-wide registry in package classad, which is
+// what makes a loaded module reachable from an expression: after registering
+// through it, an expression calling the module's name gets the guest.
 //
-// THE SWITCH IS THE ONE LINE MARKED BELOW. Until classad.RegisterFunction exists
-// this adapter refuses, loudly, rather than pretending to register and leaving a
-// UDF that no expression can call; everything else in this package -- loading,
-// the ABI, the bounds, Register itself -- is exercised against a Registry
-// implementation in the tests and does not wait on it.
+// Use it for anything other than a test. The interface exists so a test can pass
+// a registry it can inspect, since classad's registry is process-wide and
+// append-only and a test cannot undo a registration in it.
 func ClassAdRegistry() Registry { return classAdRegistry{} }
 
 type classAdRegistry struct{}
 
-func (classAdRegistry) RegisterFunction(_ string, _, _ int, _ func(args []classad.Value) classad.Value) error {
-	// Replace this line with:
-	//	return classad.RegisterFunction(name, minArgs, maxArgs, fn)
-	// and name the parameters above.
-	return ErrRegistryUnavailable
+func (classAdRegistry) RegisterFunction(name string, minArgs, maxArgs int, fn func(args []classad.Value) classad.Value) error {
+	return classad.RegisterFunction(name, minArgs, maxArgs, fn)
 }
 
 // Register loads wasm as name and registers it, so an expression calling name

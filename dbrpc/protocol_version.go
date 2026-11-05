@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 3
+const ProtocolVersion = 4
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -124,6 +124,18 @@ const (
 	// expression-valued attribute is untypeable, which is the wrong answer rather than a
 	// missing one.
 	FeatEvalTypes Feature = "evaltypes"
+
+	// FeatNamedAggregate is the aggregate frame carrying an aggregate's NAME
+	// (opAggregateNamed, opArchiveAggregateNamed), which is what lets a request reach a
+	// user-defined aggregate the server has registered. Postdates advertisement, so silence
+	// is a no -- but silence is still probed rather than refused outright, because the
+	// probe's answer is a clean stBadReq before any row.
+	//
+	// What the server registered is a separate question this cannot answer: the feature
+	// says the NAME crosses, not that any particular name resolves. A name the server does
+	// not know fails the query with db.ErrNoSuchAggregate, which is a different error for a
+	// different cause, and deliberately not an "undefined" column.
+	FeatNamedAggregate Feature = "namedagg"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -158,6 +170,7 @@ var serverFeatures = []Feature{
 	FeatQueryValues,
 	FeatValueDict,
 	FeatEvalTypes,
+	FeatNamedAggregate,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar

@@ -38,8 +38,10 @@ const (
 	AggCountDistinct
 	// AggUser is a user-defined aggregate, named by AggSpec.UserFunc and registered with
 	// RegisterAggregate. It sits past AggMax on purpose: that is what routes a request
-	// carrying one onto the extended RPC opcodes, so a server too old to know it refuses
-	// rather than answering a different aggregate.
+	// carrying one onto the RPC opcodes with a field for the NAME, so a server too old to
+	// know them refuses rather than answering a different aggregate. A selector alone says
+	// only "past MAX" -- which aggregate was meant is in UserFunc, and a frame that cannot
+	// carry it cannot ask the question.
 	AggUser
 )
 

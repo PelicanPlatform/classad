@@ -3,6 +3,11 @@
 // It is a separate Go module so the wazero dependency is opt-in: a program that
 // imports classad but never wants a sandboxed UDF does not link a wasm compiler.
 //
+// Integrating a module -- loading it, choosing its sandbox, deciding whether to
+// trust it -- is documented in docs/user-defined-functions.md at the repository
+// root, which covers all four ways to extend this engine and treats wasm as one
+// of them.
+//
 // Writing a guest module is documented in prose, for someone who is not reading
 // this code and may not write Go, in docs/wasm-udf-abi.md at the repository root.
 // It covers both calling conventions, the ownership and lifetime rules, and what

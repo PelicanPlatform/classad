@@ -220,6 +220,12 @@ var mxWant = map[string]map[mxKind]string{
 		kArchive: "stream",
 		kMissing: "err: no such table: nope",
 	},
+	"AggregateNamed": {
+		kTable:   "stream",
+		kView:    "stream",
+		kArchive: "stream",
+		kMissing: "err: no such table: nope",
+	},
 	"ArchiveAggregate": {
 		kTable:   "err: no such archive: mut",
 		kView:    "err: no such archive: vw",
@@ -227,6 +233,12 @@ var mxWant = map[string]map[mxKind]string{
 		kMissing: "err: no such archive: nope",
 	},
 	"ArchiveAggregateFiltered": {
+		kTable:   "err: no such archive: mut",
+		kView:    "err: no such archive: vw",
+		kArchive: "stream",
+		kMissing: "err: no such archive: nope",
+	},
+	"ArchiveAggregateNamed": {
 		kTable:   "err: no such archive: mut",
 		kView:    "err: no such archive: vw",
 		kArchive: "stream",
@@ -500,7 +512,7 @@ type mxCase struct {
 }
 
 // aggTail appends the group/aggregate tail shared by the aggregate opcodes.
-func aggTail(b []byte, widths, filters bool) []byte {
+func aggTail(b []byte, widths bool, form aggSpecForm) []byte {
 	b = putI32(b, 1) // one group column
 	b = putStr(b, "Owner")
 	if widths {
@@ -509,8 +521,11 @@ func aggTail(b []byte, widths, filters bool) []byte {
 	b = putI32(b, 1) // one aggregate
 	b = putU8(b, byte(db.AggCount))
 	b = putStr(b, "*")
-	if filters {
+	if form >= aggSpecFiltered {
 		b = putStr(b, "")
+	}
+	if form >= aggSpecNamed {
+		b = putStr(b, "") // a built-in names no aggregate
 	}
 	return b
 }
@@ -551,17 +566,22 @@ func mxCases() []mxCase {
 		}},
 		{op: "Aggregate", build: func(n string) func(uint64) []byte {
 			return func(id uint64) []byte {
-				return aggTail(putStr(putStr(req(id, opAggregate), n), "true"), false, false)
+				return aggTail(putStr(putStr(req(id, opAggregate), n), "true"), false, aggSpecBase)
 			}
 		}},
 		{op: "AggregateBucketed", build: func(n string) func(uint64) []byte {
 			return func(id uint64) []byte {
-				return aggTail(putStr(putStr(req(id, opAggregateBucketed), n), "true"), true, false)
+				return aggTail(putStr(putStr(req(id, opAggregateBucketed), n), "true"), true, aggSpecBase)
 			}
 		}},
 		{op: "AggregateFiltered", build: func(n string) func(uint64) []byte {
 			return func(id uint64) []byte {
-				return aggTail(putStr(putStr(req(id, opAggregateFiltered), n), "true"), true, true)
+				return aggTail(putStr(putStr(req(id, opAggregateFiltered), n), "true"), true, aggSpecFiltered)
+			}
+		}},
+		{op: "AggregateNamed", build: func(n string) func(uint64) []byte {
+			return func(id uint64) []byte {
+				return aggTail(putStr(putStr(req(id, opAggregateNamed), n), "true"), true, aggSpecNamed)
 			}
 		}},
 		{op: "Diag", build: func(n string) func(uint64) []byte {
@@ -731,17 +751,23 @@ func mxCases() []mxCase {
 		}},
 		{op: "ArchiveAggregate", build: func(n string) func(uint64) []byte {
 			return func(id uint64) []byte {
-				return aggTail(putStr(putStr(req(id, opArchiveAggregate), n), "true"), false, false)
+				return aggTail(putStr(putStr(req(id, opArchiveAggregate), n), "true"), false, aggSpecBase)
 			}
 		}},
 		{op: "ArchiveAggregateFiltered", build: func(n string) func(uint64) []byte {
 			return func(id uint64) []byte {
-				return aggTail(putStr(putStr(req(id, opArchiveAggregateFiltered), n), "true"), true, true)
+				return aggTail(putStr(putStr(req(id, opArchiveAggregateFiltered), n), "true"), true, aggSpecFiltered)
 			}
 		}},
 		{op: "ArchiveAggregateStats", build: func(n string) func(uint64) []byte {
 			return func(id uint64) []byte {
-				return aggTail(putStr(putStr(req(id, opArchiveAggregateStats), n), "true"), true, true)
+				return aggTail(putStr(putStr(req(id, opArchiveAggregateStats), n), "true"), true, aggSpecFiltered)
+			}
+		}},
+		{op: "ArchiveAggregateNamed", build: func(n string) func(uint64) []byte {
+			return func(id uint64) []byte {
+				// The trailing byte is this opcode's stats request, declined here.
+				return putU8(aggTail(putStr(putStr(req(id, opArchiveAggregateNamed), n), "true"), true, aggSpecNamed), 0)
 			}
 		}},
 		{op: "CreateView", mutates: true, build: func(n string) func(uint64) []byte {

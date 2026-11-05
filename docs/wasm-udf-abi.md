@@ -10,6 +10,12 @@ reverse-engineer the example fixtures to know what is required of you. The
 fixtures in `wasmudf/testdata/*.wat` are the worked examples; this is the
 explanation.
 
+If you are integrating a module rather than writing one — registering it,
+choosing its sandbox, deciding whether to trust it — start at
+[docs/user-defined-functions.md](user-defined-functions.md), which covers all
+four ways to extend this engine and treats wasm as one of them. This page is the
+guest's half of the contract.
+
 There are **two** calling conventions. The scalar one is called once per record
 and every module must implement it. The vector one is called once per batch of
 records, is optional, and is where the performance is. The relationship between
@@ -716,6 +722,8 @@ rule testable rather than merely stated:
 
 | fixture | what it demonstrates |
 |---|---|
+| `examplepct.wat` | a complete scalar module, start to finish; the documentation's example |
+| `examplemean.wat` | a complete aggregate module, likewise |
 | `tagecho.wat` | the scalar ABI across every tag |
 | `identity.wat` | the cheapest possible guest; the round-trip of every value state |
 | `concat.wat` | building a string result in memory you own |
@@ -913,8 +921,11 @@ not is the shape to write something new in.
   per-module decision, and it is a yes or no rather than a number
 - any mechanism by which a module influences whether it is trusted, which is not
   a gap to be filled but a property to be preserved
-- a wire representation for a user-defined aggregate: no RPC frame has a field to
-  put its name in, so an aggregate runs against the engine in process
+- shipping a MODULE to a server. An RPC request can now name a user-defined
+  aggregate (`dbrpc`'s `opAggregateNamed` / `opArchiveAggregateNamed`), so a
+  remote client reaches one — but it reaches one the SERVER has registered. The
+  name crosses; the wasm does not, and loading a guest module a client sent is a
+  trust decision nothing here makes
 - grouped aggregation handing a guest its group key. The grouped columnar pass
   carries user accumulators, so a guest aggregate works under GROUP BY, but it
   never sees which group it is accumulating

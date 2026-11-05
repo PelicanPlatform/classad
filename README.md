@@ -33,6 +33,8 @@ This project provides a complete parser and evaluation engine for the ClassAds l
   - Scoped attribute references for parent/target relationships
   - Attribute selection and subscripting
   - 25+ built-in functions (string, math, type checking, list operations, conditional)
+- **User-Defined Functions**: Register your own functions and aggregates, in Go or as sandboxed
+  WebAssembly — see [docs/user-defined-functions.md](docs/user-defined-functions.md)
 - **ClassAd Matching**: MatchClassAd type for symmetric matching (job/machine matching)
 - **Public API**: High-level API mimicking the C++ HTCondor ClassAd library
 - **Go Generate Support**: Easy regeneration of parser from grammar
@@ -215,9 +217,13 @@ golang-classads/
 │   ├── job.ad
 │   └── expressions.txt
 ├── docs/             # Documentation
-│   ├── EVALUATION_API.md       # API reference for evaluation
-│   ├── MARSHALING.md           # Struct marshaling guide (ClassAd & JSON)
-│   └── MARSHALING_QUICKREF.md  # Quick reference card
+│   ├── EVALUATION_API.md           # API reference for evaluation
+│   ├── MARSHALING.md               # Struct marshaling guide (ClassAd & JSON)
+│   ├── MARSHALING_QUICKREF.md      # Quick reference card
+│   ├── user-defined-functions.md   # Adding your own functions and aggregates
+│   ├── wasm-udf-abi.md             # The guest-side ABI, for a module author
+│   ├── changefeed.md               # The HTTP/SSE change feed
+│   └── SCRIPTING_LANGUAGE_DESIGN.md # The query and scripting layer's design
 ├── generate.go       # go generate directive
 ├── go.mod
 └── README.md
@@ -577,7 +583,8 @@ The evaluator supports 25+ built-in functions:
 **Time:**
 - `time()` - Current Unix timestamp
 
-See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete function documentation.
+See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete function documentation,
+and [docs/user-defined-functions.md](docs/user-defined-functions.md) to add your own.
 
 ### Example ClassAd
 

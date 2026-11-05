@@ -55,13 +55,21 @@ const internalErrorPrefix = "internal error: "
 
 // recoverable reports whether a panic while serving o can be contained to the request: the reads.
 // Anything not listed here writes durable or shared state and is left to crash (see above).
+//
+// The *Named aggregates are listed with the rest although they run a user-defined aggregate's own
+// code, which is the one place a read calls out to the embedding program. That costs nothing here:
+// the db package already contains a panic out of an aggregate for the whole query and returns it as
+// an error naming the aggregate, so one reaching this recover would be a bug in the reduction
+// rather than in the aggregate -- and it is still a read, leaving nothing behind for a later
+// request to trip on.
 func (o op) recoverable() bool {
 	switch o {
 	case opQuery, opQueryAsOf, opQueryRaw, opQueryRawProj, opQueryRawProjSeq, opQueryRawProjRefs,
 		opQueryRawProjRefsStats, opQueryRawWire, opQueryRawWireOpts, opQueryValues, opQueryKeys,
 		opTopK, opTopKStats, opMatchSorted, opMatchTables, opMatchExplain, opOrdered,
-		opAggregate, opAggregateFiltered, opAggregateBucketed,
-		opArchiveQuery, opArchiveAggregate, opArchiveAggregateFiltered, opArchiveAggregateStats, opArchiveList,
+		opAggregate, opAggregateFiltered, opAggregateBucketed, opAggregateNamed,
+		opArchiveQuery, opArchiveAggregate, opArchiveAggregateFiltered, opArchiveAggregateStats,
+		opArchiveAggregateNamed, opArchiveList,
 		opWatch, opWatchWire, opWatchHead, opWatchStop, opSnapshot,
 		opLookupAd, opLookupAttr, opTxnQuery, opTxnQueryKeys,
 		opDiag, opExplain, opListTables, opListViews, opListExporters, opGetExporter, opGetExporterState,

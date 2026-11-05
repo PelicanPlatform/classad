@@ -105,15 +105,28 @@ func TestRegisterReportsCollision(t *testing.T) {
 	}
 }
 
-// TestClassAdRegistryIsExplicitlyUnavailable pins the one-line switch. When
-// classad.RegisterFunction lands, this test is what fails, and its failure is the
-// reminder to delete it.
-func TestClassAdRegistryIsExplicitlyUnavailable(t *testing.T) {
-	err := ClassAdRegistry().RegisterFunction("f", 1, 1, func([]classad.Value) classad.Value {
-		return classad.NewUndefinedValue()
-	})
-	if !errors.Is(err, ErrRegistryUnavailable) {
-		t.Errorf("got %v, want ErrRegistryUnavailable", err)
+// TestClassAdRegistryReachesTheEvaluator is what the stub this replaced was standing in for. The
+// adapter used to refuse, and the test that pinned the refusal asserted the stub rather than the
+// wiring -- so when classad.RegisterFunction landed, nothing failed and the switch stayed unflipped.
+// This asserts the end the caller cares about: a module registered through ClassAdRegistry is
+// callable from an expression.
+//
+// The name is unique to this test because classad's registry is process-wide and has no unregister.
+func TestClassAdRegistryReachesTheEvaluator(t *testing.T) {
+	u := loadFixture(t, Options{}, "identity", 1, 1)
+	if err := ClassAdRegistry().RegisterFunction("wasmudfIdentity", 1, 1, u.Func()); err != nil {
+		t.Fatalf("registering through the classad registry: %v", err)
+	}
+	ad, err := classad.Parse(`[ n = 41 ]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expr, err := classad.ParseExpr(`wasmudfIdentity(n) + 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := expr.Eval(ad).String(); got != "42" {
+		t.Errorf("wasmudfIdentity(n) + 1 = %s, want 42", got)
 	}
 }
 
