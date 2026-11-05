@@ -11,6 +11,10 @@ import (
 
 // USER-DEFINED AGGREGATES.
 //
+// docs/user-defined-functions.md at the repository root is the prose version of this, for someone
+// writing one: the merge laws, the columnar opt-in, and a worked example. What follows is why the
+// registry is built this way.
+//
 // The expression layer already takes a user-defined scalar function, which covers projections and
 // predicates. It does not cover aggregation, and aggregation is where a query layer over this
 // engine spends its time -- so a story that stops at scalars stops short of the use that motivates
@@ -20,27 +24,27 @@ import (
 // WHAT IT COSTS, stated first because it is the thing a caller has to decide about. A built-in
 // numeric aggregate reads its argument as a CONTIGUOUS COLUMN: one pass over the column's blocks,
 // with a segment's zone map and each block's own min/max ruling whole blocks out before any value
-// is touched, and no record decode and no boxing for the values that survive. A user-defined
-// aggregate is served from the RECORD SCAN instead -- every matching record decoded, its argument
-// evaluated into a classad.Value, one call per row.
+// is touched, and no record decode and no boxing for the values that survive. A plain Accumulator
+// is served from the RECORD SCAN instead -- every matching record decoded, its argument evaluated
+// into a classad.Value, one call per row.
 //
-// So the honest headline is not "slower than a built-in": A USER-DEFINED AGGREGATE FORFEITS THE
-// COLUMNAR VALUE PASS. What is lost is the column layout, the block pruning and the absence of
-// boxing. What is NOT lost is reading the values, because the columnar pass reads them too -- it
-// computes the statistics it reports, it does not look them up. (The one aggregate path that truly
-// visits no values is the archive's index-resident GROUP BY count, which attributes a whole
-// segment's postings; SUM, AVG, MIN and MAX do not use that one either.)
+// AN ACCUMULATOR CAN OPT OUT OF THAT by also implementing ColumnAccumulator, which is fed from the
+// same block-pruned unboxed pass that answers SUM, ungrouped and grouped alike. Implementing it is
+// a declaration about order and about what is offered, neither of which a signature can check --
+// see ColumnAccumulator for both, and CheckAggregate for the test. An aggregate that cannot make
+// those promises stays on the record scan, which is correct and slower, never wrong.
 //
-// That distinction is worth keeping straight, because it says what could change. Nothing about this
-// interface forecloses a column-shaped accumulate riding the same pass; an aggregate that could be
-// handed a column rather than a value per row would lose only the statistics shortcut itself. The
-// cliff is deliberately left visible meanwhile: ColumnarAggregate declines AggUser outright.
+// The one aggregate path a user-defined aggregate still cannot reach is the archive's
+// index-resident GROUP BY count, which attributes a whole segment's postings without visiting a
+// value. SUM, AVG, MIN and MAX do not use that one either, so it is not part of the gap.
 //
 // THE SAME CHANNEL COUNT(DISTINCT) ALREADY CUT. Its selector sits past AggMax, which is what routes
 // a request carrying it onto the extended RPC opcodes and makes an older server refuse rather than
-// answer a different aggregate; it declines the columnar path for the same reason as above; and the
-// materialized-view layer cannot name it. AggUser inherits all three behaviours by being past
-// AggMax too, so this is a registration and a reduction case rather than a new mechanism.
+// answer a different aggregate; ColumnarAggregate, which serves the built-ins from precomputed
+// statistics, declines it; and the materialized-view layer cannot name it. AggUser inherits all
+// three by being past AggMax too, so this was a registration and a reduction case rather than a new
+// mechanism. (The columnar refusal is ColumnarAggregate's alone: a ColumnAccumulator is served by
+// ColumnarUserAggregate, a different entry on the same pass.)
 
 // Registration failures a caller can act on differently, as sentinels rather than only as messages.
 var (
@@ -83,13 +87,12 @@ type Aggregate interface {
 // failure mode available. Result must be repeatable and must not mutate the accumulator. Those are
 // contracts an interface cannot enforce, so CheckAggregate exists to test one against them.
 //
-// MERGE IS REQUIRED AND IS NOT YET CALLED, which is worth saying plainly rather than implying a
-// parallelism that is not there. The reduction core today is strictly serial over one sequence, so
-// every accumulator this package builds is folded by Add alone. Merge is in the interface anyway
-// because leaving it out would bake that serialism into the contract: the moment a per-segment or
-// parallel reduction exists, an interface without merge is single-threaded BY CONSTRUCTION in the
-// one place the engine is not, and every aggregate already written would have to be revisited.
-// Requiring it now costs an implementation a method; adding it later costs everyone a rewrite.
+// MERGE IS CALLED, twice over, and not as decoration. The columnar pass fans out across segment
+// windows and folds one accumulator per worker, so merge is the reduction of that fan-out; and two
+// storage groups that render to the same label are merged into one row. Which worker draws which
+// segment is a race, which is why associativity alone is not enough and commutativity is in the
+// contract: an order-sensitive merge is correct in every test its author writes and wrong in
+// production, plausibly and only sometimes.
 type Accumulator interface {
 	// Add folds one row's argument value into the state. The value is whatever the row's
 	// argument attribute evaluated to, including undefined for a row that does not carry it;
