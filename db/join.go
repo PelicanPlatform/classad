@@ -298,10 +298,38 @@ type joinPlan struct {
 	postAlias *aliasedCond
 	limit     int
 	limits    JoinLimits
-	// Scratch for spliceComposite, which runs once per OUTPUT row. A plan is compiled per
-	// query and its rows are yielded to one consumer in order, so this is per-query state,
-	// not shared. bodies and entBufs are reused across rows; member0 holds the FROM side's
-	// narrowed bytes for as long as the walk stays on one scan row (see scanRow).
+}
+
+// joinWalk is ONE walker's private state: everything the pair loop and the row form touch
+// that is not the plan or the rows themselves.
+//
+// It exists as a separate thing from joinPlan so that walking can be parallelized. The plan
+// is immutable once compiled and can be shared; this cannot, and keeping the two apart is
+// what makes "shared or not" a property you can read off the type rather than reason about.
+// An earlier version kept this scratch on the plan, with a comment arguing it was safe
+// because a plan is compiled per query and its rows go to one consumer in order -- true then,
+// and exactly the assumption a parallel walk breaks.
+type joinWalk struct {
+	// rows is the accumulated row: one entry per side, nil where a side is not yet folded in
+	// or was null-extended. Every compiled term indexes it by side.
+	rows []*joinRow
+	// buf is the row form's output buffer, reused across rows. A yielded row aliases it, so
+	// a caller that keeps one must copy -- the same contract the store's raw scans have.
+	buf []byte
+	// maxPairs is this walker's SHARE of the pair budget, and noRowLimit says the drainer
+	// enforces the row limit instead of this walker. Both exist because a parallel walk has
+	// P of these: a guard checked per walker against the whole budget would let the join do
+	// P times the work it is allowed, and a row limit checked per walker would report "too
+	// many rows" for a total the join never produced.
+	//
+	// A walker's COUNTERS are not here: runJoinParallel owns one JoinStats per walker and
+	// merges them (see walkerStats), so the serial walk and the parallel one report through
+	// the same path rather than two.
+	maxPairs   int
+	noRowLimit bool
+	// Scratch for spliceComposite, which runs once per OUTPUT row. bodies and entBufs are
+	// reused across rows; member0 holds the FROM side's narrowed bytes for as long as the
+	// walk stays on one scan row (see scanRow).
 	bodies        []memberBody
 	entBufs       [][]byte
 	member0       memberBody
@@ -309,11 +337,15 @@ type joinPlan struct {
 	member0Cached bool
 }
 
+func newJoinWalk(p *joinPlan) *joinWalk {
+	return &joinWalk{rows: make([]*joinRow, p.nSides())}
+}
+
 // scanRow marks the start of a new FROM-side row, dropping what spliceComposite cached for
 // side 0. The scanned side is constant beneath one walk; this is what says when it stops
 // being, and it is called even when the walk emits nothing, so a row that matches no
 // candidate cannot leave a stale member behind for the next one.
-func (p *joinPlan) scanRow() { p.member0Cached = false }
+func (w *joinWalk) scanRow() { w.member0Cached = false }
 
 // nSides is how many tables the row is made of.
 func (p *joinPlan) nSides() int { return len(p.aliases) }
@@ -374,7 +406,11 @@ func (cat *Catalog) Join(spec JoinSpec, want JoinLimits, stats *JoinStats) (iter
 // for less" a property of every entry point rather than of this one.
 func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats) (iter.Seq[*classad.ClassAd], error) {
 	return joinStream(cat, spec, limits, stats,
-		func(p *joinPlan, rows []*joinRow) (*classad.ClassAd, bool) { return p.composite(rows), true })
+		func(_ *joinWalk, p *joinPlan, rows []*joinRow) (*classad.ClassAd, bool) {
+			return p.composite(rows), true
+		},
+		func(a *classad.ClassAd) *classad.ClassAd { return a }, // composite builds a fresh ad per row
+		nil) // no arena: a ClassAd is not bytes, and cloning it is free
 }
 
 // joinStream is the join with the form of its output rows left to the caller: mk turns a
@@ -386,7 +422,8 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 // condition keeps, when an unmatched LEFT row is null-extended, which limit stops what. A
 // second copy of that is a second set of answers to those questions.
 func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, stats *JoinStats,
-	mk func(p *joinPlan, rows []*joinRow) (T, bool)) (iter.Seq[T], error) {
+	mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool),
+	clone func(T) T, arena *rowArena[T]) (iter.Seq[T], error) {
 	p, err := compileJoin(spec, limits)
 	if err != nil {
 		return nil, err
@@ -434,7 +471,7 @@ func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, stats *Jo
 		}
 		hashSeqs = append(hashSeqs, seq)
 	}
-	return runJoin(p, hashSeqs, scanSeq, stats, mk), nil
+	return runJoin(cat, p, hashSeqs, scanSeq, stats, mk, clone, arena), nil
 }
 
 // joinSource resolves one side to a sequence of its rows, whatever kind of thing it names.
@@ -732,8 +769,9 @@ type joinStage struct {
 // The hashes are built HERE rather than by the caller so that a limit met while building one
 // is reported the way every other mid-stream limit is: in stats.Err, after the sequence has
 // started.
-func runJoin[T any](p *joinPlan, hashSeqs []iter.Seq[*joinRow], scanSeq iter.Seq[*joinRow],
-	stats *JoinStats, mk func(p *joinPlan, rows []*joinRow) (T, bool)) iter.Seq[T] {
+func runJoin[T any](cat *Catalog, p *joinPlan, hashSeqs []iter.Seq[*joinRow], scanSeq iter.Seq[*joinRow],
+	stats *JoinStats, mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool),
+	clone func(T) T, arena *rowArena[T]) iter.Seq[T] {
 	return func(yield func(T) bool) {
 		stages := make([]*joinStage, 0, len(hashSeqs))
 		for i, seq := range hashSeqs {
@@ -748,60 +786,22 @@ func runJoin[T any](p *joinPlan, hashSeqs []iter.Seq[*joinRow], scanSeq iter.Seq
 		// rows is the accumulated row: one entry per side, nil where a side is not yet
 		// folded in or was null-extended. Every compiled term indexes it by side, which is
 		// what lets the condition read the sides where they already are.
-		rows := make([]*joinRow, p.nSides())
-		var walk func(depth int) (stop bool)
-		walk = func(depth int) bool {
-			if depth == len(stages) {
-				return emitJoin(p, rows, stats, mk, yield)
-			}
-			st := stages[depth]
-			candidates := st.all
-			if st.hashed {
-				k, ok := p.rowKey(st.step, rows)
-				if !ok {
-					candidates = nil // an undefined key matches nothing
-				} else {
-					candidates = st.buckets[k]
-				}
-			}
-			matched := false
-			for _, r := range candidates {
-				stats.Pairs++
-				if stats.Pairs > p.limits.MaxPairs {
-					stats.Err = fmt.Errorf("the join examined more than %d candidate pairs; "+
-						"it needs a more selective condition", p.limits.MaxPairs)
-					return true
-				}
-				rows[st.step.side] = r
-				// The hash only narrowed the candidates; the condition decides, in full,
-				// with ClassAd's own semantics.
-				if !p.condHolds(st.step, rows) {
-					continue
-				}
-				// The pair matched. Whether the finished row then survives the post-filter
-				// is a SEPARATE question, answered once at the end of the chain, and
-				// conflating the two is a wrong answer: a matched row that WHERE drops
-				// must not come back as a null-extended one.
-				matched = true
-				if walk(depth + 1) {
-					return true
-				}
-			}
-			rows[st.step.side] = nil
-			// A side is null-extendable exactly when ITS OWN step is a LEFT join. Every
-			// earlier side is preserved by every later step, so being preserved once is
-			// being preserved throughout -- which is why this is one comparison and not a
-			// walk back along the chain.
-			if !matched && st.step.kind == JoinLeft {
-				return walk(depth + 1)
-			}
-			return false
+		var sem chan struct{}
+		if cat != nil {
+			sem = cat.joinSem
 		}
+		if runJoinParallel(p, sem, stages, scanSeq, stats, mk, clone, arena, yield) {
+			return
+		}
+
+		wk := newJoinWalk(p)
+		rows := wk.rows
+		walk := makeWalk(p, stages, wk, stats, mk, yield)
 
 		for l := range scanSeq {
 			stats.ScanRows++
 			rows[0] = l
-			p.scanRow()
+			wk.scanRow()
 			if walk(0) {
 				return
 			}
@@ -845,16 +845,16 @@ func buildStage(p *joinPlan, step *joinStepPlan, seq iter.Seq[*joinRow], stats *
 // emit forms the joined row, applies the post-filter and yields it. It reports only whether
 // the join should STOP -- whether the row survived the filter is deliberately not reported,
 // because the one caller that used to branch on it drew the wrong conclusion from it.
-func emitJoin[T any](p *joinPlan, rows []*joinRow, stats *JoinStats,
-	mk func(p *joinPlan, rows []*joinRow) (T, bool), yield func(T) bool) (stop bool) {
+func emitJoin[T any](wk *joinWalk, p *joinPlan, rows []*joinRow, stats *JoinStats,
+	mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool), yield func(T) bool) (stop bool) {
 	if !p.postHolds(rows) {
 		return false
 	}
-	row, ok := mk(p, rows)
+	row, ok := mk(wk, p, rows)
 	if !ok {
 		return false // the row form could not be made; it is not a reason to stop
 	}
-	if stats.Rows >= p.limits.MaxRows {
+	if !wk.noRowLimit && stats.Rows >= p.limits.MaxRows {
 		stats.Err = fmt.Errorf("the join produced more than %d rows; narrow it with a constraint",
 			p.limits.MaxRows)
 		return true
@@ -1097,4 +1097,73 @@ func isTrue(v classad.Value) bool {
 	}
 	b, err := v.BoolValue()
 	return err == nil && b
+}
+
+// pairBudget is the pair limit this walker is held to: its own share when a parallel walk
+// split it, the whole budget otherwise.
+func (w *joinWalk) pairBudget(p *joinPlan) int {
+	if w.maxPairs > 0 {
+		return w.maxPairs
+	}
+	return p.limits.MaxPairs
+}
+
+// makeWalk builds the nested pair loop for ONE walker.
+//
+// It is a function rather than an inline closure so the parallel walk can have several, each
+// over its own joinWalk, its own stats and its own yield. Everything it closes over that is
+// shared -- the plan and the stages -- is immutable once built: the stages' buckets are read
+// here and written only by buildStage, before any walker starts.
+func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *JoinStats,
+	mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool), yield func(T) bool) func(int) bool {
+	rows := wk.rows
+	var walk func(depth int) (stop bool)
+	walk = func(depth int) bool {
+		if depth == len(stages) {
+			return emitJoin(wk, p, rows, stats, mk, yield)
+		}
+		st := stages[depth]
+		candidates := st.all
+		if st.hashed {
+			k, ok := p.rowKey(st.step, rows)
+			if !ok {
+				candidates = nil // an undefined key matches nothing
+			} else {
+				candidates = st.buckets[k]
+			}
+		}
+		matched := false
+		for _, r := range candidates {
+			stats.Pairs++
+			if stats.Pairs > wk.pairBudget(p) {
+				stats.Err = fmt.Errorf("the join examined more than %d candidate pairs; "+
+					"it needs a more selective condition", p.limits.MaxPairs)
+				return true
+			}
+			rows[st.step.side] = r
+			// The hash only narrowed the candidates; the condition decides, in full,
+			// with ClassAd's own semantics.
+			if !p.condHolds(st.step, rows) {
+				continue
+			}
+			// The pair matched. Whether the finished row then survives the post-filter
+			// is a SEPARATE question, answered once at the end of the chain, and
+			// conflating the two is a wrong answer: a matched row that WHERE drops
+			// must not come back as a null-extended one.
+			matched = true
+			if walk(depth + 1) {
+				return true
+			}
+		}
+		rows[st.step.side] = nil
+		// A side is null-extendable exactly when ITS OWN step is a LEFT join. Every
+		// earlier side is preserved by every later step, so being preserved once is
+		// being preserved throughout -- which is why this is one comparison and not a
+		// walk back along the chain.
+		if !matched && st.step.kind == JoinLeft {
+			return walk(depth + 1)
+		}
+		return false
+	}
+	return walk
 }

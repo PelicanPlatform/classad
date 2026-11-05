@@ -209,20 +209,20 @@ func TestWireRowReadsALiteralWithoutDecoding(t *testing.T) {
 	if _, fromWire := r.attr("NoSuchAttribute"); !fromWire {
 		t.Error("an absent attribute is undefined, which the bytes answer without decoding")
 	}
-	if r.ad != nil {
+	if r.ad.Load() != nil {
 		t.Fatal("reading literals decoded the row; the whole point is that it does not")
 	}
 	// An expression-valued attribute is the case the bytes cannot answer.
 	if _, fromWire := r.attr("Doubled"); fromWire {
 		t.Error("Doubled holds an expression; the bytes must not claim to answer it")
 	}
-	if r.ad != nil {
+	if r.ad.Load() != nil {
 		t.Fatal("attr decoded on its own; the decision to decode belongs to the caller")
 	}
 	if v := r.eval("Doubled"); !v.IsInteger() {
 		t.Errorf("eval should have decoded and evaluated Doubled, got %v", v)
 	}
-	if r.ad == nil {
+	if r.ad.Load() == nil {
 		t.Fatal("eval did not decode the row for a term the bytes could not answer")
 	}
 }
@@ -305,7 +305,7 @@ func TestDecodedRowReadsThroughTheAd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &joinRow{ad: ad}
+	r := decodedRow(ad)
 	v, ok := r.attr("Doubled")
 	if !ok {
 		t.Fatal("a decoded row has no bytes to decline on")

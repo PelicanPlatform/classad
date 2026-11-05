@@ -3,6 +3,7 @@ package db
 import (
 	"iter"
 	"strings"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
@@ -45,7 +46,20 @@ type joinRow struct {
 	// which is what a side read whole does, since only a narrowed read serves wire.
 	w wire.Ad
 	// ad is the decoded form. It is built at most once, by record.
-	ad *classad.ClassAd
+	//
+	// ATOMIC because a parallel walk shares the hashed sides' rows across walkers. The ad
+	// itself is safe to read concurrently -- the classad package documents that reads do not
+	// modify an ad and need no locking -- but THIS field is a write on a read path, and two
+	// walkers reaching an undecoded row at once would race on it. Decoding is pure, so a
+	// losing racer's ad is simply dropped: both goroutines built equal ads and either will do.
+	ad atomic.Pointer[classad.ClassAd]
+}
+
+// decodedRow is a joinRow that arrived already decoded, as a side read whole does.
+func decodedRow(ad *classad.ClassAd) *joinRow {
+	r := &joinRow{}
+	r.ad.Store(ad)
+	return r
 }
 
 // record returns the row as a ClassAd, decoding it the first time it is asked for.
@@ -58,16 +72,17 @@ func (r *joinRow) record() *classad.ClassAd {
 	if r == nil {
 		return nil
 	}
-	if r.ad != nil {
-		return r.ad
+	if a := r.ad.Load(); a != nil {
+		return a
 	}
-	a, err := wire.DecodeInline(r.w)
-	if err != nil {
-		r.ad = classad.New()
-		return r.ad
+	built := classad.New()
+	if a, err := wire.DecodeInline(r.w); err == nil {
+		built = classad.FromAST(a)
 	}
-	r.ad = classad.FromAST(a)
-	return r.ad
+	if r.ad.CompareAndSwap(nil, built) {
+		return built
+	}
+	return r.ad.Load() // another walker decoded it first; its ad is equal to ours
 }
 
 // attr returns the value of one attribute, reading the wire bytes when they hold the answer
@@ -83,8 +98,8 @@ func (r *joinRow) attr(name string) (classad.Value, bool) {
 	if r == nil {
 		return classad.NewUndefinedValue(), true
 	}
-	if r.ad != nil {
-		return r.ad.EvaluateAttr(name), true // already decoded: no reason to read bytes
+	if a := r.ad.Load(); a != nil {
+		return a.EvaluateAttr(name), true // already decoded: no reason to read bytes
 	}
 	node, found := r.w.LookupByName(name)
 	if !found {
@@ -186,9 +201,9 @@ func wireRows(rows iter.Seq[[]byte]) iter.Seq[*joinRow] {
 			arena = append(arena, row...)
 			r := &structs[0]
 			structs = structs[1:]
-			*r = joinRow{w: wire.Ad(arena[start:len(arena):len(arena)])}
+			r.w = wire.Ad(arena[start:len(arena):len(arena)]) // ad stays nil: a fresh slab cell
 			if forceDecodedRows {
-				r = &joinRow{ad: r.record()}
+				r = decodedRow(r.record())
 			}
 			if !yield(r) {
 				return
@@ -201,7 +216,7 @@ func wireRows(rows iter.Seq[[]byte]) iter.Seq[*joinRow] {
 func adRows(ads iter.Seq[*classad.ClassAd]) iter.Seq[*joinRow] {
 	return func(yield func(*joinRow) bool) {
 		for ad := range ads {
-			if !yield(&joinRow{ad: ad}) {
+			if !yield(decodedRow(ad)) {
 				return
 			}
 		}
@@ -271,7 +286,7 @@ func (r *joinRow) member(attrs []string) *classad.ClassAd {
 	if r == nil {
 		return nil
 	}
-	if attrs == nil || r.ad != nil || r.w == nil {
+	if attrs == nil || r.ad.Load() != nil || r.w == nil {
 		return project(r.record(), attrs)
 	}
 	out := &ast.ClassAd{Attributes: make([]*ast.AttributeAssignment, 0, len(attrs))}

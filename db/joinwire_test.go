@@ -103,10 +103,10 @@ func TestSpliceIsTakenForTheOrdinaryShape(t *testing.T) {
 	if side == nil {
 		t.Fatal("the fixture produced no row")
 	}
-	if _, ok := p.spliceComposite(nil, []*joinRow{side, nil}); !ok {
+	if _, ok := newJoinWalk(p).spliceComposite(p, nil, []*joinRow{side, nil}); !ok {
 		t.Fatal("the splice declined a narrowed wire row, which is the shape it exists for")
 	}
-	if side.ad != nil {
+	if side.ad.Load() != nil {
 		t.Fatal("splicing decoded the row; the whole point is that it does not")
 	}
 }
@@ -122,7 +122,7 @@ func TestSpliceDeclinesWhatItCannotCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := p.spliceComposite(nil, []*joinRow{{ad: ad}, nil}); ok {
+	if _, ok := newJoinWalk(p).spliceComposite(p, nil, []*joinRow{decodedRow(ad), nil}); ok {
 		t.Error("a side that arrived decoded has no bytes to splice; it must decline")
 	}
 
@@ -138,7 +138,7 @@ func TestSpliceDeclinesWhatItCannotCopy(t *testing.T) {
 		side = r
 		break
 	}
-	if _, ok := whole.spliceComposite(nil, []*joinRow{side, nil}); ok {
+	if _, ok := newJoinWalk(whole).spliceComposite(whole, nil, []*joinRow{side, nil}); ok {
 		t.Error("a whole-ad projection has no narrowed body to copy; it must decline")
 	}
 }
@@ -239,7 +239,7 @@ func TestSpliceDeclinesAnInternedRow(t *testing.T) {
 		t.Fatal("memberBody accepted an interned row; it would have spliced an empty member")
 	}
 	p := &joinPlan{aliases: []string{"h", "e"}, projects: [][]string{{"ClusterId"}, nil}}
-	if _, ok := p.spliceComposite(nil, []*joinRow{row, nil}); ok {
+	if _, ok := newJoinWalk(p).spliceComposite(p, nil, []*joinRow{row, nil}); ok {
 		t.Fatal("the splice accepted an interned row")
 	}
 }
