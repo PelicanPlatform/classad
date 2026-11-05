@@ -260,7 +260,7 @@ func (cat *Catalog) probeGate(sp *joinStepPlan, side JoinSide) (attr string, row
 	// alternative, and what this did until the store could be asked, is to decline every
 	// constrained side -- which is most of them, since a history join narrows by owner or
 	// date far more often than not.
-	rows, why = cat.sideRows(side, rows, segments)
+	rows, why = cat.sideRows(side, rows)
 	if why != "" {
 		return "", 0, 0, why
 	}

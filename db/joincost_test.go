@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -84,7 +85,7 @@ var costConstraints = []string{
 	`Cmd == "/home/erin/run.sh"`,
 }
 
-// TestReadVisitsTracksTheRead is the cost model's foundation: every join cost is denominated
+// TestEstVisitedTracksTheRead is the cost model's foundation: every join cost is denominated
 // in records touched, so an estimate that does not track what a read actually touches makes
 // every decision built on it arbitrary.
 //
@@ -93,22 +94,22 @@ var costConstraints = []string{
 // number. What a tolerance this wide still catches is the failure that matters: EstCandidates
 // is zero for a plan that scans, so reading it off that one field prices the most expensive
 // side a join can have at nothing.
-func TestReadVisitsTracksTheRead(t *testing.T) {
+func TestEstVisitedTracksTheRead(t *testing.T) {
 	for _, reindex := range []bool{true, false} {
 		t.Run(fmt.Sprintf("reindex=%v", reindex), func(t *testing.T) {
 			cat, a := costFixture(t, 20000, reindex)
 			defer cat.Close()
-			total, segments := a.Count(), a.Stats().Segments
+			total := a.Count()
 			for _, c := range costConstraints {
 				ex, err := a.Explain(c)
 				if err != nil {
 					t.Fatalf("%s: %v", c, err)
 				}
-				est, ok := readVisits(ex, total, segments)
-				if !ok {
-					t.Errorf("%s: plan %q could not be priced", c, ex.Plan)
+				if ex.Plan == "" {
+					t.Errorf("%s: no plan was reported", c)
 					continue
 				}
+				est := int(ex.EstVisited)
 				var st collections.ScanStats
 				seq, err := a.QueryRawWireStats(c, nil, false, &st)
 				if err != nil {
@@ -117,7 +118,7 @@ func TestReadVisitsTracksTheRead(t *testing.T) {
 				for range seq {
 				}
 				actual := st.RecordsVisited
-				t.Logf("%-44s est %6d  visited %6d  (%s)", c, est, actual, ex.Plan)
+				t.Logf("%-44s estVisited %6d  visited %6d  (%s)", c, est, actual, ex.Plan)
 				// A ratio bound plus an absolute allowance. The allowance is for the
 				// open segment, which a read walks in full and no explain reports (see
 				// readVisits), so the shortfall is additive and swamps a ratio when the
@@ -136,10 +137,10 @@ func TestReadVisitsTracksTheRead(t *testing.T) {
 // A constraint no index covers reads every record. EstCandidates is 0 for that plan, so a
 // cost model that trusted it would price a full scan as free -- and then narrow it, or
 // choose it as the side to hash, on the strength of a number that means the opposite.
-func TestReadVisitsPricesAScanAtTheWholeTable(t *testing.T) {
+func TestEstVisitedPricesAScanAtTheWholeTable(t *testing.T) {
 	cat, a := costFixture(t, 20000, true)
 	defer cat.Close()
-	total, segments := a.Count(), a.Stats().Segments
+	total := a.Count()
 	ex, err := a.Explain(`RequestCpus >= 4`) // no index covers RequestCpus
 	if err != nil {
 		t.Fatal(err)
@@ -147,20 +148,84 @@ func TestReadVisitsPricesAScanAtTheWholeTable(t *testing.T) {
 	if ex.EstCandidates != 0 {
 		t.Fatalf("the fixture no longer produces the scan this is about: EstCandidates = %d", ex.EstCandidates)
 	}
-	est, ok := readVisits(ex, total, segments)
-	if !ok {
-		t.Fatalf("plan %q could not be priced", ex.Plan)
-	}
+	est := int(ex.EstVisited)
 	if est != total {
 		t.Errorf("priced a full scan at %d records, want the whole table (%d)", est, total)
 	}
 }
 
-// An unrecognized plan string is not priced at all. A cost model that substituted a number
-// here would decide with it, and the decision would be indistinguishable from an informed
-// one in everything it reports.
-func TestReadVisitsDeclinesAnUnknownPlan(t *testing.T) {
-	if _, ok := readVisits(QueryExplain{Plan: "a-plan-from-the-future", TotalAds: 1000}, 1000, 10); ok {
-		t.Error("priced a plan it does not know")
+// The error paths. Each returns a reason rather than a number, because the caller's next
+// move is to decide something with whatever comes back, and a decision made on an invented
+// size is indistinguishable in everything it reports from an informed one.
+func TestSideRowsDeclinesWhatItCannotPrice(t *testing.T) {
+	cat, a := costFixture(t, 1000, true)
+	defer cat.Close()
+	total := a.Count()
+
+	for _, tc := range []struct {
+		name string
+		side JoinSide
+		want string
+	}{
+		{"no such table", JoinSide{Table: "nope", Alias: "n", Constraint: `Owner == "x"`}, "could not be planned"},
+		{"bad constraint", JoinSide{Table: "history", Alias: "h", Constraint: "Owner =="}, "could not be planned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, why := cat.sideRows(tc.side, total)
+			if why == "" {
+				t.Fatalf("priced it at %d records instead of declining", rows)
+			}
+			if !strings.Contains(why, tc.want) {
+				t.Errorf("reason %q does not contain %q", why, tc.want)
+			}
+			if rows != 0 {
+				t.Errorf("declined but returned %d rows", rows)
+			}
+		})
+	}
+
+	// A MUTABLE table prices the same way. It is a separate branch of explainSide and the
+	// one build-side selection will lean on, so it is not left to the archive to cover.
+	jobs, err := cat.CreateTable("jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 500; i++ {
+		ad, perr := classad.ParseOld(fmt.Sprintf("ClusterId = %d\nOwner = \"user%d\"", i, i%5))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if perr = jobs.Put(fmt.Sprintf("%d.0", i), ad); perr != nil {
+			t.Fatal(perr)
+		}
+	}
+	side := JoinSide{Table: "jobs", Alias: "j", Constraint: `Owner == "user0"`}
+	rows, why := cat.sideRows(side, jobs.Len())
+	if why != "" {
+		t.Fatalf("a mutable table could not be priced: %s", why)
+	}
+	if rows <= 0 || rows > jobs.Len() {
+		t.Errorf("priced a mutable side at %d records, outside 1..%d", rows, jobs.Len())
+	}
+
+	// A side with no constraint of its own reads the whole table, and that needs no plan.
+	if rows, why := cat.sideRows(JoinSide{Table: "history", Alias: "h"}, total); why != "" || rows != total {
+		t.Errorf("an unconstrained side priced at (%d, %q), want (%d, \"\")", rows, why, total)
+	}
+}
+
+func TestAndConstraints(t *testing.T) {
+	for _, tc := range []struct{ own, cons, want string }{
+		{"", "(a == 1)", "(a == 1)"},
+		{"b == 2", "", "b == 2"},
+		{"", "", ""},
+		{"b == 2", "(a == 1)", "(b == 2) && (a == 1)"},
+		// The side's own text is parenthesized because it may be a bare disjunction,
+		// which would otherwise bind looser than the && and widen the side.
+		{"b == 2 || c == 3", "(a == 1)", "(b == 2 || c == 3) && (a == 1)"},
+	} {
+		if got := andConstraints(tc.own, tc.cons); got != tc.want {
+			t.Errorf("andConstraints(%q, %q) = %q, want %q", tc.own, tc.cons, got, tc.want)
+		}
 	}
 }
