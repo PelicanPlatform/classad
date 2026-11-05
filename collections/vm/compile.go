@@ -116,6 +116,16 @@ type compiler struct {
 	// waiting to be computed rather than a performance note. It is reported by Script.Compile and
 	// is always nil outside a script, where there are no locals to capture. See delegate.
 	capture error
+
+	// inlineCall expands a call to a script function in place, reporting whether the name was one.
+	// Set by Script and nil for an ordinary expression, which has no functions to call. The hook
+	// goes through the Script rather than living here because an expansion emits STATEMENTS -- the
+	// body's -- and the builder is what knows how to emit those. See scriptfunc.go.
+	inlineCall func(*ast.FunctionCall) bool
+
+	// isScriptFunc reports whether a name is one of the script's functions, for the refusal a
+	// delegated subtree gets. Nil outside a script.
+	isScriptFunc func(string) bool
 }
 
 // ins appends an instruction and returns its index (for later backpatching).
@@ -208,6 +218,12 @@ func (c *compiler) emit(expr ast.Expr) {
 		c.emit(v.Right)
 		c.patch(j, len(c.p.code))
 	case *ast.FunctionCall:
+		// A SCRIPT'S OWN FUNCTION IS TRIED FIRST, and no other case can take the name from it: a
+		// script function may not shadow a built-in or a registered UDF, so a name that reaches
+		// here as one of the script's is one nothing else answers to.
+		if c.inlineCall != nil && c.inlineCall(v) {
+			return
+		}
 		// ifThenElse becomes a branch, not a call, so it must be tried before the strict-call path
 		// (which refuses it anyway, because an eager call would evaluate both branches).
 		if c.emitIfThenElse(v) {
@@ -287,7 +303,20 @@ func (c *compiler) delegate(expr ast.Expr) {
 // wins: later ones are almost always the same mistake, and a compiler that reports five is a
 // compiler whose first line is ignored.
 func (c *compiler) noteCapture(expr ast.Expr) {
-	if c.locals == nil || c.capture != nil {
+	if c.capture != nil {
+		return
+	}
+	// A CALL IS THE SAME MISTAKE AS A LOCAL READ, one level up. The evaluator resolves a function
+	// name against the built-ins and the UDF registry; a script's own function is in neither, so a
+	// delegated subtree calling one evaluates to ERROR. Refused here rather than computed, exactly
+	// as a captured local is.
+	if c.isScriptFunc != nil {
+		if name := callsScriptFunc(expr, c.isScriptFunc); name != "" {
+			c.capture = &ScriptCallCaptureError{Func: name, Expr: expr.String()}
+			return
+		}
+	}
+	if c.locals == nil {
 		return
 	}
 	for _, name := range collectReads(expr, map[string]bool{}, nil) {
@@ -315,11 +344,14 @@ func (e *LocalCaptureError) detail() string {
 		"or MY.%s if the attribute was meant", e.Expr, e.Local, e.Local)
 }
 
+// detailed is a compiler refusal that can render itself without the "vm: script: " prefix.
+type detailed interface{ detail() string }
+
 // captureDetail renders a compiler refusal for a diagnostic that supplies its own position.
 func captureDetail(err error) string {
-	var lc *LocalCaptureError
-	if errors.As(err, &lc) {
-		return lc.detail()
+	var d detailed
+	if errors.As(err, &d) {
+		return d.detail()
 	}
 	return err.Error()
 }

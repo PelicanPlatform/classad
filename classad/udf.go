@@ -145,6 +145,24 @@ func lookupUDF(folded string) (udfEntry, bool) {
 	return e, ok
 }
 
+// KnownFunctionName reports whether name is already callable as a function: a built-in, or a
+// user-defined function registered through RegisterFunction. The comparison is case-insensitive,
+// as a call is.
+//
+// It answers a WIDER question than StrictFunction, which reports whether a call of a given arity
+// can be compiled natively and so says no to a lazy built-in, to a nondeterministic one and to a
+// wrong argument count. A caller that wants to introduce a new name -- a second registry, a
+// script's own function -- needs to know whether the name is taken at all, and StrictFunction
+// returning false does not mean it is free.
+func KnownFunctionName(name string) bool {
+	folded := strings.ToLower(name)
+	if _, isBuiltin := functionArity[folded]; isBuiltin {
+		return true
+	}
+	_, isUDF := lookupUDF(folded)
+	return isUDF
+}
+
 // RegisteredFunctions returns the registered names, as registered, for diagnostics. The order is
 // unspecified.
 func RegisteredFunctions() []string {
