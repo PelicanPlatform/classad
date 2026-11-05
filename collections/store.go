@@ -577,6 +577,10 @@ type Collection struct {
 	colCache     *blockCache
 	colCacheOnce sync.Once
 
+	// canon gives every segment that describes the SAME schema the one schema OBJECT, so the scan's
+	// pointer-keyed caches hit on a table whose segments each carry their own copy. See schemacanon.go.
+	canon schemaCanon
+
 	// schemaSeed holds a schema recovered from a sidecar whose BLOCK format this build cannot read, so a
 	// format bump keeps the accelerator's schema instead of switching the accelerator off. Only ever read by
 	// adoptPersistedSchemaScan, and only when no block loaded. See readColSectionSchemaOnly.

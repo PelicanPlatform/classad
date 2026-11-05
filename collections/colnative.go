@@ -185,6 +185,7 @@ func publishColRecord(c *Collection, seg *segment, o uint32) error {
 		seg.colDamaged.Store(true)
 		return nil
 	}
+	c.canonColSchemas(cs) // one schema object per layout, not one per segment (schemacanon.go)
 	cs.schemaOnly = true
 	// The collection's ONE shared block cache, not a fresh per-segment cache: a cache
 	// per segment made ristretto's fixed admission metadata scale with segment count (a

@@ -258,6 +258,30 @@ func (sh *shard) allocSeg(id uint32, size int, codec Codec) *segment {
 	return seg
 }
 
+// allocRewrite allocates a segment-rewrite's DESTINATION, whichever backing this shard has:
+// a staged file under prefix (a name recovery ignores) for a persistent shard, a RAM arena for
+// an in-memory one. The prefix is meaningless without a file and is simply unused there.
+//
+// It exists so a rewrite does not have to ask whether the shard is persistent. Segment rewrites
+// are a storage LAYOUT decision, and an in-memory shard has segments and a layout like any
+// other; what it lacks is the crash-recovery protocol around the swap, which is
+// commitSegmentRewrite's business, not the allocator's. Compaction already allocates both ways
+// (see newDst in compactShard); this is the same choice, named once.
+//
+// Returns nil if the backing allocator failed, which the caller treats as "do not rewrite".
+func (sh *shard) allocRewrite(id uint32, size int, codec Codec, prefix string) *segment {
+	if sh.allocNamed == nil {
+		s := newSegment(id, size, codec)
+		s.pinReap = sh.sealRAM // pin/reap-eligible so an anon sidecar tears down safely
+		return s
+	}
+	seg, err := sh.allocNamed(id, size, codec, prefix)
+	if err != nil {
+		return nil
+	}
+	return seg
+}
+
 func (sh *shard) dirGet(h uint64) loc {
 	if l, ok := sh.dir[h]; ok {
 		return l

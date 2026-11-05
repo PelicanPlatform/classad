@@ -330,9 +330,10 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	}
 
 	// Staged under the prefix recovery ignores: until commitSegmentRewrite renames it, a crash
-	// must leave the original segment as the one the directory names.
-	dst, err := sh.allocNamed(src.id, total, src.codec, mergeTmpPrefix)
-	if err != nil {
+	// must leave the original segment as the one the directory names. An in-memory shard gets a
+	// RAM arena instead and has nothing to stage against -- see shard.allocRewrite.
+	dst := sh.allocRewrite(src.id, total, src.codec, mergeTmpPrefix)
+	if dst == nil {
 		return nil, nil, nil
 	}
 	// Records first, in order, carrying their original seq/superseded/key so nothing about
@@ -689,9 +690,6 @@ var colCommitStallHook func()
 //
 // The caller must hold maintMu, as merging and reseal do, so segment rewrites never overlap.
 func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSchema, hot []int) bool {
-	if sh.allocNamed == nil || sh.segDir == "" {
-		return false // in-memory collection: nothing to make durable, and no file to stage
-	}
 	// The plan is computed here, under a BRIEF read lock, rather than inside columnarizeSegment:
 	// the rewrite that follows is long and must not hold a shard lock, and the other caller of
 	// columnarizeSegment already holds the write lock.
@@ -836,9 +834,6 @@ func (c *Collection) columnarizeSealed() int {
 		if total >= budget || c.maintStopping() {
 			break
 		}
-		if sh.allocNamed == nil || sh.segDir == "" {
-			continue // in-memory shard: the format has nowhere durable to live
-		}
 		sh.mu.Lock()
 		act := sh.act
 		var srcs []*segment
@@ -909,9 +904,6 @@ func (c *Collection) recolumnarizeStale() int {
 	for _, sh := range c.shards {
 		if total >= budget || c.maintStopping() {
 			break
-		}
-		if sh.allocNamed == nil || sh.segDir == "" {
-			continue // in-memory shard: nothing durable to rewrite
 		}
 		sh.mu.Lock()
 		act := sh.act

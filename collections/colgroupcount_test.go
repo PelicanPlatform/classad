@@ -346,7 +346,10 @@ func heteroGroupFixture(tb testing.TB, n int, shape func(i int) string) *Collect
 	if err != nil {
 		tb.Fatal(err)
 	}
-	c := New(Options{Shards: 1, SegmentSize: 1 << 16, Codec: cd})
+	// SIDECAR TIER, for the reason candFixture gives at length: the "an expression-valued group
+	// attribute must decline" case below is a property of a block whose columns hold only literals.
+	// A columnarized segment stores the expression's computed value too and partitions correctly.
+	c := New(Options{Shards: 1, SegmentSize: 1 << 16, Codec: cd, ColumnarSegmentBudget: -1})
 	for i := 0; i < n; i++ {
 		src := fmt.Sprintf("ClusterId = %d\nRequestMemory = %d\n%s", i, 1024+(i%32)*512, shape(i))
 		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(tb, src)); putErr != nil {

@@ -36,10 +36,26 @@ func TestProductionBlockWidthIsSetByBytesNotRows(t *testing.T) {
 	// so more records buy confidence in the distribution rather than a different answer, and these
 	// are ~8.6 KB each.
 	c := populate(t, sample, 20000)
+	// The per-ad stored size, captured BEFORE the accelerator is enabled, because that is the size the
+	// byte budget was applied to: a group seals when the records it has taken reach
+	// colGroupTargetBytes. Enabling columnarizes, and columnarizing removes those very bytes from the
+	// arena -- the schema'd values move into the payload and the records keep only their remnants --
+	// so measuring the arena afterwards divides the budget by the size of what is LEFT and then asks
+	// why the blocks are not wider. On this corpus that is 3477 B/ad against the 8569 the blocks were
+	// built from, and the expectation comes out 2.5x too high.
+	//
+	// It went unnoticed because the rewrite never ran here: an in-memory collection refused to
+	// columnarize, so a test that explicitly asks for the columnar-native regime (the loop below) was
+	// measuring sidecar blocks over an untouched arena.
+	bytesPerAd := float64(liveBytes(c)) / float64(c.Len())
 	if !c.BuildAndEnableSchemaScan(1<<16, 8) {
 		t.Skip("schema scan did not enable; there is no columnar block to measure")
 	}
 	for c.ColumnarizeSealed() > 0 {
+	}
+	if info := c.SchemaScanInfo(); info.ColumnarSegments == 0 {
+		t.Fatal("no sealed segment was columnarized: the loop above did nothing, so this measures " +
+			"sidecar blocks rather than the regime the test asks for")
 	}
 
 	widths, records := blockWidths(t, c)
@@ -54,7 +70,6 @@ func TestProductionBlockWidthIsSetByBytesNotRows(t *testing.T) {
 		sq += w * w
 	}
 	mean := float64(sq) / float64(records)
-	bytesPerAd := float64(liveBytes(c)) / float64(c.Len())
 
 	t.Logf("%d blocks over %d records: p50=%d max=%d record-weighted mean width=%.1f (%.0f B/ad)",
 		len(widths), records, widths[len(widths)/2], widths[len(widths)-1], mean, bytesPerAd)

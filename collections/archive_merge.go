@@ -123,21 +123,32 @@ func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segme
 	}
 
 	// Record the intent before removing anything, so a crash from here on is finishable.
-	marker := filepath.Join(sh.segDir, filepath.Base(out.path)+mergeMarkerSuffix)
-	srcNames := make([]string, len(srcs))
-	for i, s := range srcs {
-		srcNames[i] = filepath.Base(s.path)
-	}
-	if err := writeFileSync(marker, []byte(strings.Join(srcNames, "\n"))); err != nil {
-		return abort()
-	}
+	//
+	// An in-memory shard skips this whole protocol, and not as a shortcut: the marker, the staged
+	// name and the rename exist so a crash finds either the sources or the output and never half of
+	// each. A RAM shard's segments do not outlive the process that would replay them, so there is no
+	// torn state to recover from and nothing a marker could name. What remains is the swap below,
+	// which is the part that is actually about the shard rather than about the filesystem -- and it
+	// is identical either way, so the two backings converge on one rewrite instead of one backing
+	// having no rewrite at all.
+	marker := ""
+	if sh.segDir != "" {
+		marker = filepath.Join(sh.segDir, filepath.Base(out.path)+mergeMarkerSuffix)
+		srcNames := make([]string, len(srcs))
+		for i, s := range srcs {
+			srcNames[i] = filepath.Base(s.path)
+		}
+		if err := writeFileSync(marker, []byte(strings.Join(srcNames, "\n"))); err != nil {
+			return abort()
+		}
 
-	final := filepath.Join(sh.segDir, mergedFinalName(filepath.Base(out.path)))
-	if err := os.Rename(out.path, final); err != nil {
-		_ = os.Remove(marker)
-		return abort()
+		final := filepath.Join(sh.segDir, mergedFinalName(filepath.Base(out.path)))
+		if err := os.Rename(out.path, final); err != nil {
+			_ = os.Remove(marker)
+			return abort()
+		}
+		out.path = final
 	}
-	out.path = final
 
 	// Publish before unlinking: a reader that already holds a source keeps its mapping alive
 	// through the pin/reap path, so retiring the sources here is safe even mid-scan.
@@ -170,7 +181,9 @@ func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segme
 	// Any source still pinned by an in-flight scan is unlinked when its pins drain; the
 	// marker is removed regardless, because the output file is in place and named, and a
 	// replayed unlink of an already-gone file is a no-op.
-	_ = os.Remove(marker)
+	if marker != "" {
+		_ = os.Remove(marker)
+	}
 	return true
 }
 
