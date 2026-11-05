@@ -86,14 +86,26 @@ jobs:
   #
   # The suite is SHARDED by test name across parallel jobs. Every test here is `package
   # collections`, so there is one test binary and `go test -p` (which parallelizes across
-  # packages) has nothing to work with: ~55 minutes of runner time under -race. Tests do
-  # overlap within a shard -- 71% of the recorded time calls t.Parallel() -- but that is
-  # bounded by the cores one runner has, which is what sharding adds to. The shards give it the cores one runner does not have, with no test
-  # skipped and the race detector still on everywhere. Tests are packed by their recorded
-  # durations (collections/shard-durations.txt), so each shard gets about the same time.
-  # Four shards balanced by test COUNT left one at 19-25 minutes and it hit the 25m
-  # timeout. To add a shard, add its index below: the script reads the shard count from
-  # the matrix. See collections/shard-test.sh.
+  # packages) has nothing to work with. Tests do overlap within a shard -- 71% of the
+  # recorded time calls t.Parallel() -- but that is bounded by the cores one runner has,
+  # which is what sharding adds to. The shards give it the cores one runner does not have,
+  # with no test skipped and the race detector still on everywhere. Tests are packed by
+  # their recorded durations (collections/shard-durations.txt), so each shard gets about
+  # the same time. Four shards balanced by test COUNT left one at 19-25 minutes and it hit
+  # the 25m timeout.
+  #
+  # WHY TWELVE. The suite is 10458 recorded seconds; a shard's elapsed time runs at about
+  # 0.59x the recorded seconds it is given, plus ~90s of race-detector build. Six shards
+  # therefore sit around 20 minutes against a 25m timeout, which is no headroom at all once
+  # a slow runner or an imperfect estimate is in play -- and that is what has been turning
+  # shards red. Twelve puts a shard around 10 minutes, so it takes a 2.5x bad day to reach
+  # the timeout rather than a 1.25x one. It costs almost nothing in total runner time,
+  # because the per-job overhead is only the ~90s build: six shards were ~112 minutes of
+  # runner time in total and twelve are ~122.
+  #
+  # To change the shard count, edit the list below: the script reads the count from the
+  # matrix (strategy.job-total), so this is the only place it is written down. See
+  # collections/shard-test.sh.
   collections:
     name: Collections shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -101,7 +113,7 @@ jobs:
       # Every shard reports: one shard failing must not hide a second failure elsewhere.
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
     steps:
     - name: Check out code
