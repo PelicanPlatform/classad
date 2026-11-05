@@ -89,9 +89,10 @@ SHARD_TIMEOUT="${SHARD_TIMEOUT:-40m}"
 
 # GROWTH ALARM, in recorded seconds per shard. This is the one number here that does not move with
 # runner speed: it is just how much of the suite each shard has been given, so it answers "has the suite
-# outgrown this matrix" without being drowned out by which host a job landed on. 1000s per shard is the
-# size at which a shard runs about ten minutes on a typical runner, which is the shape worth holding.
-SHARD_WEIGHT_BUDGET="${SHARD_WEIGHT_BUDGET:-1000}"
+# outgrown this matrix" without being drowned out by which host a job landed on. 900s per shard is the
+# size at which a shard runs about ten minutes on a typical runner and about sixteen on the slowest
+# batch of hosts seen so far, which is the shape worth holding.
+SHARD_WEIGHT_BUDGET="${SHARD_WEIGHT_BUDGET:-900}"
 
 # NEAR-MISS ALARM, in real elapsed seconds: a run that got this close to SHARD_TIMEOUT still passed, but
 # only just, and the next one may not. 70% of the timeout.
@@ -238,8 +239,12 @@ start=$SECONDS
 # instead of waiting to fail one. With a real growth alarm in place the timeout is free to be sized for
 # what it is for, and 40m is about 3x the typical shard.
 #
-# It should come back down as the matrix grows: at twelve shards the typical shard is near seven minutes
-# and 25m is ample again.
+# It is not obviously safe to put it back to 25m once the matrix grows, and the measurement says so.
+# Run 41932733548 drew a uniformly slow batch of hosts -- "Build and vet" took 18-20s in every job,
+# against 13-14s in the fastest jobs of the run before -- and the same shards that had taken 1048s and
+# 752s took 1891s and 1131s. Scale that slow run down to twelve shards and its worst shard is still
+# about 16 minutes, which is 1.5x under a 25m timeout and 2.4x under this one. Twelve shards AND this
+# timeout, then; dropping back to 25m wants sixteen.
 set +e
 go test -race -count=1 -timeout "$SHARD_TIMEOUT" -p 4 -v -run "$re" "$@" ./... >"$log" 2>&1
 rc=$?
