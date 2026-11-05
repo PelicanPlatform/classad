@@ -45,6 +45,13 @@ var byteLexerCases = []string{
 	// literals
 	`1`, `0`, `42`, `3.14`, `.5`, `1.0e10`, `1E-3`, `2.5e+8`, `9223372036854775807`,
 	`"hi"`, `""`, `"a\"b\n\t\\"`, `"tab\there"`, `"oct\101\0777"`, `"utf: ✓ �z"`,
+	// Escapes: every one the language defines, and undefined ones (which are
+	// accepted with the backslash dropped, as convert_escapes does). Both lexers
+	// carry their own copy of this table, so the two must agree arm for arm.
+	`"\a\b\f\n\r\t\v"`, `"\?\'\"\\"`,
+	`"a\.b"`, `"\S \r (\l)"`, `"C:\Users\x"`, `"q\8\9\y\-\,\ x"`,
+	`"warlock21\.beocat\.ksu\.edu|wsu\-lg02\.osris\.org"`,
+	`"\1" "2"`, `"\01\7\101\377"`,
 	// bytes that are not valid UTF-8 in string/quoted-name bodies are kept as they are
 	"\"\xec\"", "\"a\xec\xecb\"", "\"pre\\n\xff\"", "'\xecname'", "\"\xe2\x9c\"", "'a\\\xffb'",
 	// numbers as libclassad lexes them: a '-' where an operand is expected signs
