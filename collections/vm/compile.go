@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -109,6 +111,11 @@ type compiler struct {
 	// aliases maps a case-folded join alias to its index, for an expression compiled with
 	// CompileAliases. Nil otherwise, in which case every select is delegated as before.
 	aliases aliasIndex
+
+	// capture is the first delegated subtree found reading a script local, which is a wrong answer
+	// waiting to be computed rather than a performance note. It is reported by Script.Compile and
+	// is always nil outside a script, where there are no locals to capture. See delegate.
+	capture error
 }
 
 // ins appends an instruction and returns its index (for later backpatching).
@@ -226,7 +233,7 @@ func (c *compiler) emit(expr ast.Expr) {
 		// StrictFunction refuses and each of which would be observably wrong as
 		// an eager call (see its comment).
 		if !classad.StrictFunction(v.Name, len(v.Args)) {
-			c.ins(OpEvalNode, c.addNode(expr))
+			c.delegate(expr)
 			return
 		}
 		for _, a := range v.Args {
@@ -239,13 +246,82 @@ func (c *compiler) emit(expr ast.Expr) {
 		if c.emitAliasSelect(v) {
 			return
 		}
-		c.ins(OpEvalNode, c.addNode(expr))
+		c.delegate(expr)
 	default:
 		// ConditionalExpr, ListLiteral, RecordLiteral, SubscriptExpr, or any future
 		// node: delegate to the evaluator. (A FunctionCall reaches the evaluator too,
 		// but only the ones StrictFunction refuses; the case above compiles the rest.)
-		c.ins(OpEvalNode, c.addNode(expr))
+		c.delegate(expr)
 	}
+}
+
+// delegate emits a subtree as a tree-walking evaluation, first checking -- in a script -- that the
+// subtree does not read a local.
+//
+// A LOCAL IS INVISIBLE TO THE TREE-WALKER, AND THAT IS A WRONG ANSWER, NOT A SLOW ONE. A delegated
+// subtree is evaluated with ev.Evaluate against the SCOPE: the ad, and nothing else. A script's
+// locals live in registers the evaluator has never heard of, so a bare name that this compiler would
+// have resolved to a local resolves inside a delegated subtree to the ATTRIBUTE of that name -- or
+// to UNDEFINED, when the ad has no such attribute. Nothing fails; the script simply computes
+// something other than what it says.
+//
+//	x = Cpus + 1
+//	result = x ? 2 : 3      -- the ternary is delegated, so this reads the ATTRIBUTE x
+//
+// The ternary is not an oversight that will be fixed next week: an UNDEFINED condition evaluates
+// BOTH of its branches, which a jump-based lowering can express only by emitting each branch twice,
+// exponentially in nesting depth. See OpBranchCond, which lowers ifThenElse for exactly the reason
+// the ternary cannot be lowered that way. The same goes for a list literal, an ad literal, a
+// subscript, a select and a lazy built-in, each of which needs the record itself.
+//
+// So the compiler refuses rather than silently reading the wrong thing. The refusal is what makes
+// the restriction discoverable: a script that cannot say what it means should say so at compile
+// time, and the ways around it -- an `if` statement instead of a ternary, or `MY.x` where the
+// attribute really was meant -- are both one line away.
+func (c *compiler) delegate(expr ast.Expr) {
+	c.noteCapture(expr)
+	c.ins(OpEvalNode, c.addNode(expr))
+}
+
+// noteCapture records the first bound local a delegated subtree would read, if any. The first one
+// wins: later ones are almost always the same mistake, and a compiler that reports five is a
+// compiler whose first line is ignored.
+func (c *compiler) noteCapture(expr ast.Expr) {
+	if c.locals == nil || c.capture != nil {
+		return
+	}
+	for _, name := range collectReads(expr, map[string]bool{}, nil) {
+		if _, bound := c.locals[foldLocal(name)]; bound {
+			c.capture = &LocalCaptureError{Local: name, Expr: expr.String()}
+			return
+		}
+	}
+}
+
+// LocalCaptureError reports a script expression that reads a local from inside a construct the
+// compiler evaluates against the ad, where the local does not exist. See compiler.delegate.
+type LocalCaptureError struct {
+	Local string // the local the subtree reads, as the script spelled it
+	Expr  string // the delegated subtree, unparsed
+}
+
+func (e *LocalCaptureError) Error() string { return "vm: script: " + e.detail() }
+
+// detail is the sentence without the package prefix, for a caller -- the parser -- that puts a line
+// and column in front of it instead.
+func (e *LocalCaptureError) detail() string {
+	return fmt.Sprintf("%s reads the local %q, but this construct is evaluated against the ad, "+
+		"where a local does not exist; use an if statement instead of a conditional, "+
+		"or MY.%s if the attribute was meant", e.Expr, e.Local, e.Local)
+}
+
+// captureDetail renders a compiler refusal for a diagnostic that supplies its own position.
+func captureDetail(err error) string {
+	var lc *LocalCaptureError
+	if errors.As(err, &lc) {
+		return lc.detail()
+	}
+	return err.Error()
 }
 
 // emitIfThenElse compiles ifThenElse(cond, t, f) to a branch, and reports whether it did.
