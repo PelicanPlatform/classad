@@ -445,11 +445,29 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 		// S_reg the moment S_reg is read; catch-up reads only seq <= S_reg; and the live
 		// phase drops seq <= S_reg. Publishing runs after unlock and sync, so the live
 		// buffer may hold events at or below S_reg -- those are exactly the ones dropped.
+		//
+		// The fan-out baseline is seeded HERE, from the same snapshot, for the same
+		// reason: a parent's live change is emitted only where it differs from what the
+		// watcher last saw, so the baseline has to be the state at S_reg exactly. Seeding
+		// it later -- after catch-up, which is unbounded -- reads a parent that a live
+		// write has already moved, the diff then finds nothing to fan out, and the
+		// children of that write are never delivered.
 		sReg := make([]uint64, len(c.shards))
+		parentSig := map[string]map[string]string{}
+		chained := c.parentKeyFor != nil && c.isStructural != nil
 		for i, sh := range c.shards {
-			sh.mu.RLock()
-			sReg[i] = sh.commitSeq
-			sh.mu.RUnlock()
+			if !chained {
+				sh.mu.RLock()
+				sReg[i] = sh.commitSeq
+				sh.mu.RUnlock()
+				continue
+			}
+			// snapshot returns the commit sequence and the windows together, under one
+			// lock, which is what makes the two agree.
+			s0, wins := sh.snapshot()
+			sReg[i] = s0
+			c.seedParentSigInto(parentSig, s0, wins, redact)
+			releaseWindows(wins)
 		}
 		// Catch-up reads the store through S_reg, so make it durable first: a deferred
 		// append at or below S_reg would otherwise reach this watcher in catch-up before a
@@ -472,10 +490,9 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 		// Live phase: stream buffered + new events, advancing a running cursor vector.
 		vec := append([]uint64(nil), sReg...)
 		if c.watchCoalesce > 0 {
-			c.liveCoalesced(ctx, w, sReg, vec, yield, redact)
+			c.liveCoalesced(ctx, w, sReg, vec, yield, redact, parentSig)
 			return
 		}
-		parentSig := c.seedParentSig(redact) // parent -> non-private signature (fan-out diff baseline)
 		for {
 			if w.lagged.Load() {
 				yield(WatchEvent{Kind: WatchResync})
@@ -607,10 +624,9 @@ func WatchFilter(seq iter.Seq[WatchEvent], match func(*classad.ClassAd) bool) it
 // preserved. The running cursor vector still advances on every event received.
 // liveCoalesced streams coalesced live events; redact is the watcher's entitlement to sealed values (see
 // WatchRedacted), threaded because this decodes ads itself.
-func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []uint64, yield func(WatchEvent) bool, redact bool) {
+func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []uint64, yield func(WatchEvent) bool, redact bool, parentSig map[string]map[string]string) {
 	pending := map[string]rawEvent{}
 	order := make([]string, 0, 16) // first-seen order; keys are unique per window
-	parentSig := c.seedParentSig(redact)
 
 	ticker := time.NewTicker(c.watchCoalesce)
 	defer ticker.Stop()
@@ -785,31 +801,27 @@ func sigEqual(a, b map[string]string) bool {
 	return true
 }
 
-// seedParentSig records the current non-private signature of every structural ad,
-// giving the live fan-out a baseline so a parent's first change is diffed (and a
-// change to only parent-private attributes does not fan out). Empty for a
-// non-chained collection. redact is the watcher's entitlement (see WatchRedacted):
-// the baseline is what that watcher could see of each parent, decoded with no key
+// seedParentSigInto records the non-private signature of every structural ad in ONE shard's
+// snapshot, giving the live fan-out a baseline so a parent's first change is diffed (and a change
+// to only parent-private attributes does not fan out). redact is the watcher's entitlement (see
+// WatchRedacted): the baseline is what that watcher could see of each parent, decoded with no key
 // for a watcher without it.
-func (c *Collection) seedParentSig(redact bool) map[string]map[string]string {
-	sig := map[string]map[string]string{}
-	if c.parentKeyFor == nil || c.isStructural == nil {
-		return sig
-	}
+//
+// It takes the snapshot rather than the shard BECAUSE OF WHEN it has to be read. The baseline is
+// only meaningful against a point in the commit sequence -- it answers "what had this watcher
+// seen of this parent at S_reg" -- so it must come from the snapshot that defined S_reg, not from
+// whatever the shard holds when the live phase happens to begin. Taking its own snapshot is what
+// let a live write slip in between the two and silently cost that write its fan-out.
+func (c *Collection) seedParentSigInto(sig map[string]map[string]string, s0 uint64, wins []segWindow, redact bool) {
 	keyless := redact && c.SealsValues()
-	for _, sh := range c.shards {
-		s0, wins := sh.snapshot()
-		c.forEachVisibleKeyed(s0, wins, sealedOpened, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
-			if c.isStructural(key) {
-				if pad, err := c.decodeAdDictAs(dict, ad, codec, redact); err == nil {
-					sig[string(key)] = c.nonPrivateSig(pad, keyless)
-				}
+	c.forEachVisibleKeyed(s0, wins, sealedOpened, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+		if c.isStructural(key) {
+			if pad, err := c.decodeAdDictAs(dict, ad, codec, redact); err == nil {
+				sig[string(key)] = c.nonPrivateSig(pad, keyless)
 			}
-			return true
-		})
-		releaseWindows(wins)
-	}
-	return sig
+		}
+		return true
+	})
 }
 
 // fanoutChildren handles a structural (parent) change during a live watch. If a
