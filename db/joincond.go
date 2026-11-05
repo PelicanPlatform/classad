@@ -44,7 +44,14 @@ type aliasedCond struct {
 	// does not fail, it silently evaluates the wrong thing -- rows vanish and a LEFT row
 	// comes back carrying a member nothing matched.
 	qs   []*vm.Query
-	pool sync.Pool // holds []*vm.Matcher, one per term, for one goroutine
+	pool sync.Pool // holds *matcherSet, one set per goroutine
+}
+
+// matcherSet is one goroutine's matchers, one per term. The pool holds the POINTER: a slice
+// put into a sync.Pool is boxed into an interface, which allocates on every Put and gives
+// back exactly the garbage the pool is there to avoid.
+type matcherSet struct {
+	ms []*vm.Matcher
 }
 
 // compileAliasedCond compiles the ON terms with every alias known. It returns nil when any
@@ -73,14 +80,17 @@ func compileAliasedCond(srcs, aliases []string) *aliasedCond {
 		qs = append(qs, q)
 	}
 	a := &aliasedCond{qs: qs}
-	a.pool.New = func() any {
-		ms := make([]*vm.Matcher, len(a.qs))
-		for i, q := range a.qs {
-			ms[i] = q.Matcher()
-		}
-		return ms
-	}
+	a.pool.New = func() any { return a.newMatchers() }
 	return a
+}
+
+// newMatchers builds one goroutine's set of matchers, one per term.
+func (a *aliasedCond) newMatchers() *matcherSet {
+	ms := make([]*vm.Matcher, len(a.qs))
+	for i, q := range a.qs {
+		ms[i] = q.Matcher()
+	}
+	return &matcherSet{ms: ms}
 }
 
 // sideResolver answers (side index, attribute name) out of the row's sides.
@@ -118,9 +128,15 @@ func unqualifiedUndefined(string, ast.AttributeScope) classad.Value {
 // silently return too few rows.
 func (a *aliasedCond) holds(rows []*joinRow) (held, ok bool) {
 	resolve := sideResolver(rows)
-	ms := a.pool.Get().([]*vm.Matcher)
-	defer a.pool.Put(ms)
-	for _, m := range ms {
+	set, pooled := a.pool.Get().(*matcherSet)
+	if !pooled {
+		// Unreachable: the pool's New returns this type. Checked rather than asserted
+		// because an assertion here would panic mid-join on a mistake that building a
+		// fresh set answers for free.
+		set = a.newMatchers()
+	}
+	defer a.pool.Put(set)
+	for _, m := range set.ms {
 		v, accepted := m.EvalAliased(resolve, unqualifiedUndefined)
 		if !accepted {
 			// Unreachable by construction: compileAliasedCond admits only AliasNative
@@ -165,7 +181,10 @@ func compileAliasedValue(src string, aliases []string) *aliasedValue {
 // caller must then evaluate against a composite -- a declined term reads undefined, which
 // would silently put every row in the no-key bucket and match nothing.
 func (a *aliasedValue) eval(rows []*joinRow) (classad.Value, bool) {
-	m := a.pool.Get().(*vm.Matcher)
+	m, ok := a.pool.Get().(*vm.Matcher)
+	if !ok {
+		m = a.q.Matcher() // unreachable; see aliasedCond.holds
+	}
 	defer a.pool.Put(m)
 	return m.EvalAliased(sideResolver(rows), unqualifiedUndefined)
 }

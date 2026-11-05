@@ -316,19 +316,20 @@ type joinWalk struct {
 	// buf is the row form's output buffer, reused across rows. A yielded row aliases it, so
 	// a caller that keeps one must copy -- the same contract the store's raw scans have.
 	buf []byte
-	// stats are this walker's own counters, merged into the caller's at the end, because
-	// JoinStats carries no synchronization.
-	stats JoinStats
-	// Scratch for spliceComposite, which runs once per OUTPUT row. bodies and entBufs are
-	// reused across rows; member0 holds the FROM side's narrowed bytes for as long as the
-	// walk stays on one scan row (see scanRow).
 	// maxPairs is this walker's SHARE of the pair budget, and noRowLimit says the drainer
 	// enforces the row limit instead of this walker. Both exist because a parallel walk has
 	// P of these: a guard checked per walker against the whole budget would let the join do
 	// P times the work it is allowed, and a row limit checked per walker would report "too
 	// many rows" for a total the join never produced.
-	maxPairs      int
-	noRowLimit    bool
+	//
+	// A walker's COUNTERS are not here: runJoinParallel owns one JoinStats per walker and
+	// merges them (see walkerStats), so the serial walk and the parallel one report through
+	// the same path rather than two.
+	maxPairs   int
+	noRowLimit bool
+	// Scratch for spliceComposite, which runs once per OUTPUT row. bodies and entBufs are
+	// reused across rows; member0 holds the FROM side's narrowed bytes for as long as the
+	// walk stays on one scan row (see scanRow).
 	bodies        []memberBody
 	entBufs       [][]byte
 	member0       memberBody
