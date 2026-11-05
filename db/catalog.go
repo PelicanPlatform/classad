@@ -53,6 +53,9 @@ type Catalog struct {
 	memExporterState map[string][]byte
 	// queryPar is the catalog-wide Options.QueryParallelism applied to each table.
 	queryPar int
+	// joinSem bounds pair-loop walkers across concurrent joins on this catalog. See
+	// newJoinSem for why the join's walkers and its reads are budgeted separately.
+	joinSem chan struct{}
 }
 
 // tablesSubdir / archivesSubdir are where a persistent catalog keeps its per-table
@@ -192,6 +195,7 @@ func openConcurrently[T any](names []string, kind string, onStep func(kind, name
 func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	cat := &Catalog{
 		dir: cfg.Dir, tables: map[string]*DB{}, archives: map[string]*ArchiveTable{},
+		joinSem:          newJoinSem(),
 		views:            map[string]*View{},
 		exporters:        map[string]ExporterDef{},
 		memExporterState: map[string][]byte{},

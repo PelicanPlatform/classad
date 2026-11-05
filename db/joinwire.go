@@ -51,14 +51,14 @@ import (
 //
 // ok=false is never an error: it means one of the sides cannot be spliced -- it arrived
 // decoded, or the caller wants its whole ad -- and the caller forms the row the ordinary way.
-func (p *joinPlan) spliceComposite(dst []byte, rows []*joinRow) ([]byte, bool) {
+func (w *joinWalk) spliceComposite(p *joinPlan, dst []byte, rows []*joinRow) ([]byte, bool) {
 	// Narrow every side first: one side that cannot be spliced takes the whole row down the
 	// fallback, and finding that out after writing a header would mean unwinding it.
-	if cap(p.bodies) < len(rows) {
-		p.bodies = make([]memberBody, len(rows))
-		p.entBufs = make([][]byte, len(rows))
+	if cap(w.bodies) < len(rows) {
+		w.bodies = make([]memberBody, len(rows))
+		w.entBufs = make([][]byte, len(rows))
 	}
-	bodies := p.bodies[:len(rows)]
+	bodies := w.bodies[:len(rows)]
 	n := 0
 	for i, r := range rows {
 		// SIDE 0 IS NARROWED ONCE PER SCAN ROW, NOT ONCE PER OUTPUT ROW. It is the FROM
@@ -67,20 +67,20 @@ func (p *joinPlan) spliceComposite(dst []byte, rows []*joinRow) ([]byte, bool) {
 		// the same LookupByName calls k times. scanRow says when it stops being the same
 		// row; nothing here infers that from a pointer, because the scan is free to hand
 		// back one reused joinRow or one reused byte arena and both would compare equal.
-		if i == 0 && p.member0Cached {
-			if !p.member0OK {
+		if i == 0 && w.member0Cached {
+			if !w.member0OK {
 				return dst, false
 			}
-			bodies[0] = p.member0
-			if p.member0.ok {
+			bodies[0] = w.member0
+			if w.member0.ok {
 				n++
 			}
 			continue
 		}
-		b, ok := r.memberBodyInto(p.entBufs[i], p.projects[i])
-		p.entBufs[i] = b.entries // keep the grown buffer, whatever came of it
+		b, ok := r.memberBodyInto(w.entBufs[i], p.projects[i])
+		w.entBufs[i] = b.entries // keep the grown buffer, whatever came of it
 		if i == 0 {
-			p.member0, p.member0OK, p.member0Cached = b, ok, true
+			w.member0, w.member0OK, w.member0Cached = b, ok, true
 		}
 		if !ok {
 			return dst, false
@@ -260,15 +260,26 @@ func (cat *Catalog) JoinWire(spec JoinSpec, want JoinLimits, redact bool, stats 
 		}
 	}
 	limits := DefaultJoinLimits().clamp(want)
-	var buf []byte
-	return joinStream(cat, spec, limits, stats, func(p *joinPlan, rows []*joinRow) ([]byte, bool) {
-		if b, ok := p.spliceComposite(buf[:0], rows); ok {
-			buf = b
+	return joinStream(cat, spec, limits, stats, func(wk *joinWalk, p *joinPlan, rows []*joinRow) ([]byte, bool) {
+		// The buffer lives on the WALK, not in this closure: a parallel walk has one of
+		// these per goroutine, and a closure variable would be shared by all of them.
+		if b, ok := wk.spliceComposite(p, wk.buf[:0], rows); ok {
+			wk.buf = b
 			return b, true
 		}
 		// A side this cannot splice: build the row and encode it, which is the same ad by a
 		// longer road.
-		buf = encodeCompositeInline(buf[:0], p.composite(rows))
-		return buf, true
+		wk.buf = encodeCompositeInline(wk.buf[:0], p.composite(rows))
+		return wk.buf, true
+	}, func(b []byte) []byte {
+		// Only reached if the arena below is ever nil: a yielded row aliases the walker's
+		// buffer, which it overwrites on the next row, so a parallel walk cannot hand the
+		// drainer that buffer. The serial walk never calls this.
+		return append([]byte(nil), b...)
+	}, &rowArena[[]byte]{
+		// A wire row IS bytes, so a batch can carry its rows in one buffer and the drainer
+		// can slice them back out -- no allocation per emitted row.
+		appendTo: func(dst []byte, row []byte) []byte { return append(dst, row...) },
+		wrap:     func(b []byte) []byte { return b },
 	})
 }

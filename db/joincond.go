@@ -1,6 +1,8 @@
 package db
 
 import (
+	"sync"
+
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -35,7 +37,14 @@ var forceCompositeCond bool
 // aliasedCond is a join condition compiled for evaluation against the sides separately.
 // It is nil when any term declined, in which case the composite path runs unchanged.
 type aliasedCond struct {
-	ms []*vm.Matcher
+	// qs are the compiled terms. A vm.Query (its Program) may be evaluated concurrently;
+	// a vm.Matcher may NOT -- it carries the evaluation stack, and the package says to use
+	// one per goroutine. So the matchers are POOLED rather than cached here: a parallel
+	// walk has several goroutines in holds at once, and sharing one matcher between them
+	// does not fail, it silently evaluates the wrong thing -- rows vanish and a LEFT row
+	// comes back carrying a member nothing matched.
+	qs   []*vm.Query
+	pool sync.Pool // holds []*vm.Matcher, one per term, for one goroutine
 }
 
 // compileAliasedCond compiles the ON terms with every alias known. It returns nil when any
@@ -49,7 +58,7 @@ func compileAliasedCond(srcs, aliases []string) *aliasedCond {
 	if len(srcs) == 0 || forceCompositeCond {
 		return nil
 	}
-	ms := make([]*vm.Matcher, 0, len(srcs))
+	qs := make([]*vm.Query, 0, len(srcs))
 	for _, src := range srcs {
 		q, err := vm.ParseAliases(src, aliases)
 		if err != nil {
@@ -61,9 +70,17 @@ func compileAliasedCond(srcs, aliases []string) *aliasedCond {
 		if !q.AliasNative() {
 			return nil
 		}
-		ms = append(ms, q.Matcher())
+		qs = append(qs, q)
 	}
-	return &aliasedCond{ms: ms}
+	a := &aliasedCond{qs: qs}
+	a.pool.New = func() any {
+		ms := make([]*vm.Matcher, len(a.qs))
+		for i, q := range a.qs {
+			ms[i] = q.Matcher()
+		}
+		return ms
+	}
+	return a
 }
 
 // sideResolver answers (side index, attribute name) out of the row's sides.
@@ -101,7 +118,9 @@ func unqualifiedUndefined(string, ast.AttributeScope) classad.Value {
 // silently return too few rows.
 func (a *aliasedCond) holds(rows []*joinRow) (held, ok bool) {
 	resolve := sideResolver(rows)
-	for _, m := range a.ms {
+	ms := a.pool.Get().([]*vm.Matcher)
+	defer a.pool.Put(ms)
+	for _, m := range ms {
 		v, accepted := m.EvalAliased(resolve, unqualifiedUndefined)
 		if !accepted {
 			// Unreachable by construction: compileAliasedCond admits only AliasNative
@@ -122,7 +141,9 @@ func (a *aliasedCond) holds(rows []*joinRow) (held, ok bool) {
 // value twin of aliasedCond: the same compilation, asked for a value rather than a verdict,
 // because an equality half produces the hash key rather than a verdict.
 type aliasedValue struct {
-	m *vm.Matcher
+	// Pooled for the same reason as aliasedCond: the Query is shareable, the Matcher is not.
+	q    *vm.Query
+	pool sync.Pool // holds *vm.Matcher
 }
 
 // compileAliasedValue compiles one equality half over the accumulated row, or returns nil
@@ -135,12 +156,16 @@ func compileAliasedValue(src string, aliases []string) *aliasedValue {
 	if err != nil || !q.AliasNative() {
 		return nil
 	}
-	return &aliasedValue{m: q.Matcher()}
+	v := &aliasedValue{q: q}
+	v.pool.New = func() any { return v.q.Matcher() }
+	return v
 }
 
 // eval returns the half's value for this row. ok is false when the term declined, and the
 // caller must then evaluate against a composite -- a declined term reads undefined, which
 // would silently put every row in the no-key bucket and match nothing.
 func (a *aliasedValue) eval(rows []*joinRow) (classad.Value, bool) {
-	return a.m.EvalAliased(sideResolver(rows), unqualifiedUndefined)
+	m := a.pool.Get().(*vm.Matcher)
+	defer a.pool.Put(m)
+	return m.EvalAliased(sideResolver(rows), unqualifiedUndefined)
 }

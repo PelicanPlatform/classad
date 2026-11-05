@@ -127,13 +127,14 @@ func TestAliasedCondHoldsDeclines(t *testing.T) {
 	if q.AliasNative() {
 		t.Fatal("fixture term is AliasNative; it cannot exercise the decline")
 	}
-	a := &aliasedCond{ms: []*vm.Matcher{q.Matcher()}}
+	a := &aliasedCond{qs: []*vm.Query{q}}
+	a.pool.New = func() any { return []*vm.Matcher{q.Matcher()} }
 
 	ad, err := classad.Parse(`[ Owner = "alice" ]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := &joinRow{ad: ad}
+	row := decodedRow(ad)
 	if _, ok := a.holds([]*joinRow{row, row}); ok {
 		t.Fatal("holds accepted a term EvalAliased declined; the caller would keep an undefined answer")
 	}
