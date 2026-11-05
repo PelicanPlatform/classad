@@ -781,6 +781,16 @@ ad, _ := classad.Parse(`[
 ad, _ := classad.Parse(`[now = time()]`)
 ```
 
+### User-Defined Functions
+
+`classad.RegisterFunction` adds a function of your own, which the parser, the
+evaluator and the compiler then treat exactly as they treat the built-ins above.
+A function may also be supplied as a sandboxed WebAssembly module, and the
+database layer takes user-defined *aggregates* on the same terms.
+
+See [user-defined-functions.md](user-defined-functions.md) for all four, the
+rules they share, and worked examples.
+
 ## Attribute Selection Expressions
 
 Access nested ClassAd attributes using dot notation (`record.field`):

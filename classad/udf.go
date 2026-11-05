@@ -9,6 +9,10 @@ import (
 
 // USER-DEFINED FUNCTIONS.
 //
+// docs/user-defined-functions.md at the repository root is the prose version of this, for someone
+// writing one rather than maintaining the registry: the rules shared by all four ways to extend
+// this engine, and a worked example of each. What follows is why the registry is built this way.
+//
 // A UDF is registered by name and then behaves exactly as a built-in does: the compiler sees it
 // through StrictFunction and compiles a call to it natively, the executors reach it through
 // ApplyFunction, and a query using one stays eligible for every columnar accelerator. Nothing about

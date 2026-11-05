@@ -10,6 +10,12 @@ reverse-engineer the example fixtures to know what is required of you. The
 fixtures in `wasmudf/testdata/*.wat` are the worked examples; this is the
 explanation.
 
+If you are integrating a module rather than writing one — registering it,
+choosing its sandbox, deciding whether to trust it — start at
+[docs/user-defined-functions.md](user-defined-functions.md), which covers all
+four ways to extend this engine and treats wasm as one of them. This page is the
+guest's half of the contract.
+
 There are **two** calling conventions. The scalar one is called once per record
 and every module must implement it. The vector one is called once per batch of
 records, is optional, and is where the performance is. The relationship between
@@ -716,6 +722,8 @@ rule testable rather than merely stated:
 
 | fixture | what it demonstrates |
 |---|---|
+| `examplepct.wat` | a complete scalar module, start to finish; the documentation's example |
+| `examplemean.wat` | a complete aggregate module, likewise |
 | `tagecho.wat` | the scalar ABI across every tag |
 | `identity.wat` | the cheapest possible guest; the round-trip of every value state |
 | `concat.wat` | building a string result in memory you own |
