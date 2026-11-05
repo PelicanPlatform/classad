@@ -153,8 +153,40 @@ var forceDecodedRows bool
 // what is kept.
 func wireRows(rows iter.Seq[[]byte]) iter.Seq[*joinRow] {
 	return func(yield func(*joinRow) bool) {
+		// SLABBED, because the copy is needed and the allocation is not.
+		//
+		// The yielded row aliases a buffer the scan reuses, so a joinRow that outlives the
+		// step -- every row of a hashed side does, they sit in its buckets for the whole
+		// join -- has to own its bytes. That was `append([]byte(nil), row...)` plus a
+		// `&joinRow{}`: two allocations for every row of every side the join reads, which
+		// the allocation profile put at 81% of the join's objects.
+		//
+		// Both come out of slabs instead. Each row still gets bytes that are its own and
+		// never written again -- the arena is only ever appended to, and the three-index
+		// slice stops a later row's append from reaching into an earlier row's bytes -- so
+		// what a joinRow may assume about its bytes is unchanged. The arena is never grown
+		// by append: a row that does not fit starts a new one, because growing it would
+		// move the bytes every row handed out so far is still pointing at.
+		const slabRows = 512
+		const arenaBytes = 64 << 10
+		var structs []joinRow
+		var arena []byte
 		for row := range rows {
-			r := &joinRow{w: wire.Ad(append([]byte(nil), row...))}
+			if len(structs) == 0 {
+				structs = make([]joinRow, slabRows)
+			}
+			if cap(arena)-len(arena) < len(row) {
+				n := arenaBytes
+				if len(row) > n {
+					n = len(row) // one oversized row gets an arena of its own
+				}
+				arena = make([]byte, 0, n)
+			}
+			start := len(arena)
+			arena = append(arena, row...)
+			r := &structs[0]
+			structs = structs[1:]
+			*r = joinRow{w: wire.Ad(arena[start:len(arena):len(arena)])}
 			if forceDecodedRows {
 				r = &joinRow{ad: r.record()}
 			}
