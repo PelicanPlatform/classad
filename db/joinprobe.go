@@ -15,7 +15,9 @@ package db
 //
 //   - whether an index covers the attribute at all. Without one the constraint is a filter
 //     over a scan that still reads every row, so it costs more than it saves.
-//   - how many rows the hashed side holds, which bounds what the narrowing avoids.
+//   - how many records reading the hashed side VISITS, which bounds what the narrowing
+//     avoids. That is the table's size only when the side is read whole; a side carrying a
+//     constraint of its own reads less, and how much less is what joincost.go works out.
 //   - how many distinct keys the other side has, which bounds what it costs.
 //
 // A client holds none of these. It can ask for a row count, which is a round trip and
@@ -127,7 +129,9 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	var cands []*probeCandidate
 	for i, sp := range p.steps {
 		attr, rows, segments, why := cat.probeGate(sp, sides[sp.side])
-		stats.ProbeSteps[i] = JoinProbeStat{Alias: p.aliases[sp.side], Why: why}
+		// EstRecords is recorded even when the gate declines, because the decline that
+		// reads on the size is the one a reader most needs the size for.
+		stats.ProbeSteps[i] = JoinProbeStat{Alias: p.aliases[sp.side], Why: why, EstRecords: rows}
 		if why != "" {
 			continue
 		}
@@ -200,7 +204,8 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 			continue
 		case lookups*probeLookupCost > c.rows:
 			st.Why = fmt.Sprintf("%d keys across %d segments is %d index lookups against a "+
-				"%d-row scan, which costs more than it saves", len(c.lits), c.segments, lookups, c.rows)
+				"read of %d records, which costs more than it saves", len(c.lits), c.segments,
+				lookups, c.rows)
 			continue
 		}
 		sort.Strings(c.lits) // so the same join builds the same constraint
@@ -233,11 +238,6 @@ func (cat *Catalog) probeGate(sp *joinStepPlan, side JoinSide) (attr string, row
 	if !ok {
 		return "", 0, 0, "the equality's table half is computed, so there is no attribute to name"
 	}
-	if strings.TrimSpace(side.Constraint) != "" {
-		// Its own constraint already narrows it, so the table's row count overstates what
-		// the scan reads and the trade cannot be priced from it.
-		return "", 0, 0, "the hashed side carries its own constraint, which the row count does not describe"
-	}
 	rows, segments, indexed, configured, ok := cat.joinSideStats(side.Table, attr)
 	if !ok {
 		return "", 0, 0, "the hashed side's size could not be learned"
@@ -255,9 +255,19 @@ func (cat *Catalog) probeGate(sp *joinStepPlan, side JoinSide) (attr string, row
 		return "", 0, 0, fmt.Sprintf("no index covers %s.%s, so a membership constraint would "+
 			"filter a full scan rather than replace it", side.Alias, attr)
 	}
+	// A side with a constraint of its own does not read the whole table, so the table's size
+	// is not what a membership constraint would save. Price the read it actually does; the
+	// alternative, and what this did until the store could be asked, is to decline every
+	// constrained side -- which is most of them, since a history join narrows by owner or
+	// date far more often than not.
+	rows, why = cat.sideRows(side, rows, segments)
+	if why != "" {
+		return "", 0, 0, why
+	}
 	if rows < minProbeRows {
-		return "", 0, 0, fmt.Sprintf("the hashed side holds %d rows, below the %d where "+
-			"narrowing is worth deciding", rows, minProbeRows)
+		// rows is returned with the decline: it is the whole reason for it.
+		return "", rows, segments, fmt.Sprintf("the hashed side's read visits %d records, "+
+			"below the %d where narrowing is worth deciding", rows, minProbeRows)
 	}
 	return attr, rows, segments, ""
 }

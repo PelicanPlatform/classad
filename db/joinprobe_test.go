@@ -289,18 +289,41 @@ func TestJoinIndexProbeDeclinesOnACrossJoin(t *testing.T) {
 	}
 }
 
-// A hashed side with its own constraint is not narrowed: its row count describes the table
-// rather than the scan, so the trade cannot be priced from it.
-func TestJoinIndexProbeDeclinesWhenTheHashedSideIsAlreadyFiltered(t *testing.T) {
+// A hashed side whose own constraint no index covers still reads every record, so the whole
+// table is what narrowing would save and the probe is priced against it -- and fires.
+//
+// This is the case the decision used to decline outright, on the grounds that a constrained
+// side's row count describes the table rather than the scan. Here they are the same number,
+// and the join gets its index probe back.
+func TestJoinIndexProbePricesAnUnindexedConstraintAtTheWholeTable(t *testing.T) {
 	cat := probeFixture(t, 4096, 16, true)
 	spec := probeSpec(JoinInner)
-	spec.Right.Constraint = "ExitCode == 0"
+	spec.Right.Constraint = "ExitCode == 0" // no index covers ExitCode: the read scans
+	_, st := drainProbe(t, cat, spec)
+	if st.ProbeKeys == 0 {
+		t.Fatalf("the probe declined a side whose constraint narrows no read: %s", st.ProbeWhy)
+	}
+	if got, want := st.ProbeSteps[0].EstRecords, 4096; got != want {
+		t.Errorf("priced the scan at %d records, want the whole table (%d)", got, want)
+	}
+}
+
+// A hashed side whose own constraint an index DOES cover reads only part of the table, and
+// the decision has to price the part rather than the whole: narrowing a read that is already
+// small is what the key cap and the row floor exist to refuse.
+func TestJoinIndexProbePricesAnIndexedConstraintAtWhatItReads(t *testing.T) {
+	cat := probeFixture(t, 4096, 16, true)
+	spec := probeSpec(JoinInner)
+	spec.Right.Constraint = "ClusterId > 4000" // value-indexed: the read visits ~96 records
 	_, st := drainProbe(t, cat, spec)
 	if st.ProbeKeys != 0 {
-		t.Fatalf("the probe fired against an already-constrained side")
+		t.Fatalf("the probe narrowed a read of %d records", st.ProbeSteps[0].EstRecords)
 	}
-	if !strings.Contains(st.ProbeWhy, "its own constraint") {
-		t.Errorf("ProbeWhy = %q", st.ProbeWhy)
+	if got := st.ProbeSteps[0].EstRecords; got == 0 || got > 512 {
+		t.Errorf("priced the read at %d records, want the small part the index returns", got)
+	}
+	if !strings.Contains(st.ProbeWhy, "worth deciding") {
+		t.Errorf("ProbeWhy = %q, which does not say the read was already small", st.ProbeWhy)
 	}
 }
 

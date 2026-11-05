@@ -230,6 +230,14 @@ type JoinProbeStat struct {
 	Attr string
 	// Keys is how many distinct key values the scan was narrowed to, 0 when it was not.
 	Keys int
+	// EstRecords is the size the decision priced this side's scan at: the records its read
+	// was estimated to visit, which is the table's whole size unless the side carries a
+	// constraint of its own. 0 when the gates declined before a size was needed.
+	//
+	// It is reported because the decision cannot be checked without it. "Narrowing did not
+	// pay" and "narrowing was priced against the wrong table size" read identically in a
+	// plan that states only the outcome.
+	EstRecords int
 	// Why says why the scan was not narrowed, empty when it was.
 	Why string
 }
@@ -463,7 +471,12 @@ func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, stats *Jo
 	for i, sp := range p.steps {
 		side := sides[sp.side]
 		if cons, ok := probes.cons[i]; ok {
-			side.Constraint = cons
+			// ANDed, never assigned. The membership constraint says which key values the
+			// step can match; the side's own constraint says which of its rows the query
+			// asked for. Replacing one with the other silently widens the side to rows the
+			// caller excluded, and the join answers with more rows than it was asked for --
+			// a wrong answer that looks like a working index probe in every statistic.
+			side.Constraint = andConstraints(side.Constraint, cons)
 		}
 		seq, serr := cat.joinSource(side, readProj[sp.side])
 		if serr != nil {
