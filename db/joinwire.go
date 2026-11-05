@@ -260,7 +260,7 @@ func (cat *Catalog) JoinWire(spec JoinSpec, want JoinLimits, redact bool, stats 
 		}
 	}
 	limits := DefaultJoinLimits().clamp(want)
-	return joinStream(cat, spec, limits, stats, func(wk *joinWalk, p *joinPlan, rows []*joinRow) ([]byte, bool) {
+	return joinStream(cat, spec, limits, false, stats, func(wk *joinWalk, p *joinPlan, rows []*joinRow) ([]byte, bool) {
 		// The buffer lives on the WALK, not in this closure: a parallel walk has one of
 		// these per goroutine, and a closure variable would be shared by all of them.
 		if b, ok := wk.spliceComposite(p, wk.buf[:0], rows); ok {

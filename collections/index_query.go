@@ -644,7 +644,20 @@ type QueryExplain struct {
 	// many segments answer from an index, IndexSkippedSegments how many the index proves hold
 	// no candidate, and UnindexedSegments how many no index covers (an unsealed segment, or
 	// one sealed before the attribute was indexed), which are walked in full.
-	EstCandidates        int64 `json:"estCandidates,omitempty"`
+	EstCandidates int64 `json:"estCandidates,omitempty"`
+	// EstVisited is the estimated records a read of this plan VISITS: what the access path
+	// hands the scan from the segments it answers, plus the whole of every segment it hands
+	// over unfiltered. It is the number to COST a read with, and the one EstCandidates is
+	// mistaken for.
+	//
+	// They differ in three ways, each of which makes EstCandidates too small: it is zero for
+	// a plan that scans, it excludes the segments no index covers, and it excludes what a
+	// segment's index does not yet cover. Pricing a read by EstCandidates therefore prices a
+	// full scan -- the most expensive read there is -- at nothing.
+	//
+	// It is an estimate of records TOUCHED, not records matched: the predicate is re-verified
+	// on each, so it bounds the rows that come back rather than predicting them.
+	EstVisited           int64 `json:"estVisited,omitempty"`
 	IndexSegments        int   `json:"indexSegments,omitempty"`
 	IndexSkippedSegments int   `json:"indexSkippedSegments,omitempty"`
 	UnindexedSegments    int   `json:"unindexedSegments,omitempty"`
@@ -687,6 +700,7 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 	var dnfReason string
 	if plan := q.ProbePlan(); len(plan) > 1 {
 		if c.explainGroups(q, plan, &ex) {
+			ex.EstVisited = estVisited(ex, 0) // an indexed or empty plan needs no segment total
 			return ex
 		}
 		dnfReason = ex.Reason
@@ -729,11 +743,15 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		ex.Plan = scan
 		ex.Reason = "full scan: no conjunct of the filter is on an indexed attribute"
 	}
+	segTotal := 0
 	if ex.Plan == scan {
-		if ex.ZonePrunedSegments = c.explainZonePruned(q); ex.ZonePrunedSegments > 0 {
-			ex.Reason += fmt.Sprintf("; %d segments ruled out by their zone maps", ex.ZonePrunedSegments)
+		var pruned int
+		if pruned, segTotal = c.explainZonePruned(q); pruned > 0 {
+			ex.ZonePrunedSegments = pruned
+			ex.Reason += fmt.Sprintf("; %d segments ruled out by their zone maps", pruned)
 		}
 	}
+	ex.EstVisited = estVisited(ex, segTotal)
 	if q.Folded() != nil {
 		ex.CurrentTimeFolded = true
 		ex.CurrentTimeUnprovenSegments = c.ctUnprovenSegments()
@@ -807,7 +825,7 @@ func (c *Collection) explainGroups(q *vm.Query, plan []vm.ProbeGroup, ex *QueryE
 	if unsatisfiableGroups(groups) {
 		ex.Plan = "empty"
 		ex.Reason = "the indexed conjuncts of every disjunct of the filter contradict each other: nothing can match"
-		return true
+		return true // EstVisited stays 0: no shard is opened
 	}
 	ex.Plan = "indexed-union"
 	c.explainIndexSegmentsGroups(q, plan, groups, ex)
@@ -924,22 +942,25 @@ func (c *Collection) explainIndexSegments(q *vm.Query, usable []usableProbe, ex 
 }
 
 // explainZonePruned counts the segments a scan of q skips on their zone maps (zoneWalk).
-func (c *Collection) explainZonePruned(q *vm.Query) int {
+// total is every segment the walk saw, which a scan's own counts do not otherwise give:
+// it classifies only the segments it ruled out.
+func (c *Collection) explainZonePruned(q *vm.Query) (pruned, total int) {
 	probes := q.Probes()
 	if len(probes) == 0 || !c.hasZones.Load() {
-		return 0
+		return 0, 0
 	}
-	ct, n := q.ReadsCurrentTime(), 0
+	ct := q.ReadsCurrentTime()
 	for _, sh := range c.shards {
 		_, wins := sh.snapshot()
 		for _, w := range wins {
+			total++
 			if c.zoneExcludes(w, probes, ct) {
-				n++
+				pruned++
 			}
 		}
 		releaseWindows(wins)
 	}
-	return n
+	return pruned, total
 }
 
 // probeIndexKind reports whether a probe's attribute is indexed and, if so, its

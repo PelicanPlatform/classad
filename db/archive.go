@@ -77,7 +77,17 @@ type ArchiveConfig struct {
 	// whole-segment query pruning (value-indexed attributes are included automatically).
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
-	ZoneAttrs                    []string
+
+	// Unordered drops this archive's newest-first read order (collections.ArchiveOptions.
+	// Unordered). An archive that is a history file must leave it alone: condor_history's
+	// order is this table's whole contract. An archive whose rows are only aggregated or
+	// joined has no such contract, and saying so lets the join planner choose which side to
+	// hash on cost rather than on which one the query named first.
+	//
+	// Persisted with the rest of the config, because a reader that reordered its work on
+	// Monday and preserved an order on Tuesday would be the worst of both.
+	Unordered bool `json:",omitempty"`
+	ZoneAttrs []string
 	// AutoAttrs names the subset of the above created by the auto-tuner rather than by a
 	// human. Provenance has to be persisted with the index set, or an auto index returns
 	// from a restart indistinguishable from one someone asked for -- exempt from trimming
@@ -276,6 +286,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*Arc
 		RowGroupBytes:       cfg.RowGroupBytes,
 		Codec:               codec,
 		HotAttrs:            cfg.HotAttrs,
+		Unordered:           cfg.Unordered,
 		GroupSchemaCount:    cfg.GroupSchemaCount,
 		GroupStabilityRuns:  cfg.GroupStabilityRuns,
 		GroupMergeJaccard:   cfg.GroupMergeJaccard,
@@ -1489,6 +1500,13 @@ func (t *ArchiveTable) StaleIndexSegmentsByPolicy() int { return t.a.StaleIndexS
 
 // Retention returns the archive's current retention bounds.
 func (t *ArchiveTable) Retention() collections.Retention { return t.a.Retention() }
+
+// Unordered reports that this archive gives up newest-first reads (ArchiveConfig.Unordered),
+// so a reader may produce its rows in whatever order is cheapest.
+func (t *ArchiveTable) Unordered() (u bool) {
+	t.cfg.with(func(cfg *ArchiveConfig) { u = cfg.Unordered })
+	return u
+}
 
 // SetRetention updates the retention bounds and persists them (archiveconfig.json), so they
 // take effect on the next Rotate and survive a restart.
