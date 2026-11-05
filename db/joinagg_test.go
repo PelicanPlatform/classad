@@ -67,7 +67,7 @@ func TestJoinAggregateAgreesWithGroupingTheRowsByHand(t *testing.T) {
 			}
 			// By hand, from the rows.
 			var st JoinStats
-			seq, err := cat.joinWith(spec.Join, DefaultJoinAggLimits(), &st)
+			seq, err := cat.joinWith(spec.Join, DefaultJoinAggLimits(), true, &st)
 			if err != nil {
 				t.Fatal(err)
 			}

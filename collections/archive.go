@@ -92,6 +92,18 @@ type ArchiveOptions struct {
 	Codec Codec
 	// HotAttrs front-loads these attributes in each ad's hot header (see Collection).
 	HotAttrs []string
+	// Unordered drops the archive's newest-first read order.
+	//
+	// An archive reads newest-first by default because that is condor_history's order and
+	// callers depend on it. An archive that is not a history file -- one whose rows are only
+	// ever aggregated, joined or filtered -- has no use for that promise and pays for it: a
+	// reader that must preserve an order cannot choose freely among plans that produce the
+	// same rows in a different one. Setting this says there is no order to preserve, and in
+	// exchange a reader may reorder its work.
+	//
+	// It is a property of the archive, not of a query, because a per-query flag would let one
+	// caller's "I do not care" reorder another caller's results.
+	Unordered bool
 	// CategoricalAttrs / ValueAttrs configure the per-segment indexes (see Collection).
 	CategoricalAttrs []string
 	ValueAttrs       []string
@@ -172,8 +184,8 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		segSize = defaultArchiveSegmentSize
 	}
 	return Options{
-		AppendOnly:          true, // pure append log: no supersession, no compaction, no key dir
-		ReverseScan:         true, // newest-first Query, matching condor_history order
+		AppendOnly:          true,            // pure append log: no supersession, no compaction, no key dir
+		ReverseScan:         !opts.Unordered, // newest-first Query, matching condor_history order
 		Dir:                 opts.Dir,
 		SegmentSize:         segSize,
 		Codec:               opts.Codec,

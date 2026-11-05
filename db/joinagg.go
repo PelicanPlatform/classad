@@ -124,7 +124,9 @@ func (cat *Catalog) JoinAggregate(spec JoinAggSpec, want JoinLimits, stats *Join
 	if stats == nil {
 		stats = &JoinStats{}
 	}
-	seq, err := cat.joinWith(spec.Join, DefaultJoinAggLimits().clamp(want), stats)
+	// A grouped aggregate's output is one row per group, so the order the join's rows
+	// arrive in is not visible in the answer: the planner may exchange the sides freely.
+	seq, err := cat.joinWith(spec.Join, DefaultJoinAggLimits().clamp(want), true, stats)
 	if err != nil {
 		return nil, err
 	}

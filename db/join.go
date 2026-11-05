@@ -220,6 +220,18 @@ type JoinStats struct {
 
 	// ProbeSteps is the probe decision for each step of the chain, in order.
 	ProbeSteps []JoinProbeStat
+
+	// BuildSideSwapped reports that the planner exchanged the sides, so the side written
+	// second was streamed and the side written first was hashed. BuildSideWhy says why, on
+	// either answer, and BuildSideCost / BuildSideSwapCost are what the two orientations
+	// were priced at in records touched (0 when neither was priced).
+	//
+	// Reported because a swap changes which order the rows come out in, and a reader who
+	// notices that needs to be able to find out that it was deliberate.
+	BuildSideSwapped  bool
+	BuildSideWhy      string
+	BuildSideCost     int
+	BuildSideSwapCost int
 }
 
 // JoinProbeStat is one step's index-probe decision.
@@ -404,7 +416,7 @@ func (cat *Catalog) JoinsChains() bool { return true }
 // before any row. A limit met part way through is reported in stats.Err, because by then the
 // sequence has already yielded rows and has no other way to say it stopped early.
 func (cat *Catalog) Join(spec JoinSpec, want JoinLimits, stats *JoinStats) (iter.Seq[*classad.ClassAd], error) {
-	return cat.joinWith(spec, DefaultJoinLimits().clamp(want), stats)
+	return cat.joinWith(spec, DefaultJoinLimits().clamp(want), false, stats)
 }
 
 // joinWith is Join with the limits already settled, so a caller whose rows do not cross a
@@ -412,8 +424,8 @@ func (cat *Catalog) Join(spec JoinSpec, want JoinLimits, stats *JoinStats) (iter
 // DefaultJoinLimits being applied on top of them. It clamps nothing: every caller clamps
 // against its own defaults before it gets here, which is what keeps "a caller can only ask
 // for less" a property of every entry point rather than of this one.
-func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats) (iter.Seq[*classad.ClassAd], error) {
-	return joinStream(cat, spec, limits, stats,
+func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, unordered bool, stats *JoinStats) (iter.Seq[*classad.ClassAd], error) {
+	return joinStream(cat, spec, limits, unordered, stats,
 		func(_ *joinWalk, p *joinPlan, rows []*joinRow) (*classad.ClassAd, bool) {
 			return p.composite(rows), true
 		},
@@ -429,9 +441,16 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 // second one beside it. The loop is where a join's correctness lives: which pairs the
 // condition keeps, when an unmatched LEFT row is null-extended, which limit stops what. A
 // second copy of that is a second set of answers to those questions.
-func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, stats *JoinStats,
+func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, unordered bool, stats *JoinStats,
 	mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool),
 	clone func(T) T, arena *rowArena[T]) (iter.Seq[T], error) {
+	if stats == nil {
+		stats = &JoinStats{}
+	}
+	// Which side streams is decided before anything is compiled, so the whole pipeline
+	// below -- the plan, the probe, the pair loop -- sees one spec and needs to know
+	// nothing about the choice.
+	spec = cat.planBuildSide(spec, unordered, stats)
 	p, err := compileJoin(spec, limits)
 	if err != nil {
 		return nil, err
@@ -445,10 +464,6 @@ func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, stats *Jo
 	if err != nil {
 		return nil, err
 	}
-	if stats == nil {
-		stats = &JoinStats{}
-	}
-
 	// Before reading any step's table whole, see whether an index can be made to read only
 	// the rows whose key the FROM side actually holds (see db/joinprobe.go).
 	probes := cat.planIndexProbes(p, sides, scanSeq, stats)
