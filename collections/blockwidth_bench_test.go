@@ -30,15 +30,12 @@ func sealActiveSegments(c *Collection) {
 
 // poolSampleFixture loads the committed real OSPool `condor_status -l` sample into a store with
 // sealed segments, which is the ad shape (~8.6 KB each) the production block width is set by.
-func poolSampleFixture(tb testing.TB) *Collection { return poolSampleFixtureBytes(tb, 0) }
-
-// poolSampleFixtureBytes is poolSampleFixture at a chosen row-group budget (0: the default).
 //
-// The budget is the knob PRODUCTION has -- Options.RowGroupBytes -- and setting it before the data
-// is written is the only way to change the width of these blocks. A sealed segment here carries its
-// own columnar payload, whose row groups were decided when it was columnarized, so a width sweep has
-// to build the store at each budget rather than regroup one store repeatedly.
-func poolSampleFixtureBytes(tb testing.TB, rowGroupBytes int) *Collection {
+// rowGroupBytes is Options.RowGroupBytes, 0 taking the production default. It is a parameter rather
+// than a later adjustment because it is the only way to change the width of these blocks: a sealed
+// segment here carries its own columnar payload, whose row groups were decided when the segment was
+// columnarized, so a width sweep builds a store per budget instead of regrouping one.
+func poolSampleFixture(tb testing.TB, rowGroupBytes int) *Collection {
 	tb.Helper()
 	sample := loadCorpus(tb)
 	// 8 MiB segments over ~8.6 KB ads: ~950 records per segment, so a whole-segment block holds
@@ -105,7 +102,7 @@ func BenchmarkVecScanBlockWidth(b *testing.B) {
 		}
 		want := -1
 		for _, bud := range widthBudgets() {
-			store := poolSampleFixtureBytes(b, bud.bytes)
+			store := poolSampleFixture(b, bud.bytes)
 			blocks, recs := blockStats(b, store)
 			coldCache(b, store)
 			store.VectorEvalCount(q) // two warm passes, per widthBudgets' note on ordering
