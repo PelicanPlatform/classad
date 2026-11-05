@@ -22,6 +22,12 @@ import (
 // x, and a later `x` is the local. That is the Python rule, and it is the reason the decision has to
 // be made by the compiler: only the compiler knows what is bound at a given point.
 //
+// WHERE A LOCAL CANNOT BE READ. A construct the compiler delegates to the tree-walking evaluator --
+// a conditional, a list or ad literal, a subscript, a select, a lazy built-in -- is evaluated against
+// the ad, which has never heard of a local. Reading a local from inside one is refused at compile
+// time rather than silently resolved to the attribute of the same name; see compiler.delegate and
+// LocalCaptureError for why the refusal is the right answer and not a stopgap.
+//
 // WHY ONE PROGRAM. Every statement's expression is compiled into a single Program, through the same
 // compile.go emitter an expression uses, and the whole thing is lowered to registers once. Nothing
 // is inlined and nothing is re-lowered: a local that three statements read is computed once and read
@@ -220,7 +226,7 @@ func (s *Script) emitExpr(expr ast.Expr) {
 	// over-approximates by including names that turn out to be locals; Compile removes those.
 	s.c.p.readAttrs = collectReads(expr, s.c.seen, s.c.p.readAttrs)
 	if astHeight(expr) >= maxNativeDepth {
-		s.c.ins(OpEvalNode, s.c.addNode(expr))
+		s.c.delegate(expr)
 		return
 	}
 	s.c.emit(expr)
@@ -236,6 +242,9 @@ type ScriptProgram struct {
 func (s *Script) Compile() (*ScriptProgram, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if s.c.capture != nil {
+		return nil, s.c.capture
 	}
 	if !s.hasRes {
 		return nil, ErrNoResult
