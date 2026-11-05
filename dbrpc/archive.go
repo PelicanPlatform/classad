@@ -68,26 +68,36 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 // engine so the result is identical to the same aggregate over a mutable table. Private
 // attributes are refused for an unprivileged reader, as with the mutable aggregate.
 func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, false, false)
+	sc.archiveAggregate(reqID, r, aggSpecBase, false)
 }
 
 // streamArchiveAggregateFiltered is streamArchiveAggregate's extended form: each group
 // column carries a bucket width and each spec a filter (opArchiveAggregateFiltered).
 func (sc *serverConn) streamArchiveAggregateFiltered(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, true, false)
+	sc.archiveAggregate(reqID, r, aggSpecFiltered, false)
 }
 
 // streamArchiveAggregateStats is streamArchiveAggregate that also streams the scan's ScanStats
 // trailer for EXPLAIN ANALYZE. It carries the extended frame (a superset), so it serves any
 // aggregate shape.
 func (sc *serverConn) streamArchiveAggregateStats(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, true, true)
+	sc.archiveAggregate(reqID, r, aggSpecFiltered, true)
 }
 
-// archiveAggregate is the body shared by both archive aggregate opcodes. extended says
-// whether the frame is the wide form -- each group column followed by a bucket width, each
-// aggregate spec by a filter expression -- rather than the base opcode's narrow one.
-func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantStats bool) {
+// streamArchiveAggregateNamed is streamArchiveAggregateFiltered whose specs also carry the
+// NAME of a user-defined aggregate (opArchiveAggregateNamed). It ends in a byte saying whether
+// the client wants the ScanStats trailer, so one opcode serves the EXPLAIN ANALYZE variant too
+// rather than spending a second on the same frame.
+func (sc *serverConn) streamArchiveAggregateNamed(reqID uint64, r *reader) {
+	sc.archiveAggregate(reqID, r, aggSpecNamed, false)
+}
+
+// archiveAggregate is the body shared by the archive aggregate opcodes. form says how wide the
+// frame is -- whether each group column is followed by a bucket width, and each aggregate spec
+// by a filter expression and an aggregate name -- rather than the base opcode's narrow one.
+// wantStats asks for the ScanStats trailer; the named frame carries that request itself, in a
+// trailing byte read below.
+func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, form aggSpecForm, wantStats bool) {
 	start := time.Now()
 	name := r.str()
 	constraint := r.str()
@@ -99,13 +109,23 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantSt
 	groupCols := make([]GroupCol, nGroup)
 	for i := range groupCols {
 		groupCols[i] = GroupCol{Attr: r.str()}
-		if extended {
+		if form >= aggSpecFiltered {
 			groupCols[i].BucketWidth = int64(r.u64())
 		}
 	}
-	aggs, ok := readAggSpecs(r, reqID, sc.write, extended)
+	aggs, ok := readAggSpecs(r, reqID, sc.write, form)
 	if !ok {
 		return
+	}
+	if form >= aggSpecNamed {
+		// The stats request rides the frame rather than the opcode. A short frame here is a
+		// malformed request, not an older client: this opcode has carried the byte since it
+		// existed, so nothing that predates it can reach this line.
+		wantStats = r.u8() != 0
+		if r.err != nil {
+			sc.write(respBad(reqID))
+			return
+		}
 	}
 	// Recorded under the same name the mutable handler gives an archive it resolved, so
 	// one history aggregate is one shape however the client reached it: through the
@@ -167,7 +187,7 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantSt
 		rows, err = aggregate(constraint, groupCols, aggs, nil)
 	}
 	if err != nil {
-		sc.write(respErr(reqID, err.Error()))
+		sc.write(respErr(reqID, aggErrMsg(err)))
 		return
 	}
 	obs.Rows = len(rows)
@@ -245,6 +265,10 @@ var ErrArchiveAggregateUnsupported = errors.New("dbrpc: server does not support 
 // wire, not every matched ad -- the point of pushing a COUNT over ~200k history rows to the
 // server. Against a server that does not implement the opcode it returns an error wrapping
 // ErrArchiveAggregateUnsupported so the caller can fall back to client-side aggregation.
+//
+// A spec may name a user-defined aggregate the SERVER registered, on the same terms as
+// (*Client).Aggregate -- including that the fallback above does not apply to one, because
+// reducing the rows here would need the aggregate here.
 func (c *Client) ArchiveAggregate(ctx context.Context, name, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
 	groups := make([]GroupCol, len(groupBy))
 	for i, g := range groupBy {
@@ -263,20 +287,38 @@ func (c *Client) ArchiveAggregate(ctx context.Context, name, constraint string, 
 // without its filters) and ErrArchiveAggregateUnsupported otherwise, so the caller can fall
 // back to client-side reduction.
 func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
-	// The base opcode's frame has room for neither bucket widths nor filters, so anything
-	// carrying either must use the extended one. Sending the narrow frame instead would
-	// drop them silently and return the wrong numbers as success.
-	filtered := anyFiltered(aggs)
-	extended := filtered
+	// The base opcode's frame has room for neither bucket widths nor filters, and only the
+	// named opcode's has room for an aggregate's NAME, so anything carrying one of those must
+	// use the wider frame. Sending the narrow one instead would drop them silently and return
+	// the wrong numbers as success.
+	// form describes what the SPECS need, and is what an old server's refusal is read
+	// against: a width-only request may honestly fall back to client-side bucketing, where a
+	// filtered or named one may not.
+	form := aggSpecFormFor(aggs)
+	if err := c.refuseNamedAggregate(aggs, form); err != nil {
+		return nil, err
+	}
+	// extended describes what the FRAME needs, which a bucket width alone is enough to widen.
+	extended := form >= aggSpecFiltered
 	for _, g := range groups {
 		if g.BucketWidth != 0 {
 			extended = true
 			break
 		}
 	}
+	// A frame carrying widths carries filters too -- the extended opcode's spec tail has a
+	// filter field whether or not anything fills it -- so the tail written is the wider of
+	// what the specs need and what the frame does.
+	wire := form
+	if extended && wire < aggSpecFiltered {
+		wire = aggSpecFiltered
+	}
 	build := func(id uint64) []byte {
 		o := opArchiveAggregate
-		if extended {
+		switch {
+		case wire >= aggSpecNamed:
+			o = opArchiveAggregateNamed
+		case extended:
 			o = opArchiveAggregateFiltered
 		}
 		b := putStr(putStr(req(id, o), name), constraint)
@@ -287,9 +329,13 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 				b = putU64(b, uint64(g.BucketWidth))
 			}
 		}
-		return putAggSpecs(b, aggs, extended)
+		b = putAggSpecs(b, aggs, wire)
+		if wire >= aggSpecNamed {
+			b = putU8(b, 0) // no ScanStats trailer wanted
+		}
+		return b
 	}
-	return c.archiveAggregate(ctx, build, len(groups), len(aggs), filtered, nil)
+	return c.archiveAggregate(ctx, build, len(groups), len(aggs), form, nil)
 }
 
 // ArchiveAggregateStats is ArchiveAggregateBucketed that also fills stats (may be nil) with the
@@ -302,23 +348,44 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 // opcode it returns an error wrapping ErrArchiveAggregateUnsupported (or ErrExtendedAggregateUnsupported
 // when a filter was requested), so the caller falls back to a plain aggregate without a breakdown.
 func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint string, groups []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
-	filtered := anyFiltered(aggs)
+	// As in ArchiveAggregateBucketed: form is what the specs need and is what the refusal is
+	// read against, while the frame this opcode sends is always the extended one.
+	form := aggSpecFormFor(aggs)
+	if err := c.refuseNamedAggregate(aggs, form); err != nil {
+		return nil, err
+	}
+	wire := form
+	if wire < aggSpecFiltered {
+		wire = aggSpecFiltered
+	}
 	build := func(id uint64) []byte {
-		b := putStr(putStr(req(id, opArchiveAggregateStats), name), constraint)
+		// A named aggregate asks for the trailer on the named opcode's own byte, because
+		// opArchiveAggregateStats has nowhere to put the name. The two answer the same way,
+		// so the reply loop below does not care which carried the request.
+		o := opArchiveAggregateStats
+		if wire >= aggSpecNamed {
+			o = opArchiveAggregateNamed
+		}
+		b := putStr(putStr(req(id, o), name), constraint)
 		b = putI32(b, int32(len(groups)))
 		for _, g := range groups {
 			b = putStr(b, g.Attr)
 			b = putU64(b, uint64(g.BucketWidth))
 		}
-		return putAggSpecs(b, aggs, true)
+		b = putAggSpecs(b, aggs, wire)
+		if wire >= aggSpecNamed {
+			b = putU8(b, 1) // send the ScanStats trailer
+		}
+		return b
 	}
-	return c.archiveAggregate(ctx, build, len(groups), len(aggs), filtered, stats)
+	return c.archiveAggregate(ctx, build, len(groups), len(aggs), form, stats)
 }
 
-// archiveAggregate runs a built archive-aggregate request and collects its streamed rows. filtered
+// archiveAggregate runs a built archive-aggregate request and collects its streamed rows. form
 // selects which "unsupported" error an old server's refusal maps to; stats (may be nil) receives a
-// ScanStats trailer if the server sends one (opArchiveAggregateStats).
-func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, filtered bool, stats *collections.ScanStats) ([]AggRow, error) {
+// ScanStats trailer if the server sends one (opArchiveAggregateStats, or opArchiveAggregateNamed
+// asked for one).
+func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, form aggSpecForm, stats *collections.ScanStats) ([]AggRow, error) {
 	_, frames, strm, err := c.callStream(build)
 	if err != nil {
 		return nil, err
@@ -355,9 +422,12 @@ func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte
 				return out, statusErr(status, body)
 			case stBadReq:
 				// A server too old to know the opcode rejects it as a bad request. A plain
-				// archive aggregate can fall back to a client-side scan; a FILTERED one
-				// must not be retried without its filters.
-				if filtered {
+				// archive aggregate can fall back to a client-side scan; a FILTERED one must
+				// not be retried without its filters, nor a NAMED one without its name.
+				if form >= aggSpecNamed {
+					return nil, ErrNamedAggregateUnsupported
+				}
+				if form >= aggSpecFiltered {
 					return nil, ErrExtendedAggregateUnsupported
 				}
 				return nil, ErrArchiveAggregateUnsupported

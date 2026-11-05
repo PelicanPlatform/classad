@@ -41,6 +41,13 @@ import (
 // answer a different aggregate; it declines the columnar path for the same reason as above; and the
 // materialized-view layer cannot name it. AggUser inherits all three behaviours by being past
 // AggMax too, so this is a registration and a reduction case rather than a new mechanism.
+//
+// It needs ONE thing COUNT(DISTINCT) did not: a request has to say WHICH aggregate. A selector is
+// the whole of COUNT(DISTINCT), and it is only half of this one, so the RPC layer carries the name
+// beside the selector on opcodes of its own. The reduction here is unaffected either way -- it
+// resolves a name against this process's registry whether the request came from an embedded caller
+// or off the wire -- which is why an unknown name is an error rather than an undefined column: the
+// caller is told what happened in both cases.
 
 // Registration failures a caller can act on differently, as sentinels rather than only as messages.
 var (
