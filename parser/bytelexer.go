@@ -357,12 +357,16 @@ func (l *ByteLexer) scanString() (LexToken, error) {
 			esc := l.src[l.pos]
 			l.pos++
 			switch esc {
+			case 'a':
+				b.WriteByte('\a')
 			case 'b':
 				b.WriteByte('\b')
 			case 't':
 				b.WriteByte('\t')
 			case 'n':
 				b.WriteByte('\n')
+			case 'v':
+				b.WriteByte('\v')
 			case 'f':
 				b.WriteByte('\f')
 			case 'r':
@@ -373,15 +377,19 @@ func (l *ByteLexer) scanString() (LexToken, error) {
 				b.WriteByte('"')
 			case '\'':
 				b.WriteByte('\'')
+			case '?':
+				b.WriteByte('?')
 			case '0', '1', '2', '3', '4', '5', '6', '7':
 				if !l.scanOctalEscape(esc, &b) {
 					return LexToken{}, l.err
 				}
 			default:
-				// Match the reference: report the bad escape but keep the char.
-				l.err = errors.New(l.formatError(l.pos-2, fmt.Sprintf("invalid escape sequence \\%c at position %d", esc, l.pos-2)))
+				// An escape the language does not define is not an error: convert_escapes()
+				// in the reference (classad/util.cpp) ends its switch with "pass char after
+				// \ unmodified", dropping the backslash and reporting nothing. Erroring here
+				// rejected whole expressions the schedd accepts -- OSPool host blocklists of
+				// the form regexp("a\.b\.c") being the case that found it.
 				b.WriteByte(esc)
-				return LexToken{}, l.err
 			}
 			continue
 		}

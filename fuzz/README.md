@@ -57,6 +57,7 @@ commands below do); the devcontainer has everything the tag needs.
 | [`cmd/cafuzz/`](cmd/cafuzz) | Standalone driver: generate/replay ads, bucket & report all divergences. |
 | [`cmd/genseeds/`](cmd/genseeds) | Regenerates `corpus/seeds.txt`. |
 | [`differential_test.go`](differential_test.go) | `FuzzDifferential`, the Go-native coverage-guided target. |
+| [`escape_differential_test.go`](escape_differential_test.go) | String-literal escape decoding in both syntaxes: an exhaustive sweep plus `FuzzStringEscapeDifferential`. |
 
 ## The canonical encoding
 
@@ -286,6 +287,27 @@ change is caught (see [`CPP_QUIRKS.md`](CPP_QUIRKS.md)).
   depths (CPP_QUIRKS, "Not mirrored"); the Go engine's limits differ.
 - **`length(...)`** *was* a Go alias for `size()`; the reference engine has no
   such function, so it has been removed (now an error), matching the reference.
+
+### String-literal escapes
+
+[`escape_differential_test.go`](escape_differential_test.go) is a third axis, and it
+exists because the other two are structurally blind to it. Escapes are decoded in the
+lexer, so a disagreement shows up as *one engine not parsing* -- and `FuzzDifferential`
+reports only value divergences while the `cafuzz` survey is run with `-ignore-parse`.
+The generator cannot write an undefined escape either: it quotes string values with
+`strconv.Quote`, which emits only escapes Go defines. So a Go lexer that rejected every
+escape the ClassAd language does not name surveyed clean through hundreds of thousands
+of ads, while rejecting `Requirements` on a large fraction of real OSPool jobs.
+
+`TestEscapeParityEveryASCIIEscape` sweeps `"\<c>"` for every printable ASCII `c` and
+`TestEscapeParityOctal` every octal form, through **both** syntaxes, asserting agreement
+with libclassad and that the two documented rules hold across the whole range -- an
+exhaustive sweep rather than a table, because the bug was in a `default:` arm that a
+table of hand-picked characters would have missed.
+`FuzzStringEscapeDifferential` then mutates the *body* of a single string literal.
+Scoping the fuzzer to the inside of a literal is what makes it productive: mutating
+whole expressions, almost every input dies in the grammar long before it reaches the
+escape decoder.
 
 `TestExprParity` and `FuzzParseExprOldDifferential` (`expr_differential_test.go`)
 compare standalone-expression parsing, `classad.ParseExprOld` against

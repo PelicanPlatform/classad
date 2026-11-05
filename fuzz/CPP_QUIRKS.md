@@ -288,7 +288,9 @@ different things to the old and new lexers*:
 - **Every backslash is literal.** In old-ClassAd, `OSIssue = "\S"` (the agetty
   escapes `/etc/issue` carries: `\S \r \l \m`) is the two characters `\` and `S`.
   The new-ClassAd parser instead *drops* an unknown-escape backslash — `[ A = "\S" ]`
-  evaluates `A` to `"S"` — and rejects yet others. `\n`, `\t`, and octal `\NNN`
+  evaluates `A` to `"S"`. It rejects nothing: `convert_escapes`' default arm passes
+  "char after \ unmodified" for every undefined escape, and only an embedded `\0`
+  invalidates the literal. `\n`, `\t`, and octal `\NNN`
   are likewise kept literal in old-ClassAd, not interpreted.
 
   ```
@@ -308,13 +310,36 @@ different things to the old and new lexers*:
 - **Adjacent string literals are not concatenated** (`"a" "b"` is a parse
   error), unlike the new-ClassAd lexer, where it is `"ab"`.
 
-This is legacy behavior, not a bug — but a sharp edge. It bit a Go collector: its
-ingest lexed forwarded old-ClassAd string values with new-ClassAd escape rules,
-so `OSIssue = "\S"` was rejected (`invalid escape sequence \S`), the startd ad was
-dropped, and the forward connection reset (`condor_write(): Socket closed`). The
-Go engine's old-ClassAd path (`classad.ParseOld` and the `collections` ingest fast
-path) now matches `tokenizeStringOld` exactly, and `FuzzParseOldClassAdDifferential`
-guards it against regression.
+This is legacy behavior, not a bug — but a sharp edge, and it has now cut three
+times, always the same way: old-ClassAd bytes read with new-ClassAd escape rules.
+
+1. A Go collector's ingest lexed forwarded old-ClassAd string values with
+   new-ClassAd rules, so `OSIssue = "\S"` was rejected (`invalid escape sequence
+   \S`), the startd ad was dropped, and the forward connection reset
+   (`condor_write(): Socket closed`).
+2. A schedd `TransferInput` naming a file with an escaped comma and space
+   (`testing\,\ more`) was dropped from the mirrored job ad the same way.
+3. htcondordb skipped `Requirements` on every OSPool job carrying a host
+   blocklist — `!regexp("warlock21\.beocat\.ksu\.edu|...")` — because
+   `db.Txn.SetAttribute` parsed job_queue.log values with `classad.ParseExpr`.
+
+(1) and (2) were fixed at the call site; (3) showed the Go *new*-ClassAd lexer had
+the second half wrong too, erroring on an undefined escape where the reference
+accepts it. Both halves now match: `classad.ParseOld`/`ParseExprOld` and the
+`collections` ingest fast path follow `tokenizeStringOld`, the new-ClassAd lexers
+follow `convert_escapes`, and `db.Txn.SetAttribute` uses old semantics because
+that is what `LogSetAttribute` does (`ParseClassAdRvalExpr` sets
+`SetOldClassAd(true)`).
+
+Note which failure is worse. Erroring is loud; reading with the *wrong syntax* is
+silent, and deletes the backslashes from a regex, leaving a pattern whose `.`
+matches any character. A mirror that reads job_queue.log with the new parser does
+not lose the attribute once the lexer is lenient — it stores a subtly wider regex.
+
+`FuzzParseOldClassAdDifferential` guards the old path;
+`FuzzStringEscapeDifferential` and `TestEscapeParityEveryASCIIEscape`
+(`fuzz/escape_differential_test.go`) guard both, sweeping every ASCII escape and
+every octal form through both syntaxes.
 
 ## 14. A `-` before a number is part of the literal, which changes how the number lexes — surprising
 
@@ -372,6 +397,35 @@ this; `classad.ParseExpr` does not. Both reject a trailing `;`.
 a leading `;` it requires an attribute, so `[;a=1]` and `[a=1;;]` parse while
 `[;]` and `[ ; ]` do not. `ClassAd::Insert` refuses an empty attribute name, so
 `[''=0]` fails to parse. The Go parser matches both.
+
+## 18. Adjacent string literals are spliced BEFORE escapes are decoded, so an octal escape straddles the join — likely bug
+
+New-ClassAd `Lexer::tokenizeString` concatenates adjacent string literals by
+erasing the intervening quotes from the token buffer, and only then runs
+`convert_escapes` **once** over the spliced result. An escape is therefore free to
+begin in one literal and end in the next — and because octal is the one
+variable-length escape, it is the one that notices:
+
+```
+classad_eval -quiet '[ A = "\1" "2" ]' A      # "\n"   (octal \12 == 0x0A), not "\x01" + "2"
+classad_eval -quiet '[ A = "\3" "77" ]' A     # "\xff"  (octal \377), not "\x03" + "77"
+classad_eval -quiet '[ A = "\0" "1" ]' A      # "\x01"  — parses, though "\0" alone is invalid
+```
+
+The last line is the sharpest: `"\0"` on its own is a rejected literal (an embedded
+NUL), but spliced with a following `"1"` it becomes a valid `\01`.
+
+The Go lexers decode each literal independently and concatenate the decoded
+strings, which is the behavior anyone would expect and which agrees with the
+reference for every escape except these. Matching it means restructuring both
+lexers to look ahead for an adjacent literal and splice the raw bodies before
+decoding — real work for a shape that does not occur in HTCondor data, since
+nothing generates adjacent ClassAd string literals at all.
+
+**Not mirrored.** `FuzzStringEscapeDifferential` restricts itself to inputs that
+lex as a single string literal so it keeps guarding escape decoding without
+re-finding this; `TestEscapeConcatSplice` pins the reference's values above, so a
+future libclassad change or a decision to mirror this is visible.
 
 ## Not mirrored: parser and evaluation depth limits (HTCONDOR-3814)
 

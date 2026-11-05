@@ -1447,8 +1447,16 @@ func (t *Txn) DestroyClassAd(key string) {
 // (classad_log.h LogSetAttribute) -- a read-modify-write within the transaction, so
 // it composes with the transaction's own earlier writes to key. The ad is created if
 // absent.
+//
+// expr is parsed with OLD-ClassAd semantics, because that is what LogSetAttribute does:
+// it calls ParseClassAdRvalExpr, which is a ClassAdParser with SetOldClassAd(true)
+// (compat_classad_util.cpp). The difference is string literals -- old syntax gives them
+// no escape interpretation at all, so a job_queue.log value like
+// regexp("host\.example\.org") keeps its backslashes and means what its author wrote.
+// Parsing it as new syntax silently deleted them (there, \. is the undefined escape that
+// decays to .), turning that regex into one matching any character.
 func (t *Txn) SetAttribute(key, name, expr string) error {
-	e, err := classad.ParseExpr(expr)
+	e, err := classad.ParseExprOld(expr)
 	if err != nil {
 		return fmt.Errorf("classad-db: SetAttribute %s[%s]: %w", key, name, err)
 	}

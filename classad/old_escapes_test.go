@@ -42,11 +42,38 @@ func TestParseOldClassAdLiteralEscapes(t *testing.T) {
 	}
 }
 
-// TestParseNewClassAdEscapesStillStrict guards the scope of the fix: NEW-ClassAd parsing is
-// unchanged -- an unrecognized escape there is still an error (leniency is only on the
-// old-ClassAd wire path, which is where C++ is lenient).
-func TestParseNewClassAdEscapesStillStrict(t *testing.T) {
-	if _, err := Parse(`[ A = "\S" ]`); err == nil {
-		t.Fatal("Parse (new ClassAd) accepted invalid escape \\S; leniency must be old-ClassAd only")
+// TestParseNewClassAdUndefinedEscape covers the OTHER half of the reference's leniency, which
+// this test previously got backwards by asserting new-ClassAd parsing stays strict. libclassad
+// is lenient on both paths; what differs is the value. New syntax runs the literal through
+// convert_escapes(), whose default arm passes "char after \ unmodified" -- so the escape is
+// accepted and the BACKSLASH IS DROPPED ("\S" is "S"). Old syntax never calls convert_escapes
+// at all, so the backslash stays ("\S" is "\S", above).
+//
+// Erroring here is what made htcondordb skip Requirements on every job carrying an OSPool host
+// blocklist; silently keeping the backslash instead would have been worse, since the two
+// syntaxes genuinely disagree about the value. fuzz.TestEscapeParity pins both against the
+// real libclassad.
+func TestParseNewClassAdUndefinedEscape(t *testing.T) {
+	cases := []struct{ text, attr, want string }{
+		{`[ A = "\S" ]`, "A", "S"},
+		{`[ A = "warlock21\.beocat\.ksu\.edu" ]`, "A", "warlock21.beocat.ksu.edu"},
+		{`[ A = "x\\y" ]`, "A", `x\y`},
+		{`[ A = "a\nb" ]`, "A", "a\nb"},
+		{`[ A = "a\ab" ]`, "A", "a\ab"},
+		{`[ A = "a\vb" ]`, "A", "a\vb"},
+		{`[ A = "a\?b" ]`, "A", "a?b"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse(tc.text)
+		if err != nil {
+			t.Fatalf("Parse(%q) errored: %v", tc.text, err)
+		}
+		got, ok := ad.EvaluateAttrString(tc.attr)
+		if !ok {
+			t.Fatalf("Parse(%q): attribute %s not a string", tc.text, tc.attr)
+		}
+		if got != tc.want {
+			t.Errorf("Parse(%q) %s = %q, want %q", tc.text, tc.attr, got, tc.want)
+		}
 	}
 }
