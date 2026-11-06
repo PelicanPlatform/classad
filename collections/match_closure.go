@@ -183,8 +183,10 @@ func (c *Collection) topUpJobAttr(a wire.Ad, partial *classad.ClassAd, mw *match
 // walkSlotRefs calls fn for each attribute reference in a slot expression that can
 // resolve to an attribute: toJob is true for TARGET.x (the job's attribute) and false
 // for an unscoped or MY reference (the slot's own; an unscoped one the slot does not
-// define falls through to the job). It does not report eval(); callers rely on
-// vm.SelfRefsSafe or the hot-closure flag for that.
+// define falls through to the job). A `.`-path select reports its member as an
+// unscoped reference too, because a member the record does not define chains out to
+// the enclosing scope. It does not report eval(); callers rely on vm.SelfRefsSafe or
+// the hot-closure flag for that.
 func walkSlotRefs(e ast.Expr, fn func(name string, toJob bool)) {
 	switch n := e.(type) {
 	case nil:
@@ -225,6 +227,12 @@ func walkSlotRefs(e ast.Expr, fn func(name string, toJob bool)) {
 		}
 	case *ast.SelectExpr:
 		walkSlotRefs(n.Record, fn)
+		// The selected member resolves in the record and, when the record does not
+		// define it, CHAINS to the enclosing scope -- the slot -- and from there falls
+		// through to the job exactly as a bare name does. So it is an unscoped slot
+		// reference, and a closure that left it out would evaluate `Res.Mem` against a
+		// partial ad missing the Mem the whole ad has.
+		fn(n.Attr, false)
 	case *ast.SubscriptExpr:
 		walkSlotRefs(n.Container, fn)
 		walkSlotRefs(n.Index, fn)

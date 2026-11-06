@@ -87,8 +87,12 @@ func (h *hider) expr(e ast.Expr) ast.Expr {
 		}
 		return &ast.FunctionCall{Name: v.Name, Args: args}
 	case *ast.SelectExpr:
-		// The selected name belongs to whatever the record evaluates to, not to the ad; only the
-		// record expression can reach one of the ad's attributes.
+		// The selected name is left alone even when it is one of the hidden ones. It names a
+		// member of whatever the record evaluates to, and a record's members are not sealed --
+		// only a top-level attribute is -- so rewriting it to undefined would withhold a value
+		// the reader IS entitled to. The select does chain out to the ad when the record has no
+		// such member, and that read is withheld where every other read of the attribute is: the
+		// keyless wire context hands back undefined for it, whatever form it is stored in.
 		return &ast.SelectExpr{Record: h.expr(v.Record), Attr: v.Attr}
 	case *ast.SubscriptExpr:
 		return &ast.SubscriptExpr{Container: h.expr(v.Container), Index: h.expr(v.Index)}

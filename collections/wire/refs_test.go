@@ -14,16 +14,21 @@ import (
 // members included (the walkers are supersets, and a member such as Foo below is evaluated in the
 // record's scope, which falls through to the enclosing ad). TARGET. references name another ad and
 // are never included.
+//
+// A `.`-path select's member is in the set too (alpha, outer, inner, m, k below). A member the
+// selected record does not define chains out to the enclosing ad, so the name can reach it; the
+// walk does not decide whether this particular record binds it, which keeps it a superset in the
+// one direction that is safe.
 var nestedRecordCases = []struct {
 	name string
 	expr string
 	refs []string
 }{
-	{"record", `[alpha = Foo; beta = Bar].alpha + Baz`, []string{"Bar", "Baz", "Foo"}},
+	{"record", `[alpha = Foo; beta = Bar].alpha + Baz`, []string{"alpha", "Bar", "Baz", "Foo"}},
 	{"record in list", `{ 1, [a = Foo; b = Bar], Baz }`, []string{"Bar", "Baz", "Foo"}},
-	{"record in record", `[outer = [inner = Foo; z = 1].inner; w = Bar].outer + Baz`, []string{"Bar", "Baz", "Foo"}},
-	{"outer references", `[m = MY.Foo; n = TARGET.Qux; o = Bar * 2].m + Baz`, []string{"Bar", "Baz", "Foo"}},
-	{"record after refs", `Baz + [k = Foo].k`, []string{"Baz", "Foo"}},
+	{"record in record", `[outer = [inner = Foo; z = 1].inner; w = Bar].outer + Baz`, []string{"Bar", "Baz", "Foo", "inner", "outer"}},
+	{"outer references", `[m = MY.Foo; n = TARGET.Qux; o = Bar * 2].m + Baz`, []string{"Bar", "Baz", "Foo", "m"}},
+	{"record after refs", `Baz + [k = Foo].k`, []string{"Baz", "Foo", "k"}},
 }
 
 // nestedRecordNode encodes [X = expr; Pad = 1] in the given key encoding and returns X's node, with
