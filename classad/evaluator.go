@@ -62,8 +62,8 @@ const (
 // length} pair across the two slots -- reaches three words and is equally
 // GC-legal, but it makes string values compare by ADDRESS instead of by
 // characters, a silent change that the whole test suite passes straight through.
-// Eight more bytes are not worth that. See payloadString for what the aliasing
-// does cost, which is narrower but not nothing.
+// Eight more bytes are not worth that. See payload for how the aliasing keeps
+// ad and list equality working anyway.
 type Value struct {
 	valueType ValueType
 	// intVal holds an integer value, a boolean (0 or 1), and -- for a RealValue --
@@ -71,44 +71,57 @@ type Value struct {
 	// scalar payloads here keeps Value one word smaller than a separate bool/real
 	// field would, and the bits round-trip exactly (NaN/Inf/-0 included).
 	//
-	// It is zero for every other type. A string value leaves it zero too; see the
-	// prefix discussion on NewStringValue for what was measured for that slot.
+	// For a ClassAdValue or a ListValue it holds the payload's ADDRESS as a plain
+	// integer, which is what keeps those two comparing by pointer identity; see
+	// payload. It is zero for every other type. A string value leaves it zero too;
+	// see the prefix discussion on NewStringValue for what was measured for that
+	// slot.
 	intVal int64
 	// strVal is a string value's characters, and for a ClassAdValue or a ListValue
 	// it is a ZERO-LENGTH string whose data pointer is the *ClassAd or *listData
-	// (see payloadString, classAd() and list()). Those three are mutually exclusive
+	// (see payload, classAd() and list()). Those three are mutually exclusive
 	// -- a Value is one type, and valueType says which -- so a separate payload
 	// pointer field was a word that every Value paid for and no Value used twice,
 	// plus a third pointer word for the GC to scan on every Value it walked.
 	strVal string
 }
 
-// payloadString packs an out-of-line payload pointer into strVal's data word as a
-// zero-length string, so that a ClassAdValue and a ListValue need no field of
-// their own. It is the only place that builds one.
+// payload packs an out-of-line payload pointer into the two fields a ClassAdValue
+// or a ListValue carries it in, so that neither needs a field of its own. It is
+// the only place that builds one, and both halves are required.
 //
-// The length MUST be zero. It is not a free choice:
+// strVal IS THE POINTER. It is the reference the garbage collector traces and the
+// one classAd() and list() read back, and its length MUST be zero. That is not a
+// free choice: any nonzero length makes Go's string equality run memequal over the
+// pointed-at object's raw memory, so two unrelated ads would compare by their
+// bytes, and a length exceeding the object reads out of bounds outright.
 //
-//   - Any nonzero length makes Go's string equality run memequal over the
-//     pointed-at object's raw memory, so two unrelated ads would compare by their
-//     bytes; a length exceeding the object reads out of bounds outright.
-//   - With length zero, Go short-circuits string equality on the length alone and
-//     never looks at the pointers, so ALL ClassAd values compare equal to each
-//     other and all list values compare equal to each other. valueType still
-//     separates the types, so an ad value never equals a string or a list value.
+// INTVAL IS THE SAME ADDRESS AGAIN, as an integer, and it is there for `==`. A
+// zero-length string compares equal to every other zero-length string on the
+// length alone, Go never looking at the data pointers, so strVal on its own would
+// make ALL ad values equal to each other and all list values equal to each other.
+// Comparing the integer copy instead is what restores the pointer identity the
+// pre-shrink layout had, where the payload was a *ClassAd field compared
+// bitwise: two Values hold one ad exactly when they were built from one pointer.
 //
-// That second point is the real price of this layout, and it is a deliberate
-// trade: ad/list equality goes from pointer identity to always-equal-within-type.
-// It is narrower than breaking string equality (which is why the string stays a
-// string) but it is still silent, so TestEqualitySemantics pins every case.
+// Holding an address as an integer is safe HERE because of two things, and only
+// because of both. It is never converted back to a pointer or dereferenced --
+// classAd() and list() read strVal, never this -- so it is not a pointer by any
+// definition the runtime enforces, and it keeps nothing alive that strVal does
+// not already keep alive. And it cannot go stale, because the only Go object that
+// ever moves is one on a stack, and neither payload is ever on a stack: a
+// &listData literal escapes outright, and a ClassAd whose address reaches
+// NewClassAdValue is moved to the heap by the same analysis, which
+// TestPayloadEscapesToTheHeap holds to. A heap object's address is fixed for its
+// lifetime, so the integer and the pointer can never disagree.
 //
 // unsafe.String with a zero length keeps the pointer rather than canonicalizing
 // to "" -- the standard library documents the data pointer of an empty string as
 // unspecified, so TestZeroLengthAliasRoundTrip asserts the round trip and will
 // fail loudly on a Go release that changes it, rather than silently handing back
 // a nil ad.
-func payloadString(p unsafe.Pointer) string {
-	return unsafe.String((*byte)(p), 0)
+func payload(p unsafe.Pointer) (int64, string) {
+	return int64(uintptr(p)), unsafe.String((*byte)(p), 0)
 }
 
 // classAd reinterprets strVal's data pointer as the *ClassAd it holds. Valid only
@@ -204,13 +217,15 @@ func NewStringValue(s string) Value {
 // NewListValue creates a list value.
 func NewListValue(list []Value) Value {
 	countValue()
-	return Value{valueType: ListValue, strVal: payloadString(unsafe.Pointer(&listData{vals: list}))}
+	n, sp := payload(unsafe.Pointer(&listData{vals: list}))
+	return Value{valueType: ListValue, intVal: n, strVal: sp}
 }
 
 // NewClassAdValue creates a ClassAd value.
 func NewClassAdValue(ad *ClassAd) Value {
 	countValue()
-	return Value{valueType: ClassAdValue, strVal: payloadString(unsafe.Pointer(ad))}
+	n, sp := payload(unsafe.Pointer(ad))
+	return Value{valueType: ClassAdValue, intVal: n, strVal: sp}
 }
 
 // Type returns the type of the value.
@@ -1096,7 +1111,8 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 		exprs = []ast.Expr{}
 	}
 	countValue()
-	return Value{valueType: ListValue, strVal: payloadString(unsafe.Pointer(&listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind}))}
+	n, sp := payload(unsafe.Pointer(&listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind}))
+	return Value{valueType: ListValue, intVal: n, strVal: sp}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {

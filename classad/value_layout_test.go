@@ -262,12 +262,17 @@ func TestZeroLengthAliasRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := payloadString(unsafe.Pointer(ad))
+	n, s := payload(unsafe.Pointer(ad))
 	if s != "" {
-		t.Fatalf("payloadString length = %d, want 0 (a nonzero length makes == read the ad's raw memory)", len(s))
+		t.Fatalf("payload string length = %d, want 0 (a nonzero length makes == read the ad's raw memory)", len(s))
 	}
 	if got := (*ClassAd)(unsafe.Pointer(unsafe.StringData(s))); got != ad {
 		t.Fatalf("aliased pointer round-trip: got %p, want %p -- the Go runtime canonicalized a zero-length string's data pointer", got, ad)
+	}
+	// The integer half must be the same address, because that is the half `==`
+	// actually reads for an ad or a list.
+	if uintptr(n) != uintptr(unsafe.Pointer(ad)) {
+		t.Fatalf("payload integer = %#x, want the ad's address %p", uintptr(n), ad)
 	}
 	// A nil payload must survive too: NewClassAdValue(nil) is legal and String()
 	// renders it "[]". unsafe.String panics on a nil pointer only when len > 0.
@@ -278,12 +283,19 @@ func TestZeroLengthAliasRoundTrip(t *testing.T) {
 
 // TestEqualitySemantics pins what Go's `==` does for every pair of Value types.
 // Value is an exported comparable struct, so `==` and use as a map key are part
-// of its API whether or not this repo writes them, and this layout deliberately
-// changes one cell of the table: aliasing the payload onto a ZERO-LENGTH string
-// means Go compares ad and list values on the length alone and never reaches the
-// pointers, so two DIFFERENT ads now compare equal. That is the price of the
-// fourth word. It is pinned here, per cell, so it is a documented decision rather
-// than something a reader discovers in production.
+// of its API whether or not this repo writes them, and this layout rearranges
+// where every cell of the table comes from: a string still compares by content,
+// a scalar still compares bitwise out of intVal, and an ad or a list compares by
+// the ADDRESS intVal holds beside the aliased pointer.
+//
+// That last one is the cell this layout could have broken and does not. Aliasing
+// the payload onto a zero-length string makes Go compare ad and list values on
+// the length alone, never reaching the data pointers, which on its own would make
+// every ad value equal to every other -- a silent change the rest of the suite
+// passes straight through. Carrying the address again as an integer is what keeps
+// the pre-shrink behavior, so the whole table below reads exactly as it did at 48
+// bytes. It is pinned per cell so that staying the same is something a change has
+// to break on purpose.
 func TestEqualitySemantics(t *testing.T) {
 	adA, err := Parse(`[A = 1]`)
 	if err != nil {
@@ -293,6 +305,15 @@ func TestEqualitySemantics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Equal content, different pointer: an ad value compares by identity, not by
+	// what the ad says, exactly as it did when the payload was a *ClassAd field.
+	adACopy, err := Parse(`[A = 1]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One list Value copied, rather than two built: copies of a Value share one
+	// payload and so must stay equal to each other.
+	listOnce := NewListValue([]Value{NewIntValue(1)})
 	// Built from separate backing arrays on purpose: the whole reason strVal
 	// stays a real Go string is that these must still compare equal.
 	aliceLit := "alice"
@@ -316,11 +337,15 @@ func TestEqualitySemantics(t *testing.T) {
 		{"bool/bool different", NewBoolValue(true), NewBoolValue(false), false},
 		{"undefined/undefined", NewUndefinedValue(), NewUndefinedValue(), true},
 		{"error/error", NewErrorValue(), NewErrorValue(), true},
-		// THE CHANGED CELLS: ad/ad and list/list are now always equal within
-		// their type, where they used to compare by pointer identity.
+		// Ads and lists: POINTER IDENTITY, which is what intVal buys back and
+		// what the layout would otherwise have turned into always-equal.
 		{"ad/ad same pointer", NewClassAdValue(adA), NewClassAdValue(adA), true},
-		{"ad/ad DIFFERENT pointers (was false)", NewClassAdValue(adA), NewClassAdValue(adB), true},
-		{"list/list DIFFERENT pointers (was false)", NewListValue([]Value{NewIntValue(1)}), NewListValue([]Value{NewIntValue(2)}), true},
+		{"ad/ad different pointers", NewClassAdValue(adA), NewClassAdValue(adB), false},
+		{"ad/ad different pointers, EQUAL CONTENT", NewClassAdValue(adA), NewClassAdValue(adACopy), false},
+		{"ad/ad both nil", NewClassAdValue(nil), NewClassAdValue(nil), true},
+		{"list/list different pointers", NewListValue([]Value{NewIntValue(1)}), NewListValue([]Value{NewIntValue(2)}), false},
+		{"list/list different pointers, EQUAL CONTENT", NewListValue([]Value{NewIntValue(1)}), NewListValue([]Value{NewIntValue(1)}), false},
+		{"list/list copied Value", listOnce, listOnce, true},
 		// Cross-type: still separated by valueType, including the cases that
 		// would otherwise collide now that ad/list carry a zero-length string.
 		{"ad vs empty string", NewClassAdValue(adA), NewStringValue(""), false},
@@ -357,5 +382,106 @@ func TestValueAsMapKey(t *testing.T) {
 	m[NewBoolValue(true)] = "bool"
 	if len(m) != 4 {
 		t.Errorf("map has %d entries, want 4: the scalar types must stay distinct keys", len(m))
+	}
+}
+
+// TestPayloadEscapesToTheHeap holds to the one thing that makes carrying the
+// payload's address in intVal safe: the payload never lives on a stack, so its
+// address never changes and the integer can never disagree with the pointer
+// beside it.
+//
+// A stack is the only Go memory that moves -- the collector does not relocate
+// heap objects, but growing a goroutine's stack copies it and rewrites every
+// pointer in it, strVal's data word included and intVal NOT, since intVal is an
+// integer and no pointer map mentions it. If escape analysis ever stopped moving
+// these payloads to the heap, two Values built from one ad across a stack growth
+// would stop comparing equal, and a stale address could even collide with a live
+// object's, making two unrelated ads compare EQUAL. Neither failure is visible
+// anywhere near the layout, so it is caught here.
+//
+// The test makes both payloads in a function that declares them locally, grows
+// the stack hard enough to force a copy, and then asks whether the two halves
+// still name one address.
+func TestPayloadEscapesToTheHeap(t *testing.T) {
+	adVal, listVal := buildPayloadsOnWhatLooksLikeAStack()
+	deepStack(1 << 13)
+
+	if got, want := uintptr(adVal.intVal), uintptr(unsafe.Pointer(adVal.classAd())); got != want {
+		t.Errorf("after a stack copy the ad payload's integer is %#x and its pointer is %#x: "+
+			"the ad was on the stack and moved", got, want)
+	}
+	if got, want := uintptr(listVal.intVal), uintptr(unsafe.Pointer(listVal.list())); got != want {
+		t.Errorf("after a stack copy the list payload's integer is %#x and its pointer is %#x: "+
+			"the listData was on the stack and moved", got, want)
+	}
+	// And the consequence the rest of the code depends on: still the same value.
+	if again := NewClassAdValue(adVal.classAd()); again != adVal {
+		t.Error("an ad Value rebuilt from its own pointer no longer equals itself after a stack copy")
+	}
+}
+
+//go:noinline
+func buildPayloadsOnWhatLooksLikeAStack() (Value, Value) {
+	var ad ClassAd
+	ad.Set("Owner", "alice")
+	return NewClassAdValue(&ad), NewListValue([]Value{NewIntValue(1)})
+}
+
+// deepStack recurses with a frame big enough that the goroutine's stack has to
+// grow and be copied.
+//
+//go:noinline
+func deepStack(n int) byte {
+	var pad [256]byte
+	if n == 0 {
+		return pad[0]
+	}
+	pad[0] = deepStack(n - 1)
+	return pad[0]
+}
+
+// payloadSink keeps the compiler from discarding a Value the allocation test
+// builds only to measure.
+var payloadSink Value
+
+// adSink is the control arm's: an ad built and never handed to a Value.
+var adSink byte
+
+// TestPayloadIsHeapAllocated is the half of the escape argument a stack copy
+// cannot show. TestPayloadEscapesToTheHeap asks whether the two halves of a
+// payload still agree after the stack moves, which is the failure a regression
+// would PRODUCE -- but it answers "yes" trivially if no payload was ever on a
+// stack to begin with, which is exactly the state being asserted. So the
+// allocation is measured directly: a value the compiler puts on the stack costs
+// no allocation, and one it moves to the heap costs one.
+//
+// The control arm is what makes the measurement mean anything. It builds the same
+// ClassAd the same way and does NOT pass it to NewClassAdValue, and it must come
+// out at zero -- proving that this ad CAN live on the stack, and so that the
+// allocation in the first arm is NewClassAdValue forcing it off.
+func TestPayloadIsHeapAllocated(t *testing.T) {
+	adEscapes := testing.AllocsPerRun(100, func() {
+		var ad ClassAd
+		payloadSink = NewClassAdValue(&ad)
+	})
+	if adEscapes < 1 {
+		t.Errorf("NewClassAdValue(&ad) allocated %.1f times: the ad stayed on the stack, "+
+			"where it can move and leave intVal naming an address nothing is at", adEscapes)
+	}
+
+	adStays := testing.AllocsPerRun(100, func() {
+		var ad ClassAd
+		adSink = *(*byte)(unsafe.Pointer(&ad))
+	})
+	if adStays != 0 {
+		t.Skipf("the control arm allocated %.1f times, so this build cannot keep a ClassAd "+
+			"on the stack at all and the first arm proves nothing", adStays)
+	}
+
+	listEscapes := testing.AllocsPerRun(100, func() {
+		payloadSink = NewListValue(nil)
+	})
+	if listEscapes < 1 {
+		t.Errorf("NewListValue allocated %.1f times: the listData stayed on the stack", listEscapes)
 	}
 }
