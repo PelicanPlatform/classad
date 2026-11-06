@@ -565,9 +565,14 @@ func (db *DB) SuggestIndexes(sampleMax int) []collections.IndexSuggestion {
 	return db.c.SuggestIndexes(sampleMax)
 }
 
-// Len returns the number of committed ads (including structural parent-only ads of a chained
-// collection, which Query hides -- see Collection.Len / Chained).
+// Len returns the number of committed ads a reader is shown: reserved system-keyed records
+// are not among them, as they are not in Query either (including structural parent-only ads of
+// a chained collection, which Query hides -- see Collection.Len / Chained).
 func (db *DB) Len() int { return db.c.Len() }
+
+// StoredLen returns the number of committed ads the table holds, system-keyed records
+// included. For accounting what is stored; Len is for how many rows a reader sees.
+func (db *DB) StoredLen() int { return db.c.StoredLen() }
 
 // Chained reports whether the table has structural (parent-only) ads that Query hides, so a
 // caller knows when Len equals the match-all row count (the COUNT(*) fast path).

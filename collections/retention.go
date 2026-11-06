@@ -61,10 +61,16 @@ func (c *Collection) Rotate(now float64) (int, error) {
 			break
 		}
 		seg := sh.segs[idx]
-		if n := segLiveCount(seg); n <= sh.count {
+		n, nsys := segLiveCount(seg)
+		if n <= sh.count {
 			sh.count -= n
 		} else {
 			sh.count = 0
+		}
+		if nsys <= sh.sysCount {
+			sh.sysCount -= nsys
+		} else {
+			sh.sysCount = 0
 		}
 		if seg.retire() { // unpinned ⇒ reap now; else the last unpin reaps it
 			toReap = append(toReap, seg)
@@ -199,11 +205,10 @@ func (sh *shard) overRetention(r Retention, idx int, now float64, maxAgeID uint3
 }
 
 // segLiveCount counts the data records (skipping time-checkpoint markers) in a segment
-// by a single forward walk. Used to keep the append-only shard's record count accurate
-// when a segment is rotated out. Append-only records are never superseded, so every
-// data record is live.
-func segLiveCount(seg *segment) int {
-	n := 0
+// by a single forward walk, returning the total and how many of them are system-keyed.
+// Used to keep the append-only shard's record counts accurate when a segment is rotated
+// out. Append-only records are never superseded, so every data record is live.
+func segLiveCount(seg *segment) (n, sys int) {
 	for off := 0; off < seg.used; {
 		o := uint32(off)
 		if end, ok := seg.damaged().skip(o); ok {
@@ -216,8 +221,11 @@ func segLiveCount(seg *segment) int {
 		}
 		if !recIsMarker(seg.data, o) {
 			n++
+			if isSystemKeyBytes(recKey(seg.data, o)) {
+				sys++
+			}
 		}
 		off += int(total)
 	}
-	return n
+	return n, sys
 }

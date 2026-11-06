@@ -419,7 +419,9 @@ func rewriteDirSnapshot(t *testing.T, dir string, edit func(hdr []byte, segs []s
 	if v := r.u32(); v != dirSnapVersion {
 		t.Fatalf("snapshot version %d", v)
 	}
-	r.u64()
+	r.u64()         // commit sequence
+	r.u64()         // live count
+	sysOff := r.pos // the system count, which a version below 3 does not carry
 	r.u64()
 	nSegs := int(r.u32())
 	hdr := append([]byte(nil), body[:r.pos]...)
@@ -434,6 +436,12 @@ func rewriteDirSnapshot(t *testing.T, dir string, edit func(hdr []byte, segs []s
 		t.Fatal("snapshot did not decode")
 	}
 	hdr, segs, ents = edit(hdr, segs, ents)
+	// An edit that downgrades the version has to shorten the header to match it: a reader
+	// of that version takes the bytes after the live count to be the segment count, so a
+	// system count left in place would be read as one and the rest of the file misframed.
+	if binary.LittleEndian.Uint32(hdr[4:]) < dirSnapVersion {
+		hdr = append(append([]byte(nil), hdr[:sysOff]...), hdr[sysOff+8:]...)
+	}
 	out := hdr
 	for _, s := range segs {
 		out = binary.LittleEndian.AppendUint64(out, s.used)

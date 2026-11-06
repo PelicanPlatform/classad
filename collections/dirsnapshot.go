@@ -33,11 +33,17 @@ import (
 // garbage it held before the restart is invisible to the compaction trigger and to dead-
 // segment reclaim until new garbage accumulates. A version 1 snapshot is still read; its
 // segments' counters are then derived by a header-only walk (walkSegBounds).
+//
+// Version 3 also carries the shard's system-keyed live count, which the store subtracts
+// from the live count to report how many rows a reader sees. An older snapshot does not
+// carry it, so it is derived by a header-only walk of the same shape as the one above
+// (countSystemRecords). That walk runs once: the next snapshot written is a version 3.
 const (
 	dirSnapName      = "dir.snap"
 	dirSnapMagic     = 0x53524944 // "DIRS"
 	dirSnapVersionV1 = 1          // directory only
-	dirSnapVersion   = 2          // + per-segment scan-pruning counters
+	dirSnapVersionV2 = 2          // + per-segment scan-pruning counters
+	dirSnapVersion   = 3          // + the shard's system-keyed live count
 
 	// dirSnapEntryLen is one serialized directory entry: hash u64, slot u32, offset u32.
 	dirSnapEntryLen = 16
@@ -46,7 +52,7 @@ const (
 // dirSnapVersionKnown reports whether v is a snapshot version this build reads. The header
 // (magic, version, commit sequence) is laid out identically in every version.
 func dirSnapVersionKnown(v uint32) bool {
-	return v == dirSnapVersionV1 || v == dirSnapVersion
+	return v == dirSnapVersionV1 || v == dirSnapVersionV2 || v == dirSnapVersion
 }
 
 // dirEntryValid reports whether the directory entry h -> (seg, off) names a record that can
@@ -161,6 +167,7 @@ func writeDirSnapshot(sh *shard, shardDir string, hasher Hasher) {
 	buf = binary.LittleEndian.AppendUint32(buf, dirSnapVersion)
 	buf = binary.LittleEndian.AppendUint64(buf, sh.commitSeq)
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(sh.count))
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(sh.sysCount))
 	nSegOff := len(buf)
 	buf = binary.LittleEndian.AppendUint32(buf, 0) // segment count, back-patched below
 	var nSegs uint32
@@ -304,6 +311,10 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 	}
 	commitSeq := r.u64()
 	count := int(r.u64())
+	sysCount, sysKnown := 0, version >= dirSnapVersion
+	if sysKnown {
+		sysCount = int(r.u64())
+	}
 	nSegs := int(r.u32())
 	if r.err || nSegs != len(byName) {
 		return false // the live segment set changed since the snapshot
@@ -378,6 +389,16 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 	sh.dir = dir
 	sh.commitSeq = commitSeq
 	sh.count = count
+	if sysKnown {
+		sh.sysCount = sysCount
+	} else {
+		sh.sysCount = 0
+		for _, seg := range sh.segs {
+			if seg != nil {
+				sh.sysCount += countSystemRecords(seg, sh.appendOnly)
+			}
+		}
+	}
 	if bounds != nil {
 		for ai, seg := range sh.segs {
 			if seg != nil {

@@ -4,7 +4,10 @@ package collections
 // and capacity planning (e.g. Prometheus metrics). All byte counts are of the
 // dictionary-compressed on-arena form, not the ads' decompressed text.
 type Stats struct {
-	// Ads is the number of live keys (== Len).
+	// Ads is the number of live keys the store holds (== StoredLen). This is storage
+	// accounting, so it counts the reserved system keyspace (syskey.go) too -- those
+	// records occupy segments like any other. Len, the number of rows a reader sees,
+	// excludes them and is the smaller figure wherever a table uses them.
 	Ads int
 	// Segments is the number of arena segments across all shards.
 	Segments int

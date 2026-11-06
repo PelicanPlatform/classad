@@ -60,8 +60,14 @@ func TestSystemKeyHiddenFromClientButDurable(t *testing.T) {
 	if _, ok := d.LookupClassAd(sysKey); !ok {
 		t.Fatal("DeleteWhere(true) deleted the system record")
 	}
-	if d.Len() != 1 {
-		t.Errorf("Len = %d, want 1 (only the system record remains)", d.Len())
+	// Len counts what a reader is shown, and the system record is not among that -- it is
+	// the one thing Query above did not return and DeleteWhere did not remove. StoredLen is
+	// where it is still counted, because it is still stored.
+	if d.Len() != 0 {
+		t.Errorf("Len = %d, want 0 (the system record is not a row a reader sees)", d.Len())
+	}
+	if d.StoredLen() != 1 {
+		t.Errorf("StoredLen = %d, want 1 (the system record is still stored)", d.StoredLen())
 	}
 
 	// ForEachSystemAd yields exactly the system record.
