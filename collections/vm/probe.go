@@ -14,10 +14,11 @@ import (
 // "==","!=","<","<=",">=",">" (a single Val), "!<","!<=","!>","!>=" (a NEGATED ordering
 // comparison, which is not the flipped one -- see negOrdering), "in" (a set of Vals: the
 // attribute is == to one of them, from an OR-of-equalities or a member() call over a
-// constant list), "is"/"isnt" (=?=/=!= exact identity), or "present"/"absent"
-// (is/isnt undefined). A store matches Probes against its configured indexes to
-// build a candidate set; because the store still re-verifies the full query, any
-// Probe the planner omits only costs selectivity, never correctness.
+// constant list), "is"/"isnt" (=?=/=!= exact identity), "prefix" (the attribute's string
+// value begins with the single Val, from an anchored regexp -- see regexpPrefixProbe), or
+// "present"/"absent" (is/isnt undefined). A store matches Probes against its configured
+// indexes to build a candidate set; because the store still re-verifies the full query,
+// any Probe the planner omits only costs selectivity, never correctness.
 //
 // A query that reads CurrentTime has its probes computed with CurrentTime folded to the
 // query's pinned time (see Compile), so `CompletionDate > CurrentTime - 86400` yields a
@@ -135,6 +136,12 @@ func (q *Query) ExactProbes() (probes []Probe, exact bool) {
 // because the reference skips an element whose comparison is ERROR or UNDEFINED rather than
 // propagating it.
 func probeIsExact(c ast.Expr, p Probe) bool {
+	if p.Op == "prefix" {
+		// The literal prefix of an anchored pattern is a necessary condition for the match,
+		// never a sufficient one: `regexp("^ap40.*gpu", x)` probes "ap40" and the rest of the
+		// pattern is left to the re-verification a candidate filter always gets.
+		return false
+	}
 	switch v := unparen(c).(type) {
 	case *ast.FunctionCall:
 		identical, isMember := isMemberFunc(v.Name)
@@ -366,6 +373,9 @@ func (pc probeCtx) probeFrom(c ast.Expr) (Probe, bool) {
 	// member(attr, {constants}) is set membership.
 	if fc, ok := c.(*ast.FunctionCall); ok {
 		if p, ok := pc.memberProbe(fc); ok {
+			return p, true
+		}
+		if p, ok := pc.regexpPrefixProbe(fc); ok {
 			return p, true
 		}
 		return pc.undefinedFuncProbe(fc, false)
