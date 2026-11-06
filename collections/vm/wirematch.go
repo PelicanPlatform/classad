@@ -8,7 +8,7 @@ import (
 // Native reports whether the query compiled entirely to native instructions,
 // with no delegated (OpEvalNode) subtrees. Only native queries can be evaluated
 // with EvalResolved, because a delegated subtree needs a real ClassAd scope for
-// its function/select/subscript/list semantics.
+// its function/select/list semantics.
 //
 // A query carrying QUALIFIED references (CompileAliases) is not Native however it compiled:
 // EvalResolved's resolver is given a name and a scope, and has no way to say which side of a

@@ -154,6 +154,33 @@ const (
 	// existed; so a program carrying one is correct either way and the opcode is purely an
 	// optimization of the case where the sides are not in one record.
 	OpLoadAlias
+
+	// OpShortSubscript peeks the container already on the stack. If it is UNDEFINED or ERROR it
+	// jumps to A, leaving the container in place as the subscript's value; otherwise it falls
+	// through to the compiled index expression and the OpSubscript that follows.
+	//
+	// THE JUMP IS WHY THIS OPCODE EXISTS, and it is not an optimization. An undefined or error
+	// container settles the result whatever the index is, so an eager form would compute the same
+	// value -- but the tree-walking evaluator does not evaluate the index at all in that case, and
+	// evaluating an expression can PANIC on a cyclic reference, which the interpreter turns into
+	// ERROR for the whole program. So `Missing[Cyc]`, with Cyc self-referential, is UNDEFINED when
+	// the index is skipped and ERROR when it is not. Skipping it is the only lowering that agrees
+	// with classad.Eval.
+	//
+	// Leaving the container in place needs no write: the result for an undefined container IS
+	// undefined, and for an error container IS error.
+	OpShortSubscript
+
+	// OpSubscript pops index,container and pushes ApplySubscript(container, index) -- the element
+	// of a list at an integer index, the attribute of an ad at a string key, and ERROR for every
+	// other shape, exactly as the evaluator's subscript does. It is reached only by falling through
+	// OpShortSubscript, so the container is neither UNDEFINED nor ERROR.
+	//
+	// Compiling a subscript rather than delegating it is what lets a SCRIPT index one of its own
+	// locals: a delegated subtree is evaluated against the ad, which has never heard of a local,
+	// so `x = SomeList` followed by `x[0]` is refused when the subscript is delegated. It is also
+	// what `for` desugars onto, and what lets a registered script function contain one.
+	OpSubscript
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

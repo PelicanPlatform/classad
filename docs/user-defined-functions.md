@@ -414,11 +414,16 @@ wants to add to it. The builder API it returns is also usable directly.
 anything else is an attribute. So `want = MY.RequestMemory` binds a local, and
 every later `want` is that local, while `MY.want` always means the attribute.
 
+**A local can be indexed.** `seq = MY.Sizes` followed by `seq[0]` reads the
+local, and `rec["K"]` reads a key out of a nested ad the same way. An index past
+the end of a list is `error` rather than `undefined`, which is the reference
+engine's answer, so `?:` — which defaults only an `undefined` — does not catch
+it.
+
 **A local is not visible to every expression**, and the compiler now says so
 rather than quietly answering from the ad. A few constructs are handed to the
-tree-walking evaluator — a ternary, a list or ad literal, a subscript, a
-selection — and that evaluator resolves names against the ad, which has never
-heard of your local:
+tree-walking evaluator — a ternary, a list or ad literal, a selection — and that
+evaluator resolves names against the ad, which has never heard of your local:
 
 ```
 x = Cpus + 1
@@ -470,10 +475,10 @@ Three things a script function will not do:
   half of that applies, because a module's own functions are the ones being
   registered; whether the name is free is answered by the registry, as
   `ErrFunctionExists`.
-- **Being called from a ternary, a list or ad literal, a subscript or a
-  selection.** Those are the same constructs that cannot see a local, for the
-  same reason, and the refusal carries a line and column. Call the function from
-  a statement and use the local.
+- **Being called from a ternary, a list or ad literal, or a selection.** Those
+  are the same constructs that cannot see a local, for the same reason, and the
+  refusal carries a line and column. Call the function from a statement and use
+  the local.
 
 A function defined inside a script belongs to that script, and nothing outside it
 can call one. A script can also *call* a UDF, which is how one rule is shared

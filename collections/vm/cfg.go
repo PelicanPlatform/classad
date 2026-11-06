@@ -40,7 +40,7 @@ func stackSuccs(p *Program, ip int, buf []int) []int {
 	buf = buf[:0]
 	in := p.code[ip]
 	switch in.Op {
-	case OpShortAnd, OpShortOr, OpJmpIfNotUndef:
+	case OpShortAnd, OpShortOr, OpJmpIfNotUndef, OpShortSubscript:
 		// Conditional: taken to A, or fall through.
 		return append(buf, int(in.A), ip+1)
 	case OpJmp, OpJmpVoid:
@@ -195,7 +195,7 @@ func regSuccs(rp *RegProgram, ip int, buf []int) []int {
 	case RBranchCond:
 		t := rp.conds[in.Imm]
 		return append(buf, ip+1, int(t.onFalse), int(t.onUndef), int(t.onError))
-	case RShortAnd, RShortOr, RJmpIfDefined:
+	case RShortAnd, RShortOr, RJmpIfDefined, RShortSubscript:
 		// Defines Dst and jumps, or falls through without defining it.
 		return append(buf, int(in.T), ip+1)
 	}

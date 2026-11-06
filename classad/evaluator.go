@@ -1081,10 +1081,13 @@ func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
 }
 
 func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
-	// Evaluate the container
 	containerVal := e.Evaluate(sub.Container)
 
-	// Handle undefined and error
+	// THE INDEX IS NOT EVALUATED when the container already settles the result. That is not an
+	// optimization: evaluating an expression can panic on a cyclic reference, so `Missing[Cyc]` is
+	// undefined here and would be an error if the index ran. ApplySubscript answers the same for an
+	// undefined or error container, so a caller that evaluates both operands still gets this value
+	// -- but a compiled form has to skip the index to get this behaviour.
 	if containerVal.IsUndefined() {
 		return NewUndefinedValue()
 	}
@@ -1092,49 +1095,7 @@ func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
 		return NewErrorValue()
 	}
 
-	// Evaluate the index
-	indexVal := e.Evaluate(sub.Index)
-
-	// Handle undefined and error in index
-	if indexVal.IsUndefined() {
-		return NewUndefinedValue()
-	}
-	if indexVal.IsError() {
-		return NewErrorValue()
-	}
-
-	// Handle list subscripting with integer index
-	if containerVal.IsList() {
-		if !indexVal.IsInteger() {
-			return NewErrorValue()
-		}
-
-		index, _ := indexVal.IntValue()
-
-		// An out-of-range (including negative) list index is an error in the
-		// reference engine, not undefined.
-		if index < 0 || index >= int64(containerVal.listLen()) {
-			return NewErrorValue()
-		}
-
-		// Evaluate only the indexed element (a lazy list does not evaluate its
-		// other elements), so {selfRef, x}[1] yields x without cycling on the
-		// self-referential element.
-		return containerVal.listElementAt(int(index), e)
-	}
-
-	// Handle ClassAd subscripting with string key
-	if containerVal.IsClassAd() {
-		if !indexVal.IsString() {
-			return NewErrorValue()
-		}
-
-		ad, _ := containerVal.ClassAdValue()
-		key, _ := indexVal.StringValue()
-		return ad.EvaluateAttr(key)
-	}
-
-	return NewErrorValue()
+	return e.ApplySubscript(containerVal, e.Evaluate(sub.Index))
 }
 
 // Arithmetic operations

@@ -24,10 +24,13 @@ import (
 // be made by the compiler: only the compiler knows what is bound at a given point.
 //
 // WHERE A LOCAL CANNOT BE READ. A construct the compiler delegates to the tree-walking evaluator --
-// a conditional, a list or ad literal, a subscript, a select, a lazy built-in -- is evaluated against
-// the ad, which has never heard of a local. Reading a local from inside one is refused at compile
-// time rather than silently resolved to the attribute of the same name; see compiler.delegate and
+// a conditional, a list or ad literal, a select, a lazy built-in -- is evaluated against the ad,
+// which has never heard of a local. Reading a local from inside one is refused at compile time
+// rather than silently resolved to the attribute of the same name; see compiler.delegate and
 // LocalCaptureError for why the refusal is the right answer and not a stopgap.
+//
+// A SUBSCRIPT IS NOT ONE OF THEM: `x = SomeList` followed by `x[0]` compiles to an element load that
+// reads the register. See OpSubscript.
 //
 // WHY ONE PROGRAM. Every statement's expression is compiled into a single Program, through the same
 // compile.go emitter an expression uses, and the whole thing is lowered to registers once. Nothing

@@ -265,6 +265,11 @@ func FuzzRegisterParity(f *testing.F) {
 	for _, es := range vecExprs {
 		f.Add(`[A = 10; B = 3; F = true; S = "user3"]`, es)
 	}
+	for _, ss := range subscriptScopes {
+		for _, es := range subscriptExprs {
+			f.Add(ss, es)
+		}
+	}
 	for _, es := range []string{`Cpus ?: (Missing ?: 7)`, `Missing ?: (Cpus ?: 7)`,
 		`Cpus ?: (Missing ?: (Missing ?: 9))`, `Cpus ?: Missing ?: 7`,
 		`Missing ?: (Flag && Cpus > 2)`, `Missing ?: (Cpus > 2 || Missing2)`} {

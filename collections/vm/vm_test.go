@@ -319,6 +319,13 @@ func FuzzDifferential(f *testing.F) {
 		f.Add(`[Cpus = 4; Owner = "alice"; x = 5]`, es)
 		f.Add(`[]`, es)
 	}
+	// The element load's own corpus, over the ads it was written for: a list, an ad, the shapes
+	// that are neither, and the cyclic attributes that make the index's laziness observable.
+	for _, ss := range subscriptScopes {
+		for _, es := range subscriptExprs {
+			f.Add(ss, es)
+		}
+	}
 	f.Fuzz(func(t *testing.T, scopeSrc, exprSrc string) {
 		scopeAd, err := classad.Parse(scopeSrc)
 		if err != nil || scopeAd == nil {
