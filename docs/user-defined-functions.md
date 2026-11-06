@@ -401,9 +401,9 @@ Python-shaped statements over ordinary ClassAd expressions: `is` is `=?=`, and
 every expression between the statements is parsed by the same parser an
 attribute's value is. Blocks are introduced by `:` and delimited by indentation,
 which has to be spaces — braces were not available, since `{...}` is already a
-list literal and `[...]` an ad literal. `elif`, `else`, `while`, `pass` and the
-compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are there; `for` is not,
-and neither are writes back to the ad.
+list literal and `[...]` an ad literal. `elif`, `else`, `while`, `pass`, `def`,
+`return` and the compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are there;
+`for` is not, and neither are writes back to the ad.
 
 `ParseScriptBuilder` returns the script before compilation, for a caller that
 wants to add to it. The builder API it returns is also usable directly.
@@ -429,8 +429,50 @@ line and column. Write it as an `if`, or name the attribute explicitly with
 fix: an UNDEFINED condition evaluates both branches, which a jump cannot express
 without emitting each branch twice.
 
-A script cannot define a named function, so it is not a fifth way to write a UDF
-— though a script can *call* one.
+**A script can define its own functions**, for a rule it applies more than once:
+
+```go
+sp, err := vm.ParseScript(`
+def fits(requested, cap):
+    if requested is undefined:
+        return Optimistic
+    return requested <= cap
+
+result = fits(MY.RequestMemory, 8192) && fits(MY.RequestCpus, 16)
+`)
+```
+
+A `def` goes at the left margin — not inside an `if`, a `while` or another
+`def` — and the whole script can call it, including the lines above it. The
+parameter list may be empty. `return` with no value, and running off the end of
+the body, both give `undefined`.
+
+Inside the body, a bare name is one of three things: a parameter, a name the
+body itself assigns, or an attribute of the ad. The locals of the code that
+called it are *not* among them, so a function can be moved around the script
+without its names colliding with anything. `Optimistic` above is none of the
+first two, so it is read from the ad — a function is a function of the ad as
+well as of its arguments, and one with no parameters at all is still useful.
+
+Every argument is evaluated, left to right, before the body starts, even where
+the body never reads it.
+
+Three things a script function will not do:
+
+- **Recursion**, directly or in a cycle through other functions. A call is
+  written out in full where it appears, and something that contains itself
+  cannot be written out. The error names the cycle.
+- **Shadowing.** A `def` may not take the name of a built-in or of a registered
+  function, for the same reason a registration may not: `strcat` has to mean the
+  same thing inside the script as outside it.
+- **Being called from a ternary, a list or ad literal, a subscript or a
+  selection.** Those are the same constructs that cannot see a local, for the
+  same reason, and the refusal carries a line and column. Call the function from
+  a statement and use the local.
+
+So a script function is not a fifth way to write a UDF: it belongs to the script
+that defines it and nothing outside can call it. A script can also *call* a UDF,
+which is how one rule gets shared between scripts.
 
 The language's design, and what remains to build, are in
 [docs/SCRIPTING_LANGUAGE_DESIGN.md](SCRIPTING_LANGUAGE_DESIGN.md).
@@ -451,6 +493,7 @@ The samples above, all run by `go test`:
 | `classad/example_udf_test.go` | the Go function |
 | `collections/vm/example_scriptparse_test.go` | the ClassAd Script above |
 | `collections/vm/example_script_test.go` | the same script through the builder API |
+| `collections/vm/example_scriptfunc_test.go` | the script function above |
 | `db/example_udaf_test.go` | the Go aggregate and `CheckAggregateEqual` |
 | `wasmudf/example_test.go` | loading and registering both kinds of wasm module |
 | `wasmudf/testdata/examplepct.wat` | the wasm function |

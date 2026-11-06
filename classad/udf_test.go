@@ -279,3 +279,31 @@ func TestRegisteredFunctionsReportsAsRegistered(t *testing.T) {
 	}
 	t.Error("RegisteredFunctions did not report the name as registered")
 }
+
+// TestKnownFunctionName pins the predicate a second registry needs: whether a name is taken at all,
+// which is a wider question than whether a call of a given arity compiles natively.
+func TestKnownFunctionName(t *testing.T) {
+	mustRegister(t, "udfKnownNameProbe", 1, 1, func(args []Value) Value { return args[0] })
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"strcat", true},     // a built-in
+		{"STRCAT", true},     // folded, because a call is
+		{"ifThenElse", true}, // a LAZY built-in: StrictFunction says no, the name is still taken
+		{"random", true},     // nondeterministic, likewise
+		{"udfKnownNameProbe", true},
+		{"UDFKNOWNNAMEPROBE", true},
+		{"udfNameNobodyRegistered", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := KnownFunctionName(tc.name); got != tc.want {
+			t.Errorf("KnownFunctionName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// The narrower predicate really is narrower, which is why this one exists.
+	if StrictFunction("ifThenElse", 3) {
+		t.Error("StrictFunction accepted ifThenElse; this test no longer shows the two differ")
+	}
+}

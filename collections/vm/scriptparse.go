@@ -32,6 +32,22 @@ import (
 //	    want = want / 2
 //	result = want                   # the script's value; top level, last, exactly once
 //
+// FUNCTIONS:
+//
+//	def over_cap(requested, cap):   # top level only, and visible to the WHOLE script, so a call
+//	    if requested is undefined:  # may appear above the def that names it
+//	        return cap
+//	    return requested
+//
+// A call is expanded where it is written, which is where the rules that surprise people come from.
+// Every argument is evaluated in the caller, left to right, exactly once, before the body runs --
+// including an argument whose parameter the body never reads. The body is function-scoped: a bare
+// name in it is a parameter, a name the body itself binds, or an ATTRIBUTE of the subject ad, never
+// a local of the code that called it. A function is therefore not pure, and one with no parameters
+// is still useful: `def over(): return RequestMemory > 4096` reads the ad. `return` with no operand,
+// and falling off the end, both give UNDEFINED. Recursion is refused, directly or in a cycle,
+// because an expansion that contains itself has no end; see scriptfunc.go.
+//
 // SOFT KEYWORDS, which is a requirement and not a style choice. ClassAd attribute names are
 // case-insensitive, so `For`, `IF` and `Result` have to stay usable as attributes. A word is a
 // keyword only when it is spelled in lowercase AND leads a statement; everywhere else it lexes as an
@@ -47,12 +63,11 @@ import (
 // `if x: y = 1` would destroy that: the line would end in `1`, and finding the block colon would
 // require backtracking over an arbitrary expression.
 //
-// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), functions (`def`,
-// `return`), `break`, `continue`, `fail` and `defer` are all refused by name with a message saying
-// so. None of them has a machine behind it -- the compiler has no opcode that mutates the scope, no
-// call frame and no way out of a loop -- and a parser that accepted them would have to invent one.
-// Refusing a word the language is going to grow is a better failure than parsing it into something
-// that is not what it says.
+// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), `break`,
+// `continue`, `fail` and `defer` are all refused by name with a message saying so. None of them has
+// a machine behind it -- the compiler has no opcode that mutates the scope and no way out of a loop
+// -- and a parser that accepted them would have to invent one. Refusing a word the language is
+// going to grow is a better failure than parsing it into something that is not what it says.
 //
 // `for` IS REFUSED FOR A MORE SPECIFIC REASON, and it is worth writing down because the shape of it
 // is not obvious. A `for` over a list desugars cleanly into a counted `while` -- bind the sequence,
@@ -163,6 +178,20 @@ type resultStmt struct {
 	expr ast.Expr
 }
 
+type defStmt struct {
+	stmtAt
+	name   string
+	params []string
+	body   []stmt
+}
+
+// returnStmt carries a nil expr for a bare `return`, which is a return of UNDEFINED and not a
+// statement with a missing part.
+type returnStmt struct {
+	stmtAt
+	expr ast.Expr
+}
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
@@ -177,6 +206,10 @@ type scriptParser struct {
 	// indentation level", and it is worth detecting because the alternative -- silently treating it
 	// as the nearest enclosing block -- puts a statement somewhere the author did not write it.
 	levels []int
+
+	// inFunc says whether a function body is being parsed, which is what makes `return` a statement
+	// and `result` still not one.
+	inFunc bool
 }
 
 func (p *scriptParser) parseTop() ([]stmt, error) {
@@ -205,10 +238,15 @@ func (p *scriptParser) checkResult(stmts []stmt) error {
 		if _, ok := s.(*resultStmt); !ok {
 			continue
 		}
-		if i != len(stmts)-1 {
-			// Blamed on the statement that cannot run, not on the result, because that is the line
+		for _, later := range stmts[i+1:] {
+			// A `def` is a declaration rather than a step, so it may sit below the result it is
+			// called from -- the same freedom a call above the definition has. Anything else is
+			// blamed on the statement that cannot run, not on the result, because that is the line
 			// the author has to delete or move.
-			return p.pos.errorAt(stmts[i+1].at(), "no statements may follow 'result'")
+			if _, isDef := later.(*defStmt); isDef {
+				continue
+			}
+			return p.pos.errorAt(later.at(), "no statements may follow 'result'")
 		}
 		return nil
 	}
@@ -301,7 +339,13 @@ func (p *scriptParser) statement(indent int) (stmt, error) {
 			return nil, p.pos.errorAt(after, "expected end of line after 'pass'")
 		}
 		return nil, nil
-	case "break", "continue", "def", "return", "del", "fail", "defer":
+	case "def":
+		p.idx++
+		return p.defLine(ln, after, indent)
+	case "return":
+		p.idx++
+		return p.returnLine(ln, after)
+	case "break", "continue", "del", "fail", "defer":
 		return nil, p.at(ln, fmt.Sprintf("'%s' is not implemented in ClassAd Script", word))
 	case "result":
 		p.idx++
@@ -347,6 +391,80 @@ func (p *scriptParser) ifChain(ln scriptLine, after, indent int, kw string) (stm
 		out.els = els
 	}
 	return out, nil
+}
+
+// defLine parses `def NAME(p1, p2):` and the indented body that follows it.
+//
+// TOP LEVEL ONLY. A function is a name the whole script can call, so there is nothing for a `def`
+// inside an `if` to mean: the branch it sits in decides whether a line runs, not whether a name
+// exists, and the call sites were compiled before the branch is reached. Nesting one inside another
+// `def` is refused for the same reason and one more -- a nested function would read the enclosing
+// body's parameters, which is a closure, and nothing here captures anything.
+func (p *scriptParser) defLine(ln scriptLine, after, indent int) (stmt, error) {
+	if indent != 0 || p.inFunc {
+		return nil, p.at(ln, "'def' must be a top-level statement: a function is visible to the "+
+			"whole script, so there is nothing for one nested inside a block to mean")
+	}
+	end, err := p.blockColon(ln, after, "def")
+	if err != nil {
+		return nil, err
+	}
+	name, params, err := p.defHeader(after, end)
+	if err != nil {
+		return nil, err
+	}
+	p.inFunc = true
+	body, err := p.block(ln, indent, "def")
+	p.inFunc = false
+	if err != nil {
+		return nil, err
+	}
+	return &defStmt{stmtAt: stmtAt{ln.off}, name: name, params: params, body: body}, nil
+}
+
+// defHeader reads `NAME(p1, p2)` out of the range between `def` and the block colon.
+func (p *scriptParser) defHeader(from, to int) (string, []string, error) {
+	from, to = trimRange(p.clean, from, to)
+	text := p.text(from, to)
+	open := strings.IndexByte(text, '(')
+	if open < 0 || !strings.HasSuffix(text, ")") {
+		return "", nil, p.pos.errorAt(from, "expected a function name and a parameter list, as in 'def f(x):'")
+	}
+	name := strings.TrimSpace(text[:open])
+	if !isBareIdent(name) {
+		return "", nil, p.pos.errorAt(from, fmt.Sprintf("expected a function name, found %q", name))
+	}
+	inner := strings.TrimSpace(text[open+1 : len(text)-1])
+	if inner == "" {
+		// `def now():` -- a function of the ad alone, which is a function like any other here,
+		// since a body reads attributes whether or not it has parameters.
+		return name, nil, nil
+	}
+	var params []string
+	for _, part := range strings.Split(inner, ",") {
+		pname := strings.TrimSpace(part)
+		if !isBareIdent(pname) {
+			return "", nil, p.pos.errorAt(from+open+1,
+				fmt.Sprintf("expected a parameter name, found %q", pname))
+		}
+		params = append(params, pname)
+	}
+	return name, params, nil
+}
+
+// returnLine parses `return` and `return <expr>`.
+func (p *scriptParser) returnLine(ln scriptLine, after int) (stmt, error) {
+	if !p.inFunc {
+		return nil, p.at(ln, "'return' outside a function body: the script's value is 'result'")
+	}
+	if p.text(after, ln.end) == "" {
+		return &returnStmt{stmtAt: stmtAt{ln.off}}, nil
+	}
+	expr, err := p.expr(after, ln.end)
+	if err != nil {
+		return nil, err
+	}
+	return &returnStmt{stmtAt: stmtAt{ln.off}, expr: expr}, nil
 }
 
 // resultLine parses `result = <expr>`.
@@ -682,11 +800,27 @@ func identPart(c byte) bool {
 // Lowering into the builder
 // ---------------------------------------------------------------------------
 
-// emitScript walks the statement tree, making the Let/If/While/Result calls a hand-written builder
-// script would have made.
+// emitScript walks the statement tree, making the Let/If/While/Func/Return/Result calls a
+// hand-written builder script would have made.
+//
+// Every `def` is declared before any statement is lowered, so a call may appear above the function
+// it names. The builder would allow that anyway -- it compiles nothing until Compile -- but this
+// parser flushes after each statement to keep a refusal attached to the line that caused it, and
+// the flush is what would otherwise make a forward call fail.
 func emitScript(stmts []stmt, pos *posIndex) (*Script, error) {
 	s := NewScript()
 	e := &emitter{pos: pos}
+	for _, st := range stmts {
+		d, ok := st.(*defStmt)
+		if !ok {
+			continue
+		}
+		before := s.err
+		s.Func(d.name, d.params, func(sc *Script) { e.block(sc, d.body) })
+		if before == nil && s.err != nil {
+			return nil, e.pos.errorAt(d.at(), detailOf(s.err))
+		}
+	}
 	e.block(s, stmts)
 	if e.err != nil {
 		return nil, e.err
@@ -708,21 +842,35 @@ type emitter struct {
 // reason: this is the only place that still knows which line the compiler was lowering when it
 // refused. Compile sees a finished program and a single recorded refusal, by which time the
 // statement it came from is gone and the user is told what is wrong without being told where.
+//
+// The flush is what makes that true now that the builder stages its statements: without it the
+// compiler would not have run yet, and every refusal would surface at Compile with no line.
 func (e *emitter) block(s *Script, stmts []stmt) {
 	for _, st := range stmts {
 		if e.err != nil {
 			return
 		}
-		had := s.c.capture != nil
+		hadCapture := s.c.capture != nil
+		hadErr := s.err
 		e.one(s, st)
-		if !had && s.c.capture != nil {
+		s.flush()
+		switch {
+		case !hadCapture && s.c.capture != nil:
 			e.err = e.pos.errorAt(st.at(), captureDetail(s.c.capture))
+		case hadErr == nil && s.err != nil:
+			e.err = e.pos.errorAt(st.at(), detailOf(s.err))
 		}
 	}
 }
 
+// detailOf renders a builder error for a diagnostic that supplies its own position, dropping the
+// package prefix the builder's own callers need.
+func detailOf(err error) string {
+	return strings.TrimPrefix(strings.TrimPrefix(err.Error(), "vm: "), "script: ")
+}
+
 // one makes the builder call for a single statement. `pass` reaches here as no statement at all, so
-// there is nothing to do for it and nothing to name.
+// there is nothing to do for it and nothing to name. A `def` was declared before this walk began.
 func (e *emitter) one(s *Script, st stmt) {
 	switch v := st.(type) {
 	case *letStmt:
@@ -733,6 +881,9 @@ func (e *emitter) one(s *Script, st stmt) {
 		s.If(v.cond, e.suite(v.then), e.suite(v.els))
 	case *whileStmt:
 		s.While(v.cond, e.suite(v.body))
+	case *returnStmt:
+		s.Return(v.expr)
+	case *defStmt:
 	}
 }
 

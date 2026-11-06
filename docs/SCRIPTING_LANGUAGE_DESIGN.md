@@ -310,14 +310,38 @@ def over_cap(requested, cap):
     return requested
 ```
 
+A `def` is a top-level statement, and its name is visible to the whole script: a call may appear
+above the definition it names.
+
+- **A call is expanded where it is written.** There is no call instruction, no frame and no return
+  address; the script is still one program lowered to registers once. Each expansion gets its own
+  parameter, body-local and result registers, named for the call (`over_cap#2.cap`) so a register
+  dump says which call a value belongs to.
 - Parameters are locals; call is by value, with §2.5's forcing rule applied to each argument.
-- `return` with no operand returns `undefined`. Falling off the end returns `undefined`.
+  Arguments are evaluated in the caller's scope, left to right, exactly once each, before the body
+  runs — including an argument whose parameter the body never reads, which is observable because an
+  argument can fault.
+- The body is **function-scoped**: a bare name in it is a parameter, a name the body itself binds,
+  or an attribute of the subject ad. The caller's locals are not visible.
+- A function is **not pure**. A bare name the body does not bind is an attribute, so
+  `def over(): return RequestMemory > 4096` is a function of the ad as well as of its arguments.
+- `return` with no operand returns `undefined`. Falling off the end returns `undefined`. Both come
+  from the result register having no store that reaches the epilogue, which is what the register
+  lowering already initializes to `undefined`.
 - **No closures, no default arguments, no `*args`, no keyword arguments, no nested `def`.**
-- Recursion is permitted and bounded per record by the call-depth limit (§3.2), not forbidden. A
-  non-recursive function is inlined by the optimizer (§6.8), which is what lets liveness and CSE see
-  across the call.
-- A function may read and write the subject ad in the scalar context, so it is not required to be
-  pure.
+- **Recursion is refused**, directly or mutually, with an error naming the cycle. The reason is the
+  inlining rather than a missing keyword: expanding a call means expanding whatever that call
+  expands to, and a cycle has no end. No depth limit would make it work, because the expansion
+  happens at compile time and the depth is not known then.
+- The expanded program is **bounded**. Nesting is multiplicative — a function that calls another
+  twice, which calls a third twice, expands the third four times — so a script that expands more
+  than 256 calls is refused rather than compiled.
+- A call inside a construct the compiler delegates to the tree-walking evaluator — a conditional, a
+  list or ad literal, a subscript, a select, a lazy built-in — is **refused**, for the same reason a
+  local read in that position is: the evaluator resolves a function name against the built-ins and
+  the registry, where a script's own function does not appear, and would quietly answer `ERROR`.
+- A `def` may not shadow a built-in or a registered function, which is `classad.RegisterFunction`'s
+  rule and the same one: shadowing would fork expression semantics inside one script.
 
 **Host-registered functions.** The host may register additional strict built-ins; the registration
 must be declared to the compiler so arity checking matches the evaluator's
@@ -1102,8 +1126,8 @@ that a trivial allocator is no longer good enough.
    expression-level folding and propagating `Const`-form registers through the IR. A `Const` predicate
    turns a predicated region into a compile-time branch, which is how short-circuiting over literals
    stops costing anything (§5.2).
-6. **Inlining of non-recursive script functions**, because it is what lets liveness and CSE see across
-   a call. Recursive functions are not inlined and keep a real call frame.
+6. Inlining is not on this list: a script function is expanded at its call site by the compiler
+   (§2.6), so liveness and CSE already see across a call and a recursive one is refused outright.
 7. **Compile-time unrolling of a `for` over a `Const` list**, which is both the common case and the
    only way such a loop vectorizes at all (§2.3).
 8. **Dead code and dead store elimination**, which falls out of SSA and matters here because a dead

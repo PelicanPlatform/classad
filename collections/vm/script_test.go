@@ -736,3 +736,43 @@ func TestScriptWhileNesting(t *testing.T) {
 		t.Errorf("seen after a loop that never ran = %s, want undefined", got)
 	}
 }
+
+// TestScriptReadSetIsTheProgramsReads pins that the read set is what the compiled program loads
+// from the ad, rather than the statements' bare names minus the locals.
+//
+// The two differ wherever a name is read before it is bound. `x = x + 1` reads the ATTRIBUTE x --
+// that is the binding rule -- so x is a column the script needs, and a planner that does not know
+// it skips a column the script will ask for.
+func TestScriptReadSetIsTheProgramsReads(t *testing.T) {
+	reads := func(t *testing.T, src string) map[string]bool {
+		t.Helper()
+		sp, err := ParseScript(src)
+		if err != nil {
+			t.Fatalf("compile %q: %v", src, err)
+		}
+		out := map[string]bool{}
+		for _, n := range sp.Program().ReadAttrs() {
+			out[strings.ToLower(n)] = true
+		}
+		return out
+	}
+
+	// Read before bound: the attribute really is read.
+	if got := reads(t, "x = x + 1\nresult = x\n"); !got["x"] {
+		t.Errorf("read set %v omits x, which `x = x + 1` reads from the ad", got)
+	}
+	// Bound before read, and never read as an attribute: not a column at all.
+	if got := reads(t, "x = Cpus\nresult = x + x\n"); got["x"] {
+		t.Errorf("read set %v contains x, which is only ever the local", got)
+	} else if !got["cpus"] {
+		t.Errorf("read set %v omits Cpus", got)
+	}
+	// A scoped reference is not an unscoped read, and the local it names is still not one.
+	if got := reads(t, "x = MY.Cpus\nresult = x\n"); len(got) != 0 {
+		t.Errorf("read set %v should be empty: MY.Cpus is scoped and x is a local", got)
+	}
+	// A delegated subtree reads the ad, so its names count.
+	if got := reads(t, "result = {Owner, 1}\n"); !got["owner"] {
+		t.Errorf("read set %v omits Owner, which the delegated list literal reads", got)
+	}
+}

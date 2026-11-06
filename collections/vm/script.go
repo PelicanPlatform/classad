@@ -31,8 +31,19 @@ import (
 //
 // WHY ONE PROGRAM. Every statement's expression is compiled into a single Program, through the same
 // compile.go emitter an expression uses, and the whole thing is lowered to registers once. Nothing
-// is inlined and nothing is re-lowered: a local that three statements read is computed once and read
-// from a register three times, which is the property the reduction law below actually tests.
+// is re-lowered: a local that three statements read is computed once and read from a register three
+// times, which is the property the reduction law below actually tests.
+//
+// FUNCTIONS. Func and Return define a function the script can call, and a call is EXPANDED WHERE IT
+// IS WRITTEN -- there is no call instruction and no frame, so the program stays one program. A
+// body's bare name is a parameter, a name the body binds, or an attribute; the caller's locals are
+// not visible to it, which is the one thing a function changes about the binding model above. The
+// rest of what a function means, and why recursion is refused rather than bounded, is in
+// scriptfunc.go.
+//
+// WHEN A STATEMENT IS COMPILED. Statements are recorded as they are written and compiled by
+// Compile, which is what lets a call be written above the Func that defines it. A caller that wants
+// a refusal attributed to the statement that caused it flushes after each one; the parser does.
 //
 // A LOCAL IS A PLACE. Each one has a single register for the whole script, written by OpStoreLocal
 // and read by OpLoadLocal, and every statement leaves the stack as it found it. An earlier model
@@ -60,14 +71,68 @@ type Script struct {
 	byName map[string]int32
 	hasRes bool
 	err    error
+
+	// staged holds the statements not yet emitted, and emitting says whether they are being
+	// emitted right now. A statement is recorded rather than compiled on the spot so that a call
+	// to a function DEFINED LATER in the script still resolves: Func registers a definition the
+	// moment it is called, and no statement has been compiled yet when it does. See flush.
+	staged   []func()
+	emitting bool
+
+	// funcs holds the function definitions, by folded name, and inlining is the chain of
+	// definitions currently being expanded -- the one that makes a cycle findable and nameable.
+	funcs    map[string]*funcDef
+	inlining []string
+
+	// fn is the state of the innermost inline expansion, nil outside one.
+	fn *inlineFrame
+
+	// expansions counts the inline expansions in this script, against maxInlineExpansions.
+	expansions int
+
+	// loopDepth is how many While bodies enclose the statement being emitted. An inline expansion
+	// inside one can run more than once, which is the only case where a call has to reset its own
+	// registers rather than rely on their program-start initialization. See expandCall.
+	loopDepth int
 }
 
 // NewScript returns an empty script.
 func NewScript() *Script {
-	return &Script{
-		c:      &compiler{p: &Program{}, seen: map[string]bool{}},
+	s := &Script{
+		c:      &compiler{p: &Program{}},
 		byName: map[string]int32{},
+		funcs:  map[string]*funcDef{},
 	}
+	s.c.inlineCall = s.expandCall
+	s.c.isScriptFunc = s.isScriptFunc
+	return s
+}
+
+// stage records a statement, or runs it if the script is already emitting -- which it is whenever a
+// statement comes from inside an If, a While or a function body, since those run their blocks as
+// part of being emitted.
+func (s *Script) stage(f func()) {
+	if s.emitting {
+		f()
+		return
+	}
+	s.staged = append(s.staged, f)
+}
+
+// flush emits every statement staged so far, in the order they were written.
+//
+// Calling it is idempotent and it is safe to call at any point: a caller that wants errors
+// attributed to the statement that caused them -- the parser does -- flushes after each one.
+func (s *Script) flush() {
+	if s.emitting {
+		return
+	}
+	s.emitting = true
+	for i := 0; i < len(s.staged); i++ {
+		s.staged[i]()
+	}
+	s.staged = nil
+	s.emitting = false
 }
 
 // foldLocal normalizes a local's name the way ClassAd normalizes an attribute's, so `X` and `x` are
@@ -80,17 +145,22 @@ func foldLocal(name string) string {
 // value and the old one stays live only for the statements that already read it, which is what
 // `x = x + 1` has to mean.
 func (s *Script) Let(name string, expr ast.Expr) *Script {
+	s.stage(func() { s.letNow(name, expr) })
+	return s
+}
+
+func (s *Script) letNow(name string, expr ast.Expr) {
 	if s.err != nil {
-		return s
+		return
 	}
 	if s.hasRes {
 		s.err = errors.New("vm: Let after Result")
-		return s
+		return
 	}
 	folded := foldLocal(name)
 	if folded == "" {
 		s.err = errors.New("vm: empty local name")
-		return s
+		return
 	}
 	// Emitted BEFORE the name is bound here, so the right-hand side sees whatever the name meant
 	// previously: the attribute on a first binding, the previous local on a rebinding. That is the
@@ -98,13 +168,22 @@ func (s *Script) Let(name string, expr ast.Expr) *Script {
 	s.emitExpr(expr)
 	idx, existing := s.byName[folded]
 	if !existing {
+		display := name
+		if s.fn != nil {
+			// Inside a function body the register belongs to THIS expansion, not to the script, so
+			// its name says which instance it came from. Two calls to the same function have two
+			// registers named alike otherwise, and a register dump is then unreadable.
+			display = s.fn.prefix + name
+		}
 		idx = int32(len(s.c.p.locals))
-		s.c.p.locals = append(s.c.p.locals, name)
+		s.c.p.locals = append(s.c.p.locals, display)
 		s.byName[folded] = idx
+		if s.fn != nil {
+			s.fn.bodyRegs = append(s.fn.bodyRegs, idx)
+		}
 	}
 	s.c.ins(OpStoreLocal, idx)
 	s.c.locals = s.byName
-	return s
 }
 
 // If runs then when cond is true and els when it is false. Either block may be nil.
@@ -118,12 +197,17 @@ func (s *Script) Let(name string, expr ast.Expr) *Script {
 // after the If sees whatever path ran. Where no path bound it, it reads UNDEFINED, because the
 // lowering can see that no store reaches that read.
 func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
+	s.stage(func() { s.ifNow(cond, then, els) })
+	return s
+}
+
+func (s *Script) ifNow(cond ast.Expr, then, els func(*Script)) {
 	if s.err != nil {
-		return s
+		return
 	}
 	if s.hasRes {
 		s.err = errors.New("vm: If after Result")
-		return s
+		return
 	}
 	s.c.p.hasStatements = true
 	s.emitExpr(cond)
@@ -153,7 +237,6 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 	}
 	s.c.patch(jThen, end)
 	s.c.patch(jElse, end)
-	return s
 }
 
 // While runs body for as long as cond is true.
@@ -170,12 +253,17 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 // answer, and nothing the compiler can check would tell it apart from a loop that happens to run a
 // long time. The step budget in RunRegistersLimited is what bounds it.
 func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
+	s.stage(func() { s.whileNow(cond, body) })
+	return s
+}
+
+func (s *Script) whileNow(cond ast.Expr, body func(*Script)) {
 	if s.err != nil {
-		return s
+		return
 	}
 	if s.hasRes {
 		s.err = errors.New("vm: While after Result")
-		return s
+		return
 	}
 	header := len(s.c.p.code)
 	s.c.p.hasStatements = true
@@ -185,7 +273,9 @@ func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 	s.c.ins(OpBranchVoid, k)
 
 	if body != nil {
+		s.loopDepth++
 		body(s)
+		s.loopDepth--
 	}
 	// The back edge. Every other jump this compiler emits goes forward; this one does not, and the
 	// lowering needs no special case for it because targets are resolved after the whole program is
@@ -200,21 +290,24 @@ func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 		onFalse: int32(end), onUndef: int32(onFault), onError: int32(onFault), end: int32(end),
 		loop: true, header: int32(header),
 	}
-	return s
 }
 
 // Result sets the script's value. It must be called last and exactly once.
 func (s *Script) Result(expr ast.Expr) *Script {
+	s.stage(func() { s.resultNow(expr) })
+	return s
+}
+
+func (s *Script) resultNow(expr ast.Expr) {
 	if s.err != nil {
-		return s
+		return
 	}
 	if s.hasRes {
 		s.err = errors.New("vm: Result called twice")
-		return s
+		return
 	}
 	s.emitExpr(expr)
 	s.hasRes = true
-	return s
 }
 
 // emitExpr compiles one statement's expression into the shared program.
@@ -223,9 +316,6 @@ func (s *Script) Result(expr ast.Expr) *Script {
 // natively is delegated whole, so the tree-walker's own recursion limit governs it identically. A
 // script does not change that, because a statement's expression is still just an expression.
 func (s *Script) emitExpr(expr ast.Expr) {
-	// Accumulated across statements, as CompileProgram accumulates it for one expression. It
-	// over-approximates by including names that turn out to be locals; Compile removes those.
-	s.c.p.readAttrs = collectReads(expr, s.c.seen, s.c.p.readAttrs)
 	if astHeight(expr) >= maxNativeDepth {
 		s.c.delegate(expr)
 		return
@@ -241,6 +331,7 @@ type ScriptProgram struct {
 
 // Compile lowers the script to a single register program.
 func (s *Script) Compile() (*ScriptProgram, error) {
+	s.flush()
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -250,20 +341,46 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 	if !s.hasRes {
 		return nil, ErrNoResult
 	}
-	// readAttrs is the union over the statements MINUS the locals: a local is not an attribute, and
-	// a planner told otherwise would look for a column that does not exist. collectReads has already
-	// accumulated every unscoped name, including the ones that turned out to be locals, because it
-	// walks the AST and the AST cannot tell them apart.
-	kept := s.c.p.readAttrs[:0]
-	for _, name := range s.c.p.readAttrs {
-		if _, isLocal := s.byName[foldLocal(name)]; !isLocal {
-			kept = append(kept, name)
-		}
-	}
-	s.c.p.readAttrs = kept
+	s.c.p.readAttrs = s.scriptReads()
 	s.c.p.vops = vopPrefix(s.c.p.code)
 	s.c.p.refSlots, s.c.p.nColSlots = colSlots(s.c.p.refs)
 	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
+}
+
+// scriptReads is the set of attribute names the compiled script may read, in first-seen order.
+//
+// It is read off the COMPILED PROGRAM rather than off the statements' syntax, because the compiler
+// is the only thing that knows which bare names turned out to be attributes. Two sources, which
+// between them are every way a script reaches the ad:
+//
+//   - p.refs, the unscoped references emitted as OpLoadRef. A bare name that was a local is not
+//     among them: it compiled to OpLoadLocal instead.
+//   - the unscoped names inside p.nodes, the subtrees handed to the tree-walking evaluator, which
+//     resolves every one of them against the ad. A delegated subtree that reads a local is refused
+//     before this runs, so none of these is a local either.
+//
+// COLLECTING THE SYNTAX AND SUBTRACTING THE LOCALS IS A DIFFERENT ANSWER, and wrong in both
+// directions. `x = x + 1` reads the ATTRIBUTE x before it binds the local, so subtracting x drops a
+// read the script really makes and leaves a planner unaware of a column the script needs. And a
+// function's parameters and body locals belong to an expansion whose name map no longer exists by
+// the time this runs, so there is nothing left to subtract them by. Asking the program removes both
+// problems, because the program already distinguishes a load from the ad from a load from a
+// register.
+func (s *Script) scriptReads() []string {
+	seen := make(map[string]bool, len(s.c.p.refs))
+	var out []string
+	for i := range s.c.p.refs {
+		r := &s.c.p.refs[i]
+		if r.scope != ast.NoScope || seen[r.name] {
+			continue
+		}
+		seen[r.name] = true
+		out = append(out, r.name)
+	}
+	for _, n := range s.c.p.nodes {
+		out = collectReads(n, seen, out)
+	}
+	return out
 }
 
 // Run evaluates the script against scope and returns its result, under the default instruction
