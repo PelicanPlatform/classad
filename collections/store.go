@@ -882,7 +882,7 @@ func New(opts Options) *Collection {
 	// per-segment scan can read the value whether records are inline- or id-encoded; the
 	// zone map is keyed by id, which zonePrune/age-retention resolve names to via c.intern.
 	// zoneInline is finalized in Open (a persistent collection stores inline names).
-	if opts.AppendOnly && (len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0) {
+	if len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0 {
 		var zattrs []zoneAttr
 		seen := map[uint32]struct{}{}
 		addZone := func(name string) {
