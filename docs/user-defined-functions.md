@@ -456,21 +456,34 @@ the end of a list is `error` rather than `undefined`, which is the reference
 engine's answer, so `?:` — which defaults only an `undefined` — does not catch
 it.
 
-**A local is not visible to every expression**, and the compiler now says so
-rather than quietly answering from the ad. A few constructs are handed to the
-tree-walking evaluator — a ternary, a list or ad literal, a selection — and that
-evaluator resolves names against the ad, which has never heard of your local:
+**A local reads the same everywhere it appears.** A few constructs are handed to
+the tree-walking evaluator rather than compiled — a ternary, a selection, a lazy
+built-in such as `strcat` or `ifThenElse` — and they run with the script's locals
+overlaid on the ad, so a bare bound name there is the local:
 
 ```
 x = Cpus + 1
-result = x ? 2 : 3      # refused: the ternary would read the ATTRIBUTE x
+result = x ? 2 : 3      # the ternary reads the LOCAL x
 ```
 
-That used to compute silently from the wrong `x`. It is now an error carrying the
-line and column. Write it as an `if`, or name the attribute explicitly with
-`MY.x` if that is what you meant. The ternary is not an oversight waiting on a
-fix: an UNDEFINED condition evaluates both branches, which a jump cannot express
-without emitting each branch twice.
+`MY.x` is the attribute there as everywhere, which is how you say you meant the
+ad.
+
+**Three places still cannot read a local**, and each is refused with a line and
+column rather than answered from the ad:
+
+```
+x = Cpus
+result = {x, 1}                     # a list literal
+result = [a = x].a                  # an ad literal
+result = countMatches(x, MY.GPUs)   # a per-ad context
+```
+
+Each of those evaluates in a scope of its own. A list literal is the clearest
+case: its elements are evaluated on demand, in a scope captured when the list was
+built, which may be long after the script has finished and its locals are gone.
+Bind the whole construct to a local first, or write `MY.x` if the attribute was
+what you meant.
 
 **A script can define its own functions**, for a rule it applies more than once:
 
@@ -518,10 +531,12 @@ Three things a script function will not do:
   half of that applies, because a module's own functions are the ones being
   registered; whether the name is free is answered by the registry, as
   `ErrFunctionExists`.
-- **Being called from a ternary, a list or ad literal, or a selection.** Those
-  are the same constructs that cannot see a local, for the same reason, and the
-  refusal carries a line and column. Call the function from a statement and use
-  the local.
+- **Being called from a construct that is evaluated rather than compiled** — a
+  ternary, a list or ad literal, a selection. That evaluator resolves a function
+  name against the built-ins and the registered functions, and a script's own
+  function is in neither, so the call would be `error`. The refusal carries a
+  line and column. Call the function from a statement and use the local, which a
+  ternary can read.
 
 A function defined inside a script belongs to that script, and nothing outside it
 can call one. A script can also *call* a UDF, which is how one rule is shared

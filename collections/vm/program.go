@@ -64,8 +64,12 @@ type Program struct {
 	refs      []refInfo       // OpLoadRef
 	aliasRefs []aliasRef      // OpLoadAlias
 	nodes     []ast.Expr      // OpEvalNode (delegated subtrees)
-	funcs     []funcInfo      // OpCallFunc
-	conds     []condTargets   // OpBranchCond
+	// nodeLocals[i] are the script locals nodes[i] reads, with the register each one lives in.
+	// Parallel to nodes, and empty at every index for an ordinary expression program, which has no
+	// locals. See evalDelegated.
+	nodeLocals [][]localBind
+	funcs      []funcInfo    // OpCallFunc
+	conds      []condTargets // OpBranchCond
 
 	// members are the constant lists of member/identicalMember calls (OpMember).
 	members []*memberSet

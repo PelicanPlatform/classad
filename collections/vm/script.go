@@ -23,11 +23,17 @@ import (
 // x, and a later `x` is the local. That is the Python rule, and it is the reason the decision has to
 // be made by the compiler: only the compiler knows what is bound at a given point.
 //
-// WHERE A LOCAL CANNOT BE READ. A construct the compiler delegates to the tree-walking evaluator --
-// a conditional, a list or ad literal, a select, a lazy built-in -- is evaluated against the ad,
-// which has never heard of a local. Reading a local from inside one is refused at compile time
-// rather than silently resolved to the attribute of the same name; see compiler.delegate and
-// LocalCaptureError for why the refusal is the right answer and not a stopgap.
+// A DELEGATED CONSTRUCT READS LOCALS TOO. A conditional, a select or a lazy built-in is evaluated
+// by the tree-walking evaluator rather than compiled, and it runs with the script's locals overlaid
+// on the ad, so `result = x ? 2 : 3` reads the local x. The overlay answers only the bare names the
+// compiler resolved to locals, so MY.x is the attribute there as everywhere. See compiler.delegate
+// and evalDelegated.
+//
+// THREE POSITIONS CANNOT READ ONE: a list literal's elements, an ad literal's attribute values, and
+// the first argument of countMatches or evalInEachContext. Each is evaluated in an evaluator of its
+// own, built from a captured scope -- a list literal's elements possibly long after the script has
+// finished -- and a local read in one is refused with LocalCaptureError rather than silently
+// resolved to the attribute of the same name.
 //
 // A SUBSCRIPT IS NOT ONE OF THEM: `x = SomeList` followed by `x[0]` compiles to an element load that
 // reads the register. See OpSubscript.
@@ -470,9 +476,10 @@ func (s *Script) compile(preset []int32) (*ScriptProgram, error) {
 //
 //   - p.refs, the unscoped references emitted as OpLoadRef. A bare name that was a local is not
 //     among them: it compiled to OpLoadLocal instead.
-//   - the unscoped names inside p.nodes, the subtrees handed to the tree-walking evaluator, which
-//     resolves every one of them against the ad. A delegated subtree that reads a local is refused
-//     before this runs, so none of these is a local either.
+//   - the unscoped names inside p.nodes, the subtrees handed to the tree-walking evaluator, MINUS
+//     the ones that subtree reads from a register. A delegated subtree runs with its locals
+//     overlaid on the ad (see evalDelegated), so a name the overlay answers is not a column the
+//     planner has to find -- and telling it otherwise sends it looking for one that may not exist.
 //
 // COLLECTING THE SYNTAX AND SUBTRACTING THE LOCALS IS A DIFFERENT ANSWER, and wrong in both
 // directions. `x = x + 1` reads the ATTRIBUTE x before it binds the local, so subtracting x drops a
@@ -492,8 +499,18 @@ func (s *Script) scriptReads() []string {
 		seen[r.name] = true
 		out = append(out, r.name)
 	}
-	for _, n := range s.c.p.nodes {
-		out = collectReads(n, seen, out)
+	for i, n := range s.c.p.nodes {
+		binds := s.c.p.nodeLocals[i]
+		// A fresh seen map per node, because the filter is per node: the same name may be a local
+		// in one delegated subtree and an attribute in another, and the shared map would let
+		// whichever came first decide for both.
+		for _, name := range collectReads(n, map[string]bool{}, nil) {
+			if seen[name] || lookupBind(binds, name) >= 0 {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
 	}
 	return out
 }
@@ -547,9 +564,11 @@ func (sp *ScriptProgram) VecEval(src ColumnSource, n int, scratch *VecScratch) (
 
 // Program returns the underlying stack-form program.
 //
-// It is NOT runnable by the stack interpreter: a script's local loads are resolved by the register
-// lowering and have no stack-form implementation. It is exposed for the planner's read set and for
-// tests that inspect the compiled shape.
+// A script with statement-level control flow -- an If, a While, a fault site -- is NOT runnable by
+// the stack interpreter, which has no implementation for a statement jump. A straight-line script
+// is, local bindings and all, which is what lets the two interpreters be checked against each other
+// on the same program. It is exposed for the planner's read set and for tests that inspect the
+// compiled shape.
 func (sp *ScriptProgram) Program() *Program { return sp.p }
 
 // RegProgram returns the compiled register program.
