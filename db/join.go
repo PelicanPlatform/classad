@@ -232,6 +232,18 @@ type JoinStats struct {
 	BuildSideWhy      string
 	BuildSideCost     int
 	BuildSideSwapCost int
+
+	// ChainFromAlias names the table a chain was re-planned to read FROM, empty when the
+	// chain was left as written. ChainOrderWhy says why on either answer, and the two costs
+	// are what the chosen plan and the plan as written were priced at in records touched.
+	//
+	// The FROM side of a chain is where every step's index probe gets its keys, so this is
+	// the decision that says whether the chain reads its tables through an index at all --
+	// and, like a swap, it changes the order the rows come out in.
+	ChainFromAlias          string
+	ChainOrderWhy           string
+	ChainOrderCost          int
+	ChainOrderAsWrittenCost int
 }
 
 // JoinProbeStat is one step's index-probe decision.
@@ -450,7 +462,7 @@ func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, unordered
 	// Which side streams is decided before anything is compiled, so the whole pipeline
 	// below -- the plan, the probe, the pair loop -- sees one spec and needs to know
 	// nothing about the choice.
-	spec = cat.planBuildSide(spec, unordered, stats)
+	spec = cat.planJoinOrder(spec, unordered, stats)
 	p, err := compileJoin(spec, limits)
 	if err != nil {
 		return nil, err

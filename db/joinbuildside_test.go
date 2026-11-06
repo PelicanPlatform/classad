@@ -133,6 +133,9 @@ func TestBuildSideSwapEligibility(t *testing.T) {
 		spec      func() JoinSpec
 		want      bool
 		why       string
+		// chain, when set, says this spec is not this planner's to decide: the build-side
+		// planner must report nothing and the chain planner must report this instead.
+		chain string
 	}{{
 		name: "mutable tables promise no order",
 		spec: func() JoinSpec { return bsSpec("small", "big") },
@@ -153,7 +156,10 @@ func TestBuildSideSwapEligibility(t *testing.T) {
 		want: false,
 		why:  "LEFT join",
 	}, {
-		name: "a chain is read as written",
+		// A chain's FROM side is decided by joinchainorder.go, which asks a different
+		// question -- which of three or more tables to read FROM -- and answers it against
+		// a cost model of its own. This planner must not also answer it.
+		name: "a chain is not this planner's to decide",
 		spec: func() JoinSpec {
 			return JoinSpec{
 				Left: JoinSide{Table: "small", Alias: "l"},
@@ -163,8 +169,8 @@ func TestBuildSideSwapEligibility(t *testing.T) {
 				}},
 			}
 		},
-		want: false,
-		why:  "chain",
+		want:  false,
+		chain: "reading FROM r holds",
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			cat := buildSideFixture(t, 50, 2000, tc.unordered)
@@ -174,6 +180,16 @@ func TestBuildSideSwapEligibility(t *testing.T) {
 			}
 			if tc.why != "" && !strings.Contains(st.BuildSideWhy, tc.why) {
 				t.Errorf("reason %q does not mention %q", st.BuildSideWhy, tc.why)
+			}
+			if tc.chain == "" {
+				return
+			}
+			if st.BuildSideWhy != "" {
+				t.Errorf("the build-side planner decided a chain: %q", st.BuildSideWhy)
+			}
+			if !strings.Contains(st.ChainOrderWhy, tc.chain) {
+				t.Errorf("the chain planner reported %q, want it to mention %q",
+					st.ChainOrderWhy, tc.chain)
 			}
 		})
 	}
