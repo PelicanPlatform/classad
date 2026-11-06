@@ -316,3 +316,34 @@ func TestScriptFuncConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestScriptFuncDelegatedHintFitsWhatWasFound pins that the refusal's advice is chosen from the
+// construct that caused it. One fixed hint listed every workaround at once, so the author of a list
+// literal was told to rewrite a ternary they had not written.
+func TestScriptFuncDelegatedHintFitsWhatWasFound(t *testing.T) {
+	refusal := func(t *testing.T, src string) string {
+		t.Helper()
+		m, err := ParseScriptModule(src)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if _, cerr := m.Compile("f"); cerr != nil {
+			return cerr.Error()
+		}
+		t.Fatal("expected a refusal")
+		return ""
+	}
+
+	ternary := refusal(t, "def f(x):\n    return (1 ? 2 : 3)\n")
+	if !strings.Contains(ternary, "`if` statement") {
+		t.Errorf("a ternary should be told about `if`; got %q", ternary)
+	}
+
+	list := refusal(t, "def f(x):\n    return size({1, 2, 3})\n")
+	if strings.Contains(list, "ternary") {
+		t.Errorf("a list literal should not be told to rewrite a ternary; got %q", list)
+	}
+	if !strings.Contains(list, "{1, 2, 3}") {
+		t.Errorf("the refusal should name what it found; got %q", list)
+	}
+}
