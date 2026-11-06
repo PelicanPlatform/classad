@@ -247,9 +247,13 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		}
 		sort.Strings(keys)
 		bmOffs := make([]uint32, len(keys))
+		// Its own error variable, not the one the attribute blocks above assign: a later
+		// use of that one would make the shadowing declaration inside the value-block loop
+		// matter, which govet's shadow check reports and which this loop has no need of.
 		for i, k := range keys {
-			if bmOffs[i], err = emit(cp.post[k]); err != nil {
-				return nil, err
+			var emitErr error
+			if bmOffs[i], emitErr = emit(cp.post[k]); emitErr != nil {
+				return nil, emitErr
 			}
 		}
 		excOff, offErr := emit(cp.exc)
