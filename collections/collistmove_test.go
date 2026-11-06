@@ -445,7 +445,7 @@ func TestListMovesDowngrade(t *testing.T) {
 			}
 			checkFormReaders(t, g, "moved back")
 			sameReads(t, "moved back", before, collectRawReads(t, g.c, !archive))
-			if err := g.close(); err != nil {
+			if err = g.close(); err != nil {
 				t.Fatal(err)
 			}
 			if rep, err = Fsck(dir); err != nil {
@@ -873,7 +873,7 @@ func TestListMovesOnDiskDamage(t *testing.T) {
 		t.Fatal(err)
 	}
 	data[at] ^= 0xFF
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err = os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	rep, err := Fsck(dir)
@@ -1119,7 +1119,7 @@ func TestListMovesFsckFindsUndecodableSection(t *testing.T) {
 		t.Fatal(err)
 	}
 	at := bytes.Index(data, comp)
-	if at < 0 || bytes.Index(data[at+1:], comp) >= 0 {
+	if at < 0 || bytes.Contains(data[at+1:], comp) {
 		t.Fatal("the list column is not found exactly once in its segment")
 	}
 	for i := range comp {
@@ -1133,7 +1133,7 @@ func TestListMovesFsckFindsUndecodableSection(t *testing.T) {
 	if !recVerifyCRC(data, recOff) {
 		t.Fatal("the re-sealed payload does not verify")
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err = os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	rep, err := Fsck(dir)
