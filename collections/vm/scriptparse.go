@@ -29,8 +29,14 @@ import (
 //	else:
 //	    pass
 //	while want > 65536:
+//	    if want is error:
+//	        break                   # leave the innermost enclosing 'while'
 //	    want = want / 2
 //	result = want                   # the script's value; top level, last, exactly once
+//
+// `break` leaves the innermost enclosing `while` and `continue` starts its next iteration, which
+// re-tests the condition exactly as falling off the end of the body does. Both take no operand, and
+// both are refused with a line and column when no loop encloses them.
 //
 // FUNCTIONS:
 //
@@ -48,6 +54,11 @@ import (
 // and falling off the end, both give UNDEFINED. Recursion is refused, directly or in a cycle,
 // because an expansion that contains itself has no end; see scriptfunc.go.
 //
+// A `break` or a `continue` in a body is bound by a loop IN THAT BODY, and refused when there is
+// none -- including when the call itself sits inside a loop. The expansion puts the body's
+// instructions inside the caller's loop, so a `break` bound by the call site would make the same
+// function mean one thing where it is called from a loop and nothing at all where it is not.
+//
 // SOFT KEYWORDS, which is a requirement and not a style choice. ClassAd attribute names are
 // case-insensitive, so `For`, `IF` and `Result` have to stay usable as attributes. A word is a
 // keyword only when it is spelled in lowercase AND leads a statement; everywhere else it lexes as an
@@ -63,11 +74,11 @@ import (
 // `if x: y = 1` would destroy that: the line would end in `1`, and finding the block colon would
 // require backtracking over an arbitrary expression.
 //
-// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), `break`,
-// `continue`, `fail` and `defer` are all refused by name with a message saying so. None of them has
-// a machine behind it -- the compiler has no opcode that mutates the scope and no way out of a loop
-// -- and a parser that accepted them would have to invent one. Refusing a word the language is
-// going to grow is a better failure than parsing it into something that is not what it says.
+// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), `fail` and
+// `defer` are all refused by name with a message saying so. None of them has a machine behind it --
+// the compiler has no opcode that mutates the scope -- and a parser that accepted them would have
+// to invent one. Refusing a word the language is going to grow is a better failure than parsing it
+// into something that is not what it says.
 //
 // `for` IS REFUSED FOR A MORE SPECIFIC REASON, and it is worth writing down because the shape of it
 // is not obvious. A `for` over a list desugars cleanly into a counted `while` -- bind the sequence,
@@ -192,6 +203,13 @@ type returnStmt struct {
 	expr ast.Expr
 }
 
+// breakStmt and continueStmt carry nothing but their position. Which loop each one names is settled
+// by the builder, which is the only thing that knows the loop's addresses; the parser does not even
+// track whether one encloses the statement.
+type breakStmt struct{ stmtAt }
+
+type continueStmt struct{ stmtAt }
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
@@ -225,6 +243,50 @@ func (p *scriptParser) parseTop() ([]stmt, error) {
 		return nil, err
 	}
 	return stmts, p.checkResult(stmts)
+}
+
+// parseModuleTop parses a MODULE: top-level `def` statements and nothing else.
+//
+// It is parseTop's sibling rather than a mode of it, because the two differ in exactly one place --
+// what a top-level statement may be -- and a flag threaded through parseTop would put that question
+// somewhere a reader of either language has to answer it.
+//
+// Everything below the top level is identical: a `def` body is parsed by the same code whichever
+// entry point reached it, so there is no possibility of a statement meaning one thing in a script
+// and another in a module.
+func (p *scriptParser) parseModuleTop() ([]stmt, error) {
+	if len(p.lines) == 0 {
+		return nil, fmt.Errorf("%w: the source is empty", ErrNoFunctions)
+	}
+	if p.lines[0].indent != 0 {
+		return nil, p.at(p.lines[0], "unexpected indent: the first statement must start at column 1")
+	}
+	p.levels = []int{0}
+	stmts, err := p.statements(0)
+	if err != nil {
+		return nil, err
+	}
+	for _, st := range stmts {
+		if _, isDef := st.(*defStmt); isDef {
+			continue
+		}
+		// A `result` gets its own message because it is the mistake an author of scripts makes
+		// first, and because "this is not a def" does not say what to do about it.
+		if _, isResult := st.(*resultStmt); isResult {
+			return nil, p.pos.errorAt(st.at(), "a module has no 'result': it defines functions "+
+				"rather than computing a value, and each function's value is its 'return'")
+		}
+		// Everything else, a binding included. A top-level binding has no moment at which it would
+		// be computed: a module is never run, only the functions it exports are, each with its own
+		// registers. Bind inside the function that needs the value.
+		return nil, p.pos.errorAt(st.at(), "a module holds only 'def' statements at the top level: "+
+			"a module is not run, so there is no point at which a statement outside a function "+
+			"would execute")
+	}
+	if len(stmts) == 0 {
+		return nil, fmt.Errorf("%w: the source holds no statements", ErrNoFunctions)
+	}
+	return stmts, nil
 }
 
 // checkResult enforces that `result` is present, top level, and last.
@@ -345,7 +407,17 @@ func (p *scriptParser) statement(indent int) (stmt, error) {
 	case "return":
 		p.idx++
 		return p.returnLine(ln, after)
-	case "break", "continue", "del", "fail", "defer":
+	case "break", "continue":
+		p.idx++
+		if p.text(after, ln.end) != "" {
+			return nil, p.pos.errorAt(after, fmt.Sprintf("expected end of line after '%s': it "+
+				"takes no operand", word))
+		}
+		if word == "break" {
+			return &breakStmt{stmtAt{ln.off}}, nil
+		}
+		return &continueStmt{stmtAt{ln.off}}, nil
+	case "del", "fail", "defer":
 		return nil, p.at(ln, fmt.Sprintf("'%s' is not implemented in ClassAd Script", word))
 	case "result":
 		p.idx++
@@ -855,6 +927,10 @@ func (e *emitter) block(s *Script, stmts []stmt) {
 		e.one(s, st)
 		s.flush()
 		switch {
+		case e.err != nil:
+			// A statement whose lowering expanded a call already blamed the line INSIDE the body
+			// that the compiler refused, through this same loop one level down. That line is the
+			// one the author edits, so the statement that contained the call does not take it over.
 		case !hadCapture && s.c.capture != nil:
 			e.err = e.pos.errorAt(st.at(), captureDetail(s.c.capture))
 		case hadErr == nil && s.err != nil:
@@ -883,6 +959,10 @@ func (e *emitter) one(s *Script, st stmt) {
 		s.While(v.cond, e.suite(v.body))
 	case *returnStmt:
 		s.Return(v.expr)
+	case *breakStmt:
+		s.Break()
+	case *continueStmt:
+		s.Continue()
 	case *defStmt:
 	}
 }

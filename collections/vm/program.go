@@ -97,6 +97,13 @@ type Program struct {
 	// 2% of an expression scan and which an expression can never use.
 	hasStatements bool
 
+	// hasLoopJump marks a program holding a `break` or a `continue`. It is set by the script
+	// builder for the vector executor, which recognises an If by the shape of the jumps between its
+	// arms and a While by its back edge, and has no region for a jump that leaves a loop early or
+	// restarts it from inside an arm. See execVec, which declines such a program to the per-record
+	// path rather than running a shape it would read as some other construct.
+	hasLoopJump bool
+
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick
 	// the hot-header fast path; nil-safe to ignore.

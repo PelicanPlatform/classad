@@ -89,6 +89,21 @@ const maxInlineExpansions = 256
 //
 // The body is a block, exactly as If's and While's are, and it ends its value with Return.
 func (s *Script) Func(name string, params []string, body func(*Script)) *Script {
+	return s.defineFunc(name, params, body, true)
+}
+
+// defineFunc is Func, with the refusal of a name the process registry already holds made optional.
+//
+// A script keeps it (refuseRegistered true): a script function that shadowed a registered one would
+// make a call inside the script mean something other than the same call outside it.
+//
+// A MODULE's definitions do not, and the reason is what a module is for. Its functions become
+// registrations, so the one that is being registered IS the name in the registry, and its siblings
+// would stop compiling the moment it got there -- registering one function of a module would break
+// the rest. Whether a module's name may be taken is a question about the registry, answered where
+// registration happens, by classad.RegisterFunction returning ErrFunctionExists. A built-in is still
+// refused, by the module parser, because that answer never changes while the process runs.
+func (s *Script) defineFunc(name string, params []string, body func(*Script), refuseRegistered bool) *Script {
 	if s.err != nil {
 		return s
 	}
@@ -97,7 +112,7 @@ func (s *Script) Func(name string, params []string, body func(*Script)) *Script 
 	case !isBareIdent(name):
 		s.err = fmt.Errorf("vm: script: %q is not a name a call can spell", name)
 		return s
-	case classad.KnownFunctionName(name):
+	case refuseRegistered && classad.KnownFunctionName(name):
 		// The same refusal classad.RegisterFunction makes, for the same reason: a script function
 		// that shadowed one would make `strcat(a, b)` mean something different inside this script
 		// than in every expression outside it, and a script's expressions are ClassAd expressions.
@@ -177,7 +192,7 @@ func (s *Script) expandCall(v *ast.FunctionCall) bool {
 		s.c.ins(OpPushError, 0)
 		return true
 	}
-	s.inline(fd, v)
+	s.inline(fd, v.Args)
 	return true
 }
 
@@ -199,8 +214,14 @@ func (s *Script) inlineCheck(fd *funcDef, v *ast.FunctionCall) error {
 	return nil
 }
 
-// inline emits one expansion.
-func (s *Script) inline(fd *funcDef, v *ast.FunctionCall) {
+// inline emits one expansion and returns the parameter locals it allocated, in declaration order.
+//
+// args are the caller's argument expressions, one per parameter. They are NIL when the expansion is
+// not a call written in a script but a whole function compiled on its own, whose parameters are
+// filled from values before it runs rather than by code inside it; see scriptmodule.go. The locals
+// are returned for that caller, which needs to know where to put those values, and ignored by
+// every other.
+func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 	s.expansions++
 	frame := &inlineFrame{
 		prefix: fmt.Sprintf("%s#%d.", fd.name, s.expansions),
@@ -210,11 +231,15 @@ func (s *Script) inline(fd *funcDef, v *ast.FunctionCall) {
 	// The arguments, in the CALLER's scope: left to right, each evaluated once into its parameter's
 	// register. Emitted before the scope is swapped, which is the whole of call-by-value here.
 	params := make(map[string]int32, len(fd.params))
+	paramLocals := make([]int32, len(fd.params))
 	for i, p := range fd.params {
 		reg := s.newFuncReg(frame.prefix + p)
-		s.c.emit(v.Args[i])
-		s.c.ins(OpStoreLocal, reg)
+		if args != nil {
+			s.c.emit(args[i])
+			s.c.ins(OpStoreLocal, reg)
+		}
 		params[foldLocal(p)] = reg
+		paramLocals[i] = reg
 	}
 
 	// An expansion inside a loop runs more than once, and its registers are the program's, written
@@ -230,8 +255,10 @@ func (s *Script) inline(fd *funcDef, v *ast.FunctionCall) {
 		bodyStart = len(s.c.p.code)
 	}
 
-	outerByName, outerFrame := s.byName, s.fn
-	s.byName, s.fn = params, frame
+	// The loop stack is cleared for the body, not just the name map: a `break` in the body is bound
+	// by a loop in the BODY, never by the loop this call happens to sit inside. See Script.Break.
+	outerByName, outerFrame, outerLoops := s.byName, s.fn, s.loops
+	s.byName, s.fn, s.loops = params, frame, nil
 	s.c.locals = s.byName
 	fd.active = true
 	s.inlining = append(s.inlining, fd.name)
@@ -240,7 +267,7 @@ func (s *Script) inline(fd *funcDef, v *ast.FunctionCall) {
 
 	s.inlining = s.inlining[:len(s.inlining)-1]
 	fd.active = false
-	s.byName, s.fn = outerByName, outerFrame
+	s.byName, s.fn, s.loops = outerByName, outerFrame, outerLoops
 	s.c.locals = s.byName
 
 	jumps := frame.retJumps
@@ -268,6 +295,7 @@ func (s *Script) inline(fd *funcDef, v *ast.FunctionCall) {
 		s.c.patch(j, epilogue)
 	}
 	s.c.ins(OpLoadLocal, frame.retReg)
+	return paramLocals
 }
 
 // newFuncReg allocates a program local for an expansion. It is deliberately NOT entered in any name
