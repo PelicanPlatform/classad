@@ -73,6 +73,13 @@ func buildFormFixture(t *testing.T, dir string, n, excEvery int, archive, intern
 // buildFormFixtureGen is buildFormFixture over the records gen writes.
 func buildFormFixtureGen(t *testing.T, dir string, n, excEvery int, archive, interned bool, gen func(i, excEvery int) string) *formFixture {
 	t.Helper()
+	return buildFormFixtureOpts(t, dir, n, excEvery, archive, interned, 0, gen)
+}
+
+// buildFormFixtureOpts is buildFormFixtureGen with Options.MoveListColumns set to moves, for this open and
+// every reopen.
+func buildFormFixtureOpts(t *testing.T, dir string, n, excEvery int, archive, interned bool, moves int, gen func(i, excEvery int) string) *formFixture {
+	t.Helper()
 	src := make(map[int64]*classad.ClassAd, n)
 	for i := range n {
 		src[int64(i)] = mustAd(t, gen(i, excEvery))
@@ -81,7 +88,7 @@ func buildFormFixtureGen(t *testing.T, dir string, n, excEvery int, archive, int
 	open = func(fresh bool) *formFixture {
 		f := &formFixture{archive: archive, src: src, ever: maps.Clone(src)}
 		if archive {
-			opts := ArchiveOptions{Dir: dir, SegmentSize: 1 << 16, GroupSchemaCount: -1, InternAtSeal: interned}
+			opts := ArchiveOptions{Dir: dir, SegmentSize: 1 << 16, GroupSchemaCount: -1, InternAtSeal: interned, MoveListColumns: moves}
 			var a *Archive
 			var err error
 			if fresh {
@@ -101,7 +108,7 @@ func buildFormFixtureGen(t *testing.T, dir string, n, excEvery int, archive, int
 				}
 			}
 		} else {
-			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1, WatchHistory: 64,
+			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1, WatchHistory: 64, MoveListColumns: moves,
 				TimeTravel: &TimeTravelOptions{MaxDistance: time.Hour, CheckpointInterval: time.Millisecond}})
 			if err != nil {
 				t.Fatal(err)

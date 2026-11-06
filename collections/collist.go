@@ -26,15 +26,14 @@ import (
 // real, a bitmap for a boolean, a per-block dictionary plus codes for a string -- with a child validity
 // bitmap when some element is UNDEFINED.
 //
-// A COPY, NOT A MOVE. The list stays in the record, byte for byte as it was written, and nothing about
-// the record, the escape bits or the scalar columns changes. So every reader that rebuilds an ad or
-// ships an attribute -- reassembly, projection, raw wire, text and redacted renders, re-columnarization,
-// compaction, fsck -- reads exactly the bytes it read before and never consults the copy; it cannot emit
-// the copy in place of the attribute because it does not know the copy exists. Only the list built-ins'
-// vector path (vm/veclist.go) reads it. Moving the list out of the record instead would save the bytes
-// the copy costs, but every form reader would then have to splice the list back byte-identically, and a
-// build that predates the move would have to refuse the payload (it refuses any payload version it does
-// not know) -- a rollback that cannot start.
+// A COPY, AND THEN A MOVE. The column is built as a copy: the list stays in the record, byte for byte as
+// it was written, and nothing about the record, the escape bits or the scalar columns changes. Unless
+// Options.MoveListColumns is negative, each cell whose stored bytes the column reproduces exactly is then
+// moved out of its record, which keeps a placeholder in its place (collistmove.go); the readers that
+// decompress a remnant put the list back before anything looks at the record, so every reader that
+// rebuilds an ad or ships an attribute -- reassembly, projection, raw wire, text and redacted renders,
+// re-columnarization, compaction, fsck -- sees exactly the bytes it saw before. Only the list built-ins'
+// vector path (vm/veclist.go) reads the column as a column.
 //
 // WHEN A CELL QUALIFIES. A record's value goes into the column only when it is a list literal whose every
 // element is UNDEFINED or a literal of the field's element kind -- int, real, string or boolean, chosen
@@ -51,12 +50,13 @@ import (
 // not entitled to sealed values replaces every reference to such an attribute with UNDEFINED before
 // planning (keylessQuery), so it never loads the column.
 //
-// ON DISK. The copy rides in a trailer after the computed-value trailer (colExtTrailer), which a build
-// that reads extension trailers skips section by section. A build that predates it reads every record
-// identically -- the records are unchanged -- but stops trusting the trailers that precede it on that
-// payload (its trailer parser wants them to end the payload), so such a segment reads there as one
-// columnarized before remnant-name lists and computed values: correct, and slower until it is
-// re-columnarized or the build rolls forward.
+// ON DISK. While every list is still in its record, the columns ride in a trailer after the computed-value
+// trailer (colExtTrailer), which a build that reads extension trailers skips section by section. A build
+// that predates it reads every record identically -- the records are unchanged -- but stops trusting the
+// trailers that precede it on that payload (its trailer parser wants them to end the payload), so such a
+// segment reads there as one columnarized before remnant-name lists and computed values: correct, and
+// slower until it is re-columnarized or the build rolls forward. A segment with a moved cell keeps its
+// columns in the payload body instead (version 3; see collistmove.go).
 
 // colListColumns gates writing list columns at columnarize time. A test seam; production leaves it true.
 var colListColumns = true
@@ -750,7 +750,9 @@ func readExtTrailer(rest []byte, cs *colSegment, internName func(string) uint32)
 		if c.err != nil {
 			return false
 		}
-		if tag == colExtLists {
+		// A version 3 body already holds the lists, and they are the only copy: a trailer section must
+		// not replace them.
+		if tag == colExtLists && !cs.listsInBody {
 			readListSection(body, cs, internName)
 		}
 	}
@@ -819,7 +821,9 @@ func readListSection(body []byte, cs *colSegment, internName func(string) uint32
 func (cs *colSegment) dropTrailerState() {
 	for _, b := range cs.blocks {
 		b.ccols, b.ccBlob, b.computed, b.computedComp = nil, nil, nil, nil
-		b.listIDs, b.listNames, b.listComp = nil, nil, nil
+		if !cs.listsInBody { // a version 3 body's lists did not come from a trailer
+			b.listIDs, b.listNames, b.listComp = nil, nil, nil
+		}
 	}
 }
 

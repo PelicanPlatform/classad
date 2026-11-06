@@ -356,9 +356,9 @@ func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []b
 	}
 	// The remnant as it was before its block's dictionary replaced repeated nodes with references. No
 	// reader past this point -- the splice, nor anything that consumes the whole ad -- ever sees one.
-	blk, _ := cn.blockFor(k)
+	blk, local := cn.blockFor(k)
 	sc := getRecBuf()
-	rem, expanded, err := blk.expandRemnant(raw, cn.cache, sc)
+	rem, expanded, err := blk.expandRemnant(raw, local, cn.cache, sc)
 	if err != nil {
 		putRecBuf(sc)
 		return nil, err

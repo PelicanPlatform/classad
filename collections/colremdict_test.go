@@ -830,7 +830,7 @@ func TestBuildRemnantDictSelection(t *testing.T) {
 		if !bytes.Contains(b, sealed) {
 			t.Fatalf("body %d lost its sealed node to the dictionary", i)
 		}
-		got, expanded, err := expandRemnantWith(b, region, len(entries), nil)
+		got, expanded, err := expandRemnantWith(b, region, len(entries), nil, nil)
 		if err != nil || !expanded || !bytes.Equal(got, orig[i]) {
 			t.Fatalf("body %d expands to %x (expanded=%v err=%v), want %x", i, got, expanded, err, orig[i])
 		}
@@ -851,7 +851,7 @@ func TestExpandRemnantRefusesUnresolvedReferences(t *testing.T) {
 	ref := func(j uint64) []byte { return binary.AppendUvarint([]byte{wire.TagExternalRef}, j) }
 	region := remnantDictRegion([][]byte{expr})
 	body := remDictBody(t, "M", ref(0))
-	if got, ok, err := expandRemnantWith(body, region, 1, nil); err != nil || !ok || !bytes.Equal(got, remDictBody(t, "M", expr)) {
+	if got, ok, err := expandRemnantWith(body, region, 1, nil, nil); err != nil || !ok || !bytes.Equal(got, remDictBody(t, "M", expr)) {
 		t.Fatalf("a valid reference: %x %v %v", got, ok, err)
 	}
 	cases := map[string]struct {
@@ -867,14 +867,14 @@ func TestExpandRemnantRefusesUnresolvedReferences(t *testing.T) {
 		"region claims too many": {body, region, 9},
 	}
 	for name, cse := range cases {
-		if got, _, err := expandRemnantWith(cse.body, cse.region, cse.n, nil); err == nil {
+		if got, _, err := expandRemnantWith(cse.body, cse.region, cse.n, nil, nil); err == nil {
 			t.Errorf("%s: expanded to %x, want errRemnantRef", name, got)
 		}
 	}
 	// A block without a dictionary hands the bytes on untouched -- and wire refuses them, rather than
 	// read the reference as a value.
 	var b columnarBlock
-	got, expanded, err := b.expandRemnant(body, nil, nil)
+	got, expanded, err := b.expandRemnant(body, 0, nil, nil)
 	if err != nil || expanded || !bytes.Equal(got, body) {
 		t.Fatalf("no dictionary: %x %v %v", got, expanded, err)
 	}

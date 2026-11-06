@@ -43,7 +43,8 @@ import (
 //
 // READERS. Exactly three places decompress a columnarized remnant -- recordWireIn (which every full-ad
 // read, splice, merge, compaction, reseal, index and zone build goes through), projectFromColumns and the
-// held-cell pass -- and each expands it before looking inside (expandRemnant). A reference that does not
+// held-cell pass -- and each expands it before looking inside (expandRemnant), which also puts back the
+// lists moved out into list columns (collistmove.go). A reference that does not
 // resolve fails the read: it is never handed on, and wire's readers reject the tag as malformed rather
 // than read it as a value.
 //
@@ -71,7 +72,7 @@ func (c *Collection) writeRemnantDict() bool {
 const colRemDictSection = 0x54434452 // "RDCT" on disk (little-endian)
 
 // errRemnantRef is a columnarized record holding a dictionary reference its block cannot resolve.
-var errRemnantRef = errors.New("collections: columnarized record holds a remnant dictionary reference that does not resolve")
+var errRemnantRef = errors.New("collections: columnarized record holds a remnant dictionary reference or moved list placeholder that does not resolve")
 
 // remnantRefFailures counts record reads refused with errRemnantRef.
 var remnantRefFailures atomic.Int64
@@ -86,7 +87,8 @@ var remnantDictEntries atomic.Int64
 
 // remnantEntries walks the n attribute entries of a remnant's body, calling fn with each key's bytes and
 // node's bytes, and reports whether they parse to exactly the body's end. A node holding a dictionary
-// reference is TagExternalRef and a uvarint; any other node is measured in the record's key encoding.
+// reference is TagExternalRef and a uvarint, and one holding a moved list (collist.go) TagListRef and a
+// uvarint; any other node is measured in the record's key encoding.
 func remnantEntries(ents []byte, n int, inline bool, fn func(key, node []byte) bool) bool {
 	p := 0
 	for range n {
@@ -106,7 +108,7 @@ func remnantEntries(ents []byte, n int, inline bool, fn func(key, node []byte) b
 			return false
 		}
 		ns := p
-		if ents[p] == wire.TagExternalRef {
+		if t := ents[p]; t == wire.TagExternalRef || t == wire.TagListRef {
 			_, w := binary.Uvarint(ents[p+1:])
 			if w <= 0 {
 				return false
@@ -127,9 +129,9 @@ func remnantEntries(ents []byte, n int, inline bool, fn func(key, node []byte) b
 }
 
 // remnantDictCandidate reports whether a remnant node may become a dictionary entry: a value no column
-// took (not a literal), not sealed, and not already a reference.
+// took (not a literal), not sealed, and not already a reference or a moved list's placeholder.
 func remnantDictCandidate(node []byte) bool {
-	if len(node) == 0 || node[0] == wire.TagExternalRef || wire.IsEncryptedNode(node) {
+	if len(node) == 0 || node[0] == wire.TagExternalRef || node[0] == wire.TagListRef || wire.IsEncryptedNode(node) {
 		return false
 	}
 	return !storableInColumn(node)
@@ -226,9 +228,10 @@ func buildRemnantDict(bodies [][]byte) [][]byte {
 		}
 		rw := wire.BuildAd(nil, ps[i].hdr, ps[i].n, out)
 		// Proved, not assumed: the rewrite must expand to the original bytes, or the record keeps them.
+		// A moved list's placeholder is part of those bytes, and is kept as it is.
 		var err error
 		var expanded bool
-		exp, expanded, err = expandRemnantWith(rw, region, len(entries), exp[:0])
+		exp, expanded, err = expandRemnantWith(rw, region, len(entries), nil, exp[:0])
 		if err != nil || !expanded || !bytes.Equal(exp, b) {
 			continue
 		}
@@ -283,7 +286,12 @@ func remnantDictEntry(region []byte, n, j int) ([]byte, bool) {
 // entries, appending the result to dst. expanded is false when raw holds no reference, in which case raw
 // itself is the answer and dst is untouched. A reference that does not resolve, or a body that does not
 // parse, is errRemnantRef.
-func expandRemnantWith(raw, region []byte, n int, dst []byte) ([]byte, bool, error) {
+//
+// list resolves a moved list's placeholder (TagListRef and the field's index among the block's list
+// fields, collist.go) into the list node this record held. With list nil the placeholders are copied as
+// they are, which only the dictionary builder wants: it proves its own rewrite over bodies that already
+// hold them. A placeholder that does not resolve is errRemnantRef, like a dictionary reference.
+func expandRemnantWith(raw, region []byte, n int, list func(j uint64) ([]byte, bool), dst []byte) ([]byte, bool, error) {
 	hdr, ents, cnt, inline, ok := wire.Ad(raw).SplitBody()
 	if !ok {
 		return nil, false, errRemnantRef
@@ -292,7 +300,7 @@ func expandRemnantWith(raw, region []byte, n int, dst []byte) ([]byte, bool, err
 	// hold a reference, but copying a record that holds none would be pure waste.
 	refs := 0
 	if !remnantEntries(ents, cnt, inline, func(_, node []byte) bool {
-		if node[0] == wire.TagExternalRef {
+		if node[0] == wire.TagExternalRef || (list != nil && node[0] == wire.TagListRef) {
 			refs++
 		}
 		return true
@@ -308,6 +316,16 @@ func expandRemnantWith(raw, region []byte, n int, dst []byte) ([]byte, bool, err
 	bad := false
 	remnantEntries(ents, cnt, inline, func(key, node []byte) bool {
 		dst = append(dst, key...)
+		if node[0] == wire.TagListRef && list != nil {
+			j, _ := binary.Uvarint(node[1:])
+			l, ok := list(j)
+			if !ok {
+				bad = true
+				return false
+			}
+			dst = append(dst, l...)
+			return true
+		}
 		if node[0] != wire.TagExternalRef {
 			dst = append(dst, node...)
 			return true
@@ -331,19 +349,33 @@ func expandRemnantWith(raw, region []byte, n int, dst []byte) ([]byte, bool, err
 	return dst, true, nil
 }
 
-// expandRemnant expands record raw's dictionary references against block b's dictionary, read through
-// bc. With no dictionary on the block the record holds no reference and is returned as it is (expanded
-// false); otherwise see expandRemnantWith. A failure is counted.
-func (b *columnarBlock) expandRemnant(raw []byte, bc *blockCache, dst []byte) ([]byte, bool, error) {
-	if b == nil || b.remDictN == 0 {
+// expandRemnant expands record raw's dictionary references against block b's dictionary, and its moved
+// lists' placeholders against b's list columns, both read through bc; k is the record's row in b. With
+// neither on the block the record holds no reference and is returned as it is (expanded false); otherwise
+// see expandRemnantWith. A failure is counted.
+func (b *columnarBlock) expandRemnant(raw []byte, k int, bc *blockCache, dst []byte) ([]byte, bool, error) {
+	if b == nil || (b.remDictN == 0 && b.listMoved == 0) {
 		return raw, false, nil
 	}
-	region, err := bc.stream(b, kindRemDict)
-	if err != nil {
-		remnantRefFailures.Add(1)
-		return nil, false, errRemnantRef
+	var region []byte
+	if b.remDictN > 0 {
+		r, err := bc.stream(b, kindRemDict)
+		if err != nil {
+			remnantRefFailures.Add(1)
+			return nil, false, errRemnantRef
+		}
+		region = r
 	}
-	out, expanded, err := expandRemnantWith(raw, region, b.remDictN, dst)
+	var list func(j uint64) ([]byte, bool)
+	if b.listMoved > 0 {
+		nodes, err := bc.listNodes(b)
+		if err != nil {
+			remnantRefFailures.Add(1)
+			return nil, false, errRemnantRef
+		}
+		list = func(j uint64) ([]byte, bool) { return listNodeAt(nodes, j, k) }
+	}
+	out, expanded, err := expandRemnantWith(raw, region, b.remDictN, list, dst)
 	if err != nil {
 		remnantRefFailures.Add(1)
 	}

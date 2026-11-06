@@ -129,7 +129,13 @@ func listColumnsHeld(c *Collection) int {
 
 func buildListFixture(t *testing.T, n int, archive, interned bool) *formFixture {
 	t.Helper()
-	f := buildFormFixtureGen(t, t.TempDir(), n, 50, archive, interned, listAd)
+	return buildListFixtureMoves(t, n, archive, interned, 0)
+}
+
+// buildListFixtureMoves is buildListFixture with Options.MoveListColumns set to moves.
+func buildListFixtureMoves(t *testing.T, n int, archive, interned bool, moves int) *formFixture {
+	t.Helper()
+	f := buildFormFixtureOpts(t, t.TempDir(), n, 50, archive, interned, moves, listAd)
 	f.extraProj = [][]string{{"ChildCpus"}, {"ChildState", "ChildGroup", "ChildRank"}, {"ChildFlags", "AllUndef", "ChildExpr"}}
 	if listColumnsHeld(f.c) == 0 {
 		t.Fatal("no columnarized block keeps a list column")
@@ -149,6 +155,10 @@ func buildListFixture(t *testing.T, n int, archive, interned bool) *formFixture 
 	}
 	if !odd {
 		t.Fatal("every block with list columns is a multiple of 64 records; the fixture should mix sizes")
+	}
+	// Moving is on unless the caller turned it off, so the tests over this fixture read moved lists.
+	if moved := listMovedCells(f.c); (moves >= 0) != (moved > 0) {
+		t.Fatalf("MoveListColumns %d, but %d list cells were moved", moves, moved)
 	}
 	return f
 }
@@ -420,7 +430,7 @@ func mustListNode(t *testing.T, src string) []byte {
 // later build adds is skipped while the list section beside it is still read -- and bytes after the
 // trailers that are not an extension trailer drop every trailer, computed values and lists included.
 func TestListTrailerSkipsUnknownSections(t *testing.T) {
-	f := buildListFixture(t, 900, true, false)
+	f := buildListFixtureMoves(t, 900, true, false, -1) // the trailer carries lists only while they are copies
 	var cs *colSegment
 	for _, sh := range f.c.shards {
 		for _, seg := range sh.segs {

@@ -111,7 +111,7 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 		}
 		buf = raw
 		// Expanded: the walk below must step over every node, and a reference is not one wire knows.
-		if e, expanded, eerr := blk.expandRemnant(raw, bc, exp[:0]); eerr != nil {
+		if e, expanded, eerr := blk.expandRemnant(raw, i-(blkEnd-blk.n), bc, exp[:0]); eerr != nil {
 			return nil, false
 		} else if expanded {
 			exp, raw = e, e
