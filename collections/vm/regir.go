@@ -158,6 +158,12 @@ type RegProgram struct {
 	// ordinary expression. One register per local for the whole program is the model; this is what
 	// makes that checkable rather than merely intended.
 	localRegs []int32
+
+	// nodeLocals[i] are the script locals the delegated subtree src.nodes[i] reads, with reg
+	// translated from a local index into the REGISTER holding it. The stack form's own table
+	// cannot be used here: it is indexed by local, and this program is indexed by register. Empty
+	// at every index for an ordinary expression. See evalDelegated.
+	nodeLocals [][]localBind
 }
 
 // Len returns the instruction count (for tests and benchmarks).
@@ -221,7 +227,26 @@ func lowerWithInit(p *Program, needInit []bool) *RegProgram {
 	}
 	l.lower()
 	l.rp.localRegs = l.localReg
+	l.rp.nodeLocals = regBinds(p.nodeLocals, l.localReg)
 	return l.rp
+}
+
+// regBinds translates each delegated subtree's local bindings from local indices into register
+// indices. A delegated subtree READS those registers, which is why the translation happens here
+// rather than at every use: the optimizer's use table needs them too (see regUses).
+func regBinds(nodeLocals [][]localBind, localReg []int32) [][]localBind {
+	out := make([][]localBind, len(nodeLocals))
+	for i, binds := range nodeLocals {
+		if len(binds) == 0 {
+			continue
+		}
+		mapped := make([]localBind, len(binds))
+		for j, b := range binds {
+			mapped[j] = localBind{name: b.name, reg: localReg[b.reg]}
+		}
+		out[i] = mapped
+	}
+	return out
 }
 
 // localsNeedingInit reports which locals must be initialized to UNDEFINED before the script runs.
@@ -777,7 +802,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 			regs[in.Dst] = classad.ApplyFunction(ev, f.name, args)
 			ip++
 		case REvalNode:
-			regs[in.Dst] = ev.Evaluate(p.nodes[in.Imm])
+			regs[in.Dst] = evalDelegated(ev, p.nodes[in.Imm], rp.nodeLocals[in.Imm], regs)
 			ip++
 		case RMove:
 			regs[in.Dst] = regs[in.A]

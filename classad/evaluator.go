@@ -485,6 +485,13 @@ type Evaluator struct {
 	// scope (see SetResolver). It lets a caller evaluate against an alternate
 	// backing (e.g. an encoded ad) without materializing a ClassAd.
 	resolver func(name string, scope ast.AttributeScope) Value
+	// partial, when non-nil, is consulted before resolver and before the ClassAd
+	// scope, and MAY DECLINE a reference (see SetPartialResolver): declining leaves
+	// the reference to be resolved exactly as it would be with nothing installed.
+	// It is suppressed while an attribute's own expression is evaluated, so the
+	// names inside an attribute's value belong to the ad and not to the overlay
+	// (see evalAttrExpr).
+	partial func(name string, scope ast.AttributeScope) (Value, bool)
 	// aliasResolver, when non-nil, supplies the value of a QUALIFIED reference --
 	// `alias.Attr` naming one side of a join -- by alias index rather than by selecting a
 	// member out of a record (see SetAliasResolver).
@@ -726,6 +733,14 @@ func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Valu
 // lookup does not go on to an enclosing scope or, in matchmaking, to the target ad. No
 // such ad (TARGET with no target, PARENT at the top level) is undefined.
 func (e *Evaluator) evaluateCurrentTime(ref *ast.AttributeReference) Value {
+	// A partial resolver that answers CurrentTime owns it outright: it is naming a
+	// binding of its own, not reporting what the ad holds, so none of the "does the ad
+	// define it" reasoning below applies. Declining leaves all of that intact.
+	if e.partial != nil {
+		if v, ok := e.partial(ref.Name, ref.Scope); ok {
+			return v
+		}
+	}
 	if e.resolver != nil {
 		// The resolver contract (SetResolver): undefined for an unscoped or MY
 		// CurrentTime means the ad does not define it.
@@ -771,6 +786,13 @@ func (e *Evaluator) nowValue() Value {
 }
 
 func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value {
+	if e.partial != nil {
+		if v, ok := e.partial(ref.Name, ref.Scope); ok {
+			return v
+		}
+		// Declined: fall through to whatever would have resolved it with nothing
+		// installed -- a full resolver if there is one, otherwise the ClassAd scope.
+	}
 	if e.resolver != nil {
 		// A custom resolver replaces ClassAd-scope resolution entirely (used for
 		// evaluating a native program against an encoded ad). It receives the
@@ -880,7 +902,15 @@ func (e *Evaluator) evalAttrExpr(ad *ClassAd, norm string, expr ast.Expr) Value 
 	e.pushActive(ad, norm)
 	saved := e.classad
 	e.classad = ad
+	// A partial resolver overlays the scope the CALLER is evaluating in; it does not
+	// reach inside an attribute's value. `A = B + 1` means the ad's B wherever A is
+	// read, so the overlay is suppressed for the whole of this evaluation, nested
+	// attribute references included, and restored however this returns -- a cyclic
+	// panic unwinding through here included.
+	savedPartial := e.partial
+	e.partial = nil
 	defer func() {
+		e.partial = savedPartial
 		e.classad = saved
 		e.popActive()
 	}()
@@ -1874,6 +1904,15 @@ func (e *Evaluator) evaluateEval(args []ast.Expr) Value {
 
 	// Extract the expression from the temporary attribute
 	expr := classAd.Attributes[0].Value
+
+	// A partial resolver answers names the caller's compiler could see. It cannot see into a
+	// string parsed here, at run time, so the overlay is suppressed for it: a name in the parsed
+	// expression resolves against the ad, which is the scope eval evaluates in. Without this,
+	// eval("x") would mean the ad's x or an overlaid x depending on whether the enclosing
+	// expression happened to mention x somewhere else entirely.
+	savedPartial := e.partial
+	e.partial = nil
+	defer func() { e.partial = savedPartial }()
 
 	// Evaluate the expression in the current context
 	return e.Evaluate(expr)

@@ -90,6 +90,34 @@ func (e *Evaluator) SetResolver(fn func(name string, scope ast.AttributeScope) V
 	e.resolver = fn
 }
 
+// SetPartialResolver installs (or clears, with nil) a resolver that may DECLINE.
+// While set, every attribute reference is offered to fn(name, scope) first; ok=true
+// makes fn's value the reference's value, and ok=false leaves the reference to be
+// resolved exactly as it would be with nothing installed -- the full resolver if one
+// is set (SetResolver), otherwise the ClassAd scope, with the scope chain, the
+// MY/TARGET/PARENT rules, the evaluation of the referenced attribute's expression and
+// the CurrentTime substitution all intact.
+//
+// DECLINING IS THE WHOLE POINT. SetResolver replaces scope resolution outright, so a
+// caller that can answer for only SOME names -- a script overlaying its locals on the
+// ad -- has no way to say "not mine". Saying it by returning undefined is wrong twice
+// over: undefined is a value an ad can hold, and CurrentTime reads an undefined answer
+// as "the ad does not define it". A separate ok is the one answer those cases need.
+//
+// THE OVERLAY DOES NOT REACH INSIDE AN ATTRIBUTE'S VALUE. While the ad's own expression
+// for an attribute is evaluated, fn is not consulted: `A = B + 1` means the ad's B
+// wherever A is read, whatever the overlay calls B. Nor does it reach a nested scope --
+// a lazy list element, a nested ad, countMatches' per-ad context -- because each of
+// those evaluates in an evaluator of its own, which carries no resolver (see child).
+// A caller whose names must be visible there has to arrange it some other way.
+//
+// fn is called with the reference's original-cased name; names in ClassAd are matched
+// case-insensitively, so fn must fold. The Evaluator is not safe for concurrent use,
+// and neither is anything fn closes over.
+func (e *Evaluator) SetPartialResolver(fn func(name string, scope ast.AttributeScope) (Value, bool)) {
+	e.partial = fn
+}
+
 // ShortCircuit reports whether the left operand of a logical operator already
 // determines the result without evaluating the right operand, mirroring the
 // evaluator's short-circuit rules:
