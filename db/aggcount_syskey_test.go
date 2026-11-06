@@ -38,8 +38,8 @@ func TestCountStarExcludesSystemRecords(t *testing.T) {
 			}
 			for i := range tc.markers {
 				key := SystemKey("idem:batch-" + string(rune('A'+i%26)) + string(rune('A'+i/26)))
-				if err := d.Put(key, mustAd(t, "IdemAt = 1700000000")); err != nil {
-					t.Fatal(err)
+				if putErr := d.Put(key, mustAd(t, "IdemAt = 1700000000")); putErr != nil {
+					t.Fatal(putErr)
 				}
 			}
 

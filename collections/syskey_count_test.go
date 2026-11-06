@@ -169,13 +169,13 @@ func TestCompactionKeepsTheSystemCount(t *testing.T) {
 	pad := strings.Repeat("x", 512)
 	for round := range 12 {
 		for i := range 20 {
-			ad := mustParseAd(t, fmt.Sprintf(`[ Seq=%d; Pad="%s" ]`, round, pad))
+			ad := mustParseAd(t, fmt.Sprintf("[ Seq=%d; Pad=%q ]", round, pad))
 			if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
 				t.Fatal(err)
 			}
 		}
 		for i := range 7 {
-			ad := mustParseAd(t, fmt.Sprintf(`[ IdemAt=%d; Pad="%s" ]`, round, pad))
+			ad := mustParseAd(t, fmt.Sprintf("[ IdemAt=%d; Pad=%q ]", round, pad))
 			if err := c.Put([]byte(SystemKey(fmt.Sprintf("idem:batch-%d", i))), ad); err != nil {
 				t.Fatal(err)
 			}
@@ -218,7 +218,7 @@ func TestCompactionKeepsTheSystemCountUnderConcurrentWrites(t *testing.T) {
 	pad := strings.Repeat("x", 512)
 	for round := range 30 {
 		for i := range 60 {
-			ad := mustParseAd(t, fmt.Sprintf(`[ Seq=%d; Pad="%s" ]`, round, pad))
+			ad := mustParseAd(t, fmt.Sprintf("[ Seq=%d; Pad=%q ]", round, pad))
 			if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
 				t.Fatal(err)
 			}
@@ -284,8 +284,8 @@ func TestRotationKeepsTheSystemCount(t *testing.T) {
 		if i%5 == 0 {
 			key, ad = SystemKey(fmt.Sprintf("idem:batch-%d", i)), fmt.Sprintf(`[ IdemAt=%d ]`, i)
 		}
-		if err := c.Put([]byte(key), mustParseAd(t, ad)); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(key), mustParseAd(t, ad)); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	checkLen(t, c, "before rotation")
