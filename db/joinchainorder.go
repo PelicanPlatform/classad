@@ -28,13 +28,19 @@ package db
 //
 // So the step order is worth having and the FROM side is the reason to be here.
 //
-// WHICH CHAINS MAY BE REWRITTEN. Re-centring a chain is only sound when every table joins to
-// the same key, because that is what makes the join conditions transitive: with a.K == b.K
-// and a.K == c.K, b.K == c.K follows, so any of the three may sit in the middle and the
-// other two attach directly to it. Chains that join on two different attributes of the FROM
-// table are a real shape and this is not sound for them -- promoting a spoke would leave the
-// other spokes hanging off a table that is now a step, which still answers correctly but
-// gives up the probe that is the whole point. Those are declined and say so.
+// WHICH CHAINS MAY BE REWRITTEN. Re-centring is sound when every table joins on ONE key,
+// because that is what makes the conditions transitive: with a.K == b.K and a.K == c.K,
+// b.K == c.K follows, so any of the three may sit in the middle and the other two attach
+// directly to it.
+//
+// That is a property of the equalities, NOT of how the query hung the tables off each other.
+// A chain spelled as a path -- a joined to b, then b joined to c -- is the same relation as
+// the star, and is the more natural way to write it. So the equalities are read as a graph
+// over (table, attribute) pairs and the pairs are unioned; see chainToStar for the three
+// things that make the resulting class a usable key. A chain that joins on two genuinely
+// different keys is a real shape and this is not sound for it: promoting one table would
+// leave the others attached to a table that no longer supplies the probe keys. Those are
+// declined and say so.
 //
 // WHAT MAY NOT BE REORDERED is what joinbuildside.go says: the streamed side's order is the
 // join's output order, so a chain is reordered only where there is no order to preserve --
@@ -232,7 +238,28 @@ func worthMoving(to, from chainCost) bool {
 	return better(to.hashRows, from.hashRows)
 }
 
-// chainToStar reads a chain spec as a star on one join key, or says why it is not one.
+// chainToStar reads a chain as a set of tables joined on ONE key, or says why it is not.
+//
+// The tables need not be written as a star. A chain spelled as a path -- h joined to e, then
+// e joined to m -- is the same relation as the star when every equality is on one key, and a
+// path is the more natural way to write it. So the equalities are read as a GRAPH over
+// (side, attribute) pairs and the pairs are unioned: what matters is that every table ends
+// up in one equivalence class, not which table the query happened to hang the others off.
+//
+// Three things make that class a usable join key, and each is checked:
+//
+//   - one class. Two classes are two independent join keys, and there is no single
+//     attribute every table could be re-attached by.
+//   - every table in it. A table reachable from none of the others is a cross product,
+//     whatever order it is folded in.
+//
+// A third thing would matter and cannot happen. A table appearing in one class under two of
+// its OWN attributes would also be saying those two are equal to each other -- a condition
+// on that table alone, which re-attaching the tables would regenerate the equalities between
+// them and silently drop. It cannot happen because every step introduces exactly one new
+// table and so contributes at least one node the graph has not seen: the graph is a forest,
+// and a table under two attributes puts them in two components, which the one-class check
+// already refuses. So there is no case to handle here, only a reason not to look for one.
 func chainToStar(spec JoinSpec) (*chainStar, string) {
 	sides, steps, err := spec.chain()
 	if err != nil {
@@ -246,6 +273,12 @@ func chainToStar(spec JoinSpec) (*chainStar, string) {
 		aliases[i] = s.Alias
 	}
 	star := &chainStar{sides: sides, attrs: make([]string, len(sides))}
+	uf := map[keyRef]keyRef{}
+	// A node is identified by the FOLDED attribute name, because ClassAd attribute names
+	// are case-insensitive and two spellings of one name are one node. The spelling the
+	// query used is kept beside it, so the conditions this regenerates read the way the
+	// caller wrote them rather than in the planner's normal form.
+	spell := map[keyRef]string{}
 	for i := range steps {
 		st := &steps[i]
 		side := i + 1
@@ -258,31 +291,22 @@ func chainToStar(spec JoinSpec) (*chainStar, string) {
 			return nil, fmt.Sprintf("the step folding in %s has %d equalities and a chain "+
 				"is re-centred on one join key", aliases[side], len(st.Equi))
 		}
-		// The step's own half names the attribute its table is joined on.
+		// The step's own half is written against its table's ad, so it is a bare attribute.
 		attr := bareAttrName(st.Equi[0].Right)
 		if attr == "" {
 			return nil, fmt.Sprintf("%s's half of the equality is computed, so there is no "+
 				"attribute to re-attach it by", aliases[side])
 		}
-		star.attrs[side] = attr
-		// The row half must name the FROM side and nothing else, on the SAME attribute at
-		// every step. That is what makes the equalities transitive and any side a possible
-		// centre; two different FROM-side attributes are two join keys, and promoting a
-		// spoke would leave the other spokes attached to a table that is no longer the one
-		// supplying the probe keys.
-		rowAttr, rowWhy := fromSideAttr(st.Equi[0].Left, aliases, side)
+		table := keyRef{side: side, attr: strings.ToLower(attr)}
+		row, rowName, rowWhy := rowHalfRef(st.Equi[0].Left, aliases, side)
 		if rowWhy != "" {
 			return nil, rowWhy
 		}
-		if star.attrs[0] == "" {
-			star.attrs[0] = rowAttr
-		} else if !strings.EqualFold(star.attrs[0], rowAttr) {
-			return nil, fmt.Sprintf("the chain joins an earlier table on %s.%s and %s on "+
-				"%s.%s, which are two join keys rather than one", aliases[0], star.attrs[0],
-				aliases[side], aliases[0], rowAttr)
-		}
+		ufUnion(uf, row, table)
+		spell[table], spell[row] = attr, rowName
+
 		for _, src := range st.Cond {
-			if isEquality(src, aliases, 0, star.attrs[0], side, attr) {
+			if isEquality(src, aliases, row, table, side == 1) {
 				continue // the hash equality itself, which is rebuilt rather than moved
 			}
 			named, ok := condSides(src, aliases)
@@ -293,29 +317,103 @@ func chainToStar(spec JoinSpec) (*chainStar, string) {
 			star.extra = append(star.extra, chainCond{src: src, sides: named})
 		}
 	}
+	if why := star.readKeyClass(uf, spell, aliases); why != "" {
+		return nil, why
+	}
 	return star, ""
 }
 
-// fromSideAttr reads a step's row half as one bare attribute of the FROM side.
-func fromSideAttr(src string, aliases []string, side int) (string, string) {
+// keyRef is one half of an equality: a table of the chain and the attribute of it that half
+// reads. The attribute is held folded, because ClassAd attribute names are case-insensitive
+// and two spellings of one name are one node of the graph.
+type keyRef struct {
+	side int
+	attr string
+}
+
+// ufFind returns the representative of r's equivalence class, adding r as its own class the
+// first time it is seen.
+func ufFind(uf map[keyRef]keyRef, r keyRef) keyRef {
+	parent, seen := uf[r]
+	if !seen {
+		uf[r] = r
+		return r
+	}
+	if parent == r {
+		return r
+	}
+	root := ufFind(uf, parent)
+	uf[r] = root // path compression: the chains here are short, but this keeps them so
+	return root
+}
+
+// ufUnion merges the classes of a and b, which is what one equality asserts.
+func ufUnion(uf map[keyRef]keyRef, a, b keyRef) {
+	ra, rb := ufFind(uf, a), ufFind(uf, b)
+	if ra != rb {
+		uf[ra] = rb
+	}
+}
+
+// readKeyClass fills in star.attrs from the equality graph, or says why the graph is not one
+// usable join key. See chainToStar for what the two refusals mean.
+func (star *chainStar) readKeyClass(uf map[keyRef]keyRef, spell map[keyRef]string, aliases []string) string {
+	// Sorted, not in map order. A chain with several keys has several pairs that could be
+	// named as the ones that are not equal, and a message that names a different pair on
+	// every run is one a reader cannot compare against anything.
+	refs := make([]keyRef, 0, len(uf))
+	for ref := range uf {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(a, b int) bool {
+		if refs[a].side != refs[b].side {
+			return refs[a].side < refs[b].side
+		}
+		return refs[a].attr < refs[b].attr
+	})
+
+	var root keyRef
+	for i, ref := range refs {
+		if i == 0 {
+			root = ref
+		} else if ufFind(uf, ref) != ufFind(uf, root) {
+			return fmt.Sprintf("the chain joins on more than one key (%s.%s is not equal to "+
+				"%s.%s through any of the conditions), so there is no attribute every table "+
+				"could be re-attached by", aliases[ref.side], ref.attr, aliases[root.side],
+				root.attr)
+		}
+		star.attrs[ref.side] = spell[ref]
+	}
+	for i, attr := range star.attrs {
+		if attr == "" {
+			return fmt.Sprintf("%s is joined to no other table by an equality, so every "+
+				"order pairs it by the condition alone", aliases[i])
+		}
+	}
+	return ""
+}
+
+// rowHalfRef reads a step's row half as exactly one attribute of one side.
+func rowHalfRef(src string, aliases []string, side int) (keyRef, string, string) {
 	if side == 1 {
 		// At the first step the row holds the FROM side alone, so a bare half reads it --
 		// which is what the two-table spelling writes.
 		if bare := bareAttrName(src); bare != "" {
-			return bare, ""
+			return keyRef{side: 0, attr: strings.ToLower(bare)}, bare, ""
 		}
 	}
 	q, err := vm.ParseAliases(src, aliases)
 	if err != nil || !q.AliasNative() {
-		return "", fmt.Sprintf("the row half %q is not a plain reference to a named side, "+
-			"so the chain cannot be re-centred on it", src)
+		return keyRef{}, "", fmt.Sprintf("the row half %q is not a plain reference to a "+
+			"named side, so the chain cannot be re-centred on it", src)
 	}
 	refs := q.AliasRefs()
-	if len(refs) != 1 || refs[0].Alias != 0 || refs[0].Name == "" {
-		return "", fmt.Sprintf("the row half %q does not read exactly one attribute of %s, "+
-			"so it is not a key every other table could be joined to", src, aliases[0])
+	if len(refs) != 1 || refs[0].Name == "" {
+		return keyRef{}, "", fmt.Sprintf("the row half %q does not read exactly one "+
+			"attribute of one table, so it is not a key the other tables could be joined "+
+			"to", src)
 	}
-	return refs[0].Name, ""
+	return keyRef{side: refs[0].Alias, attr: strings.ToLower(refs[0].Name)}, refs[0].Name, ""
 }
 
 // condSides lists the sides an ON term reads.
@@ -346,16 +444,19 @@ func condSides(src string, aliases []string) ([]int, bool) {
 	return out, true
 }
 
-// isEquality reports that src is exactly `a.attrA == b.attrB`, in either order, which is the
-// term a step's Equi already describes and which the rewrite regenerates.
-func isEquality(src string, aliases []string, a int, attrA string, b int, attrB string) bool {
+// isEquality reports that src is exactly the equality the step's Equi already describes, in
+// either order -- the term the rewrite regenerates rather than moves.
+func isEquality(src string, aliases []string, row, table keyRef, firstStep bool) bool {
 	norm := func(s string) string { return strings.ToLower(strings.Join(strings.Fields(s), "")) }
-	lhs := norm(aliases[a] + "." + attrA)
-	rhs := norm(aliases[b] + "." + attrB)
-	bare := norm(attrA)
+	lhs := norm(aliases[row.side] + "." + row.attr)
+	rhs := norm(aliases[table.side] + "." + table.attr)
 	got := norm(src)
-	return got == lhs+"=="+rhs || got == rhs+"=="+lhs ||
-		(a == 0 && b == 1 && (got == bare+"=="+rhs || got == rhs+"=="+bare))
+	if got == lhs+"=="+rhs || got == rhs+"=="+lhs {
+		return true
+	}
+	// At the first step the row half may be written bare, which is the two-table spelling.
+	bare := norm(row.attr)
+	return firstStep && row.side == 0 && (got == bare+"=="+rhs || got == rhs+"=="+bare)
 }
 
 // sideFacts is what one table's read costs, independent of the chain's shape.
