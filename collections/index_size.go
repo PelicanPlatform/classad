@@ -79,6 +79,38 @@ func (c *Collection) SidecarSizes() SidecarSizes {
 	return out
 }
 
+// HasSealedSidecar reports whether any segment has flipped to a mapped sidecar index, which
+// is what says an index is actually there to be probed rather than only configured.
+//
+// It exists apart from SidecarSizes because the two questions cost different amounts.
+// SidecarSizes is a diagnostic: it parses every sidecar to break the bytes out by structure,
+// which is fine once a minute and is NOT fine on a query path. A join asks this question
+// once per side while it is planning, and asking it through the byte breakdown made planning
+// a chain cost more than running it.
+func (c *Collection) HasSealedSidecar() bool {
+	for _, sh := range c.shards {
+		if sh.hasSealedSidecar() {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSealedSidecar reports whether one shard holds a mapped sidecar, stopping at the first.
+func (sh *shard) hasSealedSidecar() bool {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	if lockedReadHook != nil {
+		lockedReadHook("hassealedsidecar")
+	}
+	for _, seg := range sh.segs {
+		if seg != nil && seg.msidx.Load() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // sidecarSizes adds one shard's sidecar sizes to out under its read lock. The release is deferred:
 // the breakdown parses mapped sidecar bytes, and a diagnostics read that panics there is failed alone
 // by a server that recovers it, which must not leave the shard locked.

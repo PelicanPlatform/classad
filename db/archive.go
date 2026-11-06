@@ -1381,6 +1381,11 @@ func (t *ArchiveTable) IndexSizes() IndexSizes { return t.a.IndexSizes() }
 // SidecarSizes reports the sealed-segment sidecar index bytes (mmap-backed, evictable).
 func (t *ArchiveTable) SidecarSizes() SidecarSizes { return t.a.SidecarSizes() }
 
+// HasSealedSidecar reports whether any segment carries a mapped sidecar index, which is what
+// says an index is built and not merely configured. See collections.Collection.HasSealedSidecar
+// for why the join planner asks this rather than SidecarSizes().Segments > 0.
+func (t *ArchiveTable) HasSealedSidecar() bool { return t.a.HasSealedSidecar() }
+
 // IndexedAttrs returns the archive's categorical and value index attributes.
 func (t *ArchiveTable) IndexedAttrs() (categorical, value []string) { return t.a.IndexedAttrs() }
 
