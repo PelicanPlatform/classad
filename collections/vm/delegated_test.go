@@ -431,3 +431,26 @@ func TestDelegatedOverlayStopsAtAnAttributesValue(t *testing.T) {
 		t.Errorf("result = %s, want 6: an attribute's value resolves against the ad", got)
 	}
 }
+
+// TestDelegatedEvalStringIgnoresTheOverlay pins that `eval` of a string means the same thing
+// wherever it is written.
+//
+// The overlay answers names the compiler saw in the delegated subtree. It cannot see into a string
+// parsed at run time, so without suppressing it `eval(s)` would resolve a name through the overlay
+// only when the enclosing expression happened to mention that name somewhere else — the same call
+// meaning the local in one expression and the attribute in another, for a reason the author of the
+// eval cannot see.
+func TestDelegatedEvalStringIgnoresTheOverlay(t *testing.T) {
+	const ad = `[ x = 7 ]`
+	// No overlay is installed here at all: nothing in the subtree names x.
+	hidden := mustScript(t, "x = 42\ns = \"x\"\nresult = eval(s)\n").Run(mustAd(t, ad)).String()
+	// An overlay IS installed here, because the ternary's condition names the local.
+	beside := mustScript(t, "x = 42\ns = \"x\"\nresult = (x > 0 ? eval(s) : -1)\n").Run(mustAd(t, ad)).String()
+
+	if hidden != "7" {
+		t.Errorf("eval of a name the subtree does not mention = %s, want 7 (the attribute)", hidden)
+	}
+	if beside != "7" {
+		t.Errorf("eval beside the local = %s, want 7: the overlay reached into a run-time string", beside)
+	}
+}

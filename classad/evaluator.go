@@ -1787,6 +1787,15 @@ func (e *Evaluator) evaluateEval(args []ast.Expr) Value {
 	// Extract the expression from the temporary attribute
 	expr := classAd.Attributes[0].Value
 
+	// A partial resolver answers names the caller's compiler could see. It cannot see into a
+	// string parsed here, at run time, so the overlay is suppressed for it: a name in the parsed
+	// expression resolves against the ad, which is the scope eval evaluates in. Without this,
+	// eval("x") would mean the ad's x or an overlaid x depending on whether the enclosing
+	// expression happened to mention x somewhere else entirely.
+	savedPartial := e.partial
+	e.partial = nil
+	defer func() { e.partial = savedPartial }()
+
 	// Evaluate the expression in the current context
 	return e.Evaluate(expr)
 }
