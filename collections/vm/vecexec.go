@@ -325,6 +325,16 @@ func (q *Query) VecEval(src ColumnSource, n int, scratch *VecScratch) (*Vec, boo
 
 func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecScratch, budget int64) (*Vec, bool) {
 	s.reset(n)
+	if p.hasLoopJump {
+		// A `break` or a `continue`. This executor reads control flow by REGION -- an If by the
+		// jumps that end its arms, a While by the back edge at its header -- and both of those
+		// jumps are matched against the innermost open region. A jump that leaves a loop from
+		// inside an If arm matches neither, and one that restarts a loop from inside an arm looks
+		// exactly like a back edge while leaving that arm's region open and its other side unrun.
+		// The decline is checked here rather than left to the region matching so that the second
+		// case cannot be read as the first.
+		return nil, false
+	}
 	if p.hasStatements {
 		s.initPredicates()
 	}

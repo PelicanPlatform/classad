@@ -255,8 +255,10 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 		bodyStart = len(s.c.p.code)
 	}
 
-	outerByName, outerFrame := s.byName, s.fn
-	s.byName, s.fn = params, frame
+	// The loop stack is cleared for the body, not just the name map: a `break` in the body is bound
+	// by a loop in the BODY, never by the loop this call happens to sit inside. See Script.Break.
+	outerByName, outerFrame, outerLoops := s.byName, s.fn, s.loops
+	s.byName, s.fn, s.loops = params, frame, nil
 	s.c.locals = s.byName
 	fd.active = true
 	s.inlining = append(s.inlining, fd.name)
@@ -265,7 +267,7 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 
 	s.inlining = s.inlining[:len(s.inlining)-1]
 	fd.active = false
-	s.byName, s.fn = outerByName, outerFrame
+	s.byName, s.fn, s.loops = outerByName, outerFrame, outerLoops
 	s.c.locals = s.byName
 
 	jumps := frame.retJumps

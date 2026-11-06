@@ -94,6 +94,27 @@ type Script struct {
 	// inside one can run more than once, which is the only case where a call has to reset its own
 	// registers rather than rely on their program-start initialization. See expandCall.
 	loopDepth int
+
+	// loops is the stack of While bodies a Break or a Continue may name, innermost last.
+	//
+	// It is NOT loopDepth with the targets attached, and the difference is the whole of the
+	// function-body rule. A function expansion starts with an empty stack and gets the caller's
+	// back when it ends (see inline), so a `break` written in a body can only name a loop written
+	// in that same body. loopDepth keeps counting across the expansion, because the question it
+	// answers -- can this expansion run more than once -- is about the caller.
+	loops []*loopFrame
+}
+
+// loopFrame is one While whose body is being emitted, and the two addresses a jump out of it or
+// round it needs.
+//
+// The header is known as soon as the loop starts, so a Continue is an ordinary backward jump with
+// its target already in hand. The end is not known until the body and the condition's fault site
+// have been laid out, so each Break records its jump here and whileNow patches them all at once --
+// the same forward-patch If already does for the tail of its arms.
+type loopFrame struct {
+	header int32
+	breaks []int
 }
 
 // NewScript returns an empty script.
@@ -272,9 +293,12 @@ func (s *Script) whileNow(cond ast.Expr, body func(*Script)) {
 	k := int32(len(s.c.p.conds) - 1)
 	s.c.ins(OpBranchVoid, k)
 
+	frame := &loopFrame{header: int32(header)}
 	if body != nil {
 		s.loopDepth++
+		s.loops = append(s.loops, frame)
 		body(s)
+		s.loops = s.loops[:len(s.loops)-1]
 		s.loopDepth--
 	}
 	// The back edge. Every other jump this compiler emits goes forward; this one does not, and the
@@ -290,6 +314,78 @@ func (s *Script) whileNow(cond ast.Expr, body func(*Script)) {
 		onFalse: int32(end), onUndef: int32(onFault), onError: int32(onFault), end: int32(end),
 		loop: true, header: int32(header),
 	}
+	// A Break lands exactly where a false condition does. It skips the fault site on the way, which
+	// is right: the loop is not ending because the condition could not be read.
+	for _, j := range frame.breaks {
+		s.c.patch(j, end)
+	}
+}
+
+// Break leaves the innermost enclosing While and continues after it.
+//
+// It is a jump to the address a false condition goes to, so a loop that breaks on its first
+// iteration terminates for the same reason one whose condition is false terminates: there is no
+// back edge on that path.
+//
+// A BREAK IS BOUND BY A LOOP IN THE SAME FUNCTION BODY. A call is expanded where it is written, so
+// a function called from inside a loop sits, instruction for instruction, inside that loop -- and a
+// Break in its body would leave the CALLER's loop. That would make a function mean one thing at one
+// call site and something else at another, and the same body legal in one place and nonsense in
+// another. So a body starts with no enclosing loop, whatever the call site is inside, and a Break
+// with nothing to name is refused.
+//
+// Outside a loop altogether it is refused for the same reason: there is nothing to leave.
+func (s *Script) Break() *Script {
+	s.stage(func() { s.loopJump(true) })
+	return s
+}
+
+// Continue starts the innermost enclosing While's next iteration.
+//
+// It jumps to the loop's HEADER, which is the condition, so the next iteration re-tests it exactly
+// as falling off the end of the body does. It is bound by the same rule as Break.
+func (s *Script) Continue() *Script {
+	s.stage(func() { s.loopJump(false) })
+	return s
+}
+
+// loopJump emits a Break or a Continue. The two differ only in where they go and in what they are
+// called, which is why they share this.
+func (s *Script) loopJump(isBreak bool) {
+	word := "continue"
+	if isBreak {
+		word = "break"
+	}
+	if s.err != nil {
+		return
+	}
+	if s.hasRes {
+		s.err = fmt.Errorf("vm: '%s' after Result", word)
+		return
+	}
+	if len(s.loops) == 0 {
+		s.err = errors.New("vm: script: " + s.noLoopDetail(word))
+		return
+	}
+	s.c.p.hasLoopJump = true
+	frame := s.loops[len(s.loops)-1]
+	if isBreak {
+		frame.breaks = append(frame.breaks, s.c.ins(OpJmpVoid, -1))
+		return
+	}
+	s.c.ins(OpJmpVoid, frame.header)
+}
+
+// noLoopDetail says why a Break or a Continue had nothing to name, which is a different mistake
+// inside a function body than outside one and is worth two messages.
+func (s *Script) noLoopDetail(word string) string {
+	if s.fn != nil {
+		return fmt.Sprintf("'%s' in a function body with no loop in that body: a call is expanded "+
+			"where it is written, so a '%s' here would leave a loop at the call site and the "+
+			"function would mean something different everywhere it is called; put the loop in the "+
+			"body, or return a value and let the caller break", word, word)
+	}
+	return fmt.Sprintf("'%s' outside a loop", word)
 }
 
 // Result sets the script's value. It must be called last and exactly once.
