@@ -1246,10 +1246,25 @@ func (c *Collection) Flatten(key []byte) (*classad.ClassAd, bool) {
 	return c.Get(key)
 }
 
-// Len returns the number of live keys across all shards. Note this includes structural
-// (parent-only) ads of a chained collection, which Scan/Query hide -- so Len equals the
-// number of rows a match-all query returns only when the collection is not Chained.
+// Len returns how many live keys a reader is shown. Records of the reserved system
+// keyspace (syskey.go) are not among them, as they are not in any other client-facing
+// path. Structural (parent-only) ads of a chained collection still are, though Scan/Query
+// hide those too -- so Len equals the number of rows a match-all query returns only when
+// the collection is not Chained. StoredLen is the count of everything the store holds.
 func (c *Collection) Len() int {
+	n := 0
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		n += sh.count - sh.sysCount
+		sh.mu.RUnlock()
+	}
+	return n
+}
+
+// StoredLen returns the number of live keys the store holds, system-keyed records
+// included. It is what Stats reports as Ads, and it is the right figure for accounting
+// what is on disk; Len is the right one for how many rows a reader sees.
+func (c *Collection) StoredLen() int {
 	n := 0
 	for _, sh := range c.shards {
 		sh.mu.RLock()
