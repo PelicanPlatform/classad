@@ -77,6 +77,25 @@ type AggSpec struct {
 type AggRow struct {
 	Group  []string
 	Values []string
+
+	// GroupValues is Group as VALUES, one per group column, or nil when the producer
+	// did not supply them. It exists so a caller rendering a group for some other
+	// medium -- a JSON type, a chart label, a number it wants to do arithmetic on --
+	// does not have to parse the text back. Group remains the group's identity and
+	// its label; this is the same group said in types.
+	//
+	// It is a CANONICAL representative, not the first value that landed in the group:
+	// GroupValue maps every member of a group to one value, so a group reads the same
+	// whichever row formed it and whichever shard answered. That matters because 1 and
+	// 1.0 are deliberately one group (see GroupValueText), so "the value that made the
+	// group" is not well defined, and a parallel fan-out would otherwise report
+	// whichever arrived first.
+	//
+	// Every kind arrives here as the value it is, lists and nested ads included. Those two
+	// are grouped by their canonical text rather than by a relation (GroupValueText reaches
+	// no relation for them), but that text is a ClassAd literal, so the value survives the
+	// trip over dbrpc as well and a caller never finds a list standing in as a string.
+	GroupValues []classad.Value
 }
 
 // GroupCol is one GROUP BY column for a (possibly bucketed) aggregate: the
@@ -307,7 +326,19 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 		key := strings.Join(scratch, "\x00")
 		gs := groups[key]
 		if gs == nil {
-			gs = newGroupState(append([]string(nil), scratch...), aggs, userAggs)
+			// Only on creation: the typed key is a function of the group, so every
+			// later row of it would recompute the same answer.
+			gvalues := make([]classad.Value, nGroup)
+			for i, g := range groupCols {
+				if g.BucketWidth > 0 {
+					// The row reached here, so its bucket floor exists: the text
+					// form was computed from the same value above and did not drop.
+					gvalues[i], _ = bucketKeyValue(vals[groupCol[i]], g.BucketWidth)
+				} else {
+					gvalues[i] = GroupValue(vals[groupCol[i]])
+				}
+			}
+			gs = newGroupState(append([]string(nil), scratch...), gvalues, aggs, userAggs)
 			groups[key] = gs
 			order = append(order, key)
 		}
@@ -325,7 +356,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 
 	// A group-less aggregate over an empty match still yields one row.
 	if nGroup == 0 && len(order) == 0 {
-		gs := newGroupState(nil, aggs, userAggs)
+		gs := newGroupState(nil, nil, aggs, userAggs)
 		row := AggRow{Values: make([]string, len(aggs))}
 		for i, a := range aggs {
 			row.Values[i] = gs.accs[i].result(a)
@@ -336,7 +367,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 	out := make([]AggRow, 0, len(order))
 	for _, key := range order {
 		gs := groups[key]
-		row := AggRow{Group: gs.gvals, Values: make([]string, len(aggs))}
+		row := AggRow{Group: gs.gvals, GroupValues: gs.gvalues, Values: make([]string, len(aggs))}
 		for i, a := range aggs {
 			row.Values[i] = gs.accs[i].result(a)
 		}
@@ -348,7 +379,11 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 // groupState holds one group's key values and per-aggregate accumulators.
 type groupState struct {
 	gvals []string
-	accs  []aggAcc
+	// gvalues is gvals as values, filled once when the group is created. It is built
+	// there and not per row because every row of a group yields the same canonical
+	// value, so re-deriving it for each would buy nothing.
+	gvalues []classad.Value
+	accs    []aggAcc
 }
 
 // newGroupState builds a group's accumulators, giving each user-defined aggregate a fresh
@@ -356,8 +391,8 @@ type groupState struct {
 // first contributing row, because a group every one of whose rows fails its aggregate's FILTER
 // still appears in the output -- and its answer is then the aggregate's identity, which only an
 // accumulator can say.
-func newGroupState(gvals []string, aggs []AggSpec, userAggs []Aggregate) *groupState {
-	gs := &groupState{gvals: gvals, accs: make([]aggAcc, len(aggs))}
+func newGroupState(gvals []string, gvalues []classad.Value, aggs []AggSpec, userAggs []Aggregate) *groupState {
+	gs := &groupState{gvals: gvals, gvalues: gvalues, accs: make([]aggAcc, len(aggs))}
 	for i := range aggs {
 		if i < len(userAggs) && userAggs[i] != nil {
 			gs.accs[i].user = userAggs[i].NewAccumulator()
@@ -472,6 +507,21 @@ func bucketKeyText(v classad.Value, width int64) (string, bool) {
 	return strconv.FormatInt(b, 10), true
 }
 
+// bucketKeyValue is bucketKeyText's typed twin, for AggRow.GroupValues: the bucket floor as
+// the integer its text spells. A bucketed group is a number whatever the attribute held, so
+// unlike GroupValue there is nothing to canonicalize -- the floor IS the group.
+func bucketKeyValue(v classad.Value, width int64) (classad.Value, bool) {
+	f, ok := numberOf(v)
+	if !ok {
+		return classad.Value{}, false
+	}
+	b, ok := bucketFloorInt(f, width)
+	if !ok {
+		return classad.Value{}, false
+	}
+	return classad.NewIntValue(b), true
+}
+
 // numberOf returns the numeric value of v (integer or real) and whether it is one.
 func numberOf(v classad.Value) (float64, bool) {
 	switch {
@@ -545,7 +595,9 @@ func trimFloat(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) }
 // A LIST OR A NESTED AD is reached by no operator at all: `{1,2} =?= {1,2}` is error, so even
 // reflexivity fails there. They group by canonical text, which collects identical ones
 // together -- the most that can be said about values no relation reaches, and more useful than
-// one group per row.
+// one group per row. That text is a ClassAd literal like every other group's: a list reads
+// "{ 1,2 }" and a nested ad "[a = 1]", so there is no kind whose group text has to be read
+// differently from the rest, and ParseGroupValue inverts all of them.
 func GroupValueText(v classad.Value) string {
 	switch {
 	case v.IsString():
@@ -560,8 +612,144 @@ func GroupValueText(v classad.Value) string {
 		if f, err := v.RealValue(); err == nil {
 			return numberGroupText(f)
 		}
+	case v.IsList():
+		if elems, err := v.ListValue(); err == nil {
+			return groupListText(elems)
+		}
 	}
 	return v.String()
+}
+
+// groupListText renders a list's group as a ClassAd list literal -- "{ 1,2 }", and "{  }" when
+// empty -- with every element rendered by GroupValueText in turn.
+//
+// THE ELEMENTS GO THROUGH GroupValueText AND NOT THE UNPARSER so a list is grouped by the same
+// relation its elements are grouped by on their own: {1} and {1.0} are one group exactly as 1
+// and 1.0 are. Value.Unparse cannot serve here on either count. It keeps a list literal's
+// UNEVALUATED source, so {1,1+1} unparses as "{ 1,1 + 1 }" against {1,2}'s "{ 1,2 }" -- two
+// names for one value -- and it renders a real in the reference sink form, so {1.5} would read
+// "{ 1.500000000000000E+00 }" where the same number alone reads "1.5".
+//
+// Literal syntax rather than Go's "[1 2]" is what makes the text of EVERY group a ClassAd
+// literal, which is what lets ParseGroupValue invert all of them. It also stops one collision:
+// an empty list and an empty nested ad both printed "[]" and so shared a group, though they are
+// values of different kinds.
+func groupListText(elems []classad.Value) string {
+	if len(elems) == 0 {
+		return "{  }"
+	}
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, e := range elems {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(GroupValueText(e))
+	}
+	b.WriteString(" }")
+	return b.String()
+}
+
+// GroupValue is GroupValueText's typed twin: the canonical VALUE of the group v belongs to.
+// It is what AggRow.GroupValues carries.
+//
+// THE INVARIANT, which is the whole point: GroupValueText(GroupValue(v)) == GroupValueText(v).
+// The value names the same group the text does, so the two cannot drift -- a caller that keys
+// on one and labels with the other is keying and labelling the same thing.
+//
+// It is canonical rather than "the value that formed the group" because a group may hold
+// values that are not identical. GroupValueText puts the integer 1 and the real 1.0 in one
+// group, on purpose: they ARE one number. So "the first value seen" is not a property of the
+// group at all -- it is a property of the scan order, and under a parallel fan-out it is not
+// even stable between runs of the same query. Mapping every member to one value makes the
+// answer a function of the group.
+//
+// Only the integral real needs moving: its text is the integer's text, so the integer is the
+// representative. Every other kind already renders uniquely for its group, so it is its own.
+//
+// A LIST IS REBUILT from its elements mapped through this same function, because a list's
+// group is decided element-wise (see groupListText) and so {1} and {1.0} are one group with
+// one representative, {1}. Rebuilding also drops the unevaluated source expressions a list
+// parsed from a literal carries, which are a property of how the value was written and not of
+// the group -- {1,1+1} and {1,2} are one group and now one value.
+func GroupValue(v classad.Value) classad.Value {
+	if v.IsReal() {
+		if f, err := v.RealValue(); err == nil {
+			const twoPow63 = float64(1 << 63) // the first float64 above MaxInt64; see numberGroupText
+			if f == math.Trunc(f) && f >= -twoPow63 && f < twoPow63 {
+				return classad.NewIntValue(int64(f))
+			}
+		}
+	}
+	if v.IsList() {
+		if elems, err := v.ListValue(); err == nil {
+			canon := make([]classad.Value, len(elems))
+			for i, e := range elems {
+				canon[i] = GroupValue(e)
+			}
+			return classad.NewListValue(canon)
+		}
+	}
+	return v
+}
+
+// ParseGroupValue reads a group's TEXT back as its value: GroupValueText's inverse, for a
+// producer that has only the rendered form. The dbrpc client uses it against a server too old
+// to send AggRow.GroupValues, so a caller gets values from every server and needs one path
+// rather than two.
+//
+// It inverts EVERY group exactly, with no kind excepted: GroupValueText renders a group as
+// ClassAd literal syntax and nothing else, so a string arrives quoted and escaped, undefined
+// and error as their keywords, a number as itself, a list as "{ 1,2 }" and a nested ad as
+// "[a = 1]". Parsing that text is the exact reverse of writing it -- the reason the rendering
+// had to be faithful, and why the two must change together.
+//
+// The invariant it rests on, which TestParseGroupValueInvertsEveryGroup pins: for any value v,
+// GroupValueText(ParseGroupValue(GroupValueText(v))) == GroupValueText(v). Round-tripping a
+// group through its text lands in the same group, which is what lets a caller treat a label
+// from an old server and a value from a new one as the same thing.
+//
+// A text that does not parse comes back as the string it is, not an error value. This is the
+// fallback path, and text that reached here came out of some server's renderer; reporting the
+// group as "error" would be inventing a value the group never had, while the text always at
+// least names the group it came from.
+func ParseGroupValue(text string) classad.Value {
+	if v, ok := parseGroupValueFast(text); ok {
+		return v
+	}
+	e, err := classad.ParseExpr(text)
+	if err != nil {
+		return classad.NewStringValue(text)
+	}
+	return GroupValue(e.Eval(classad.New()))
+}
+
+// parseGroupValueFast reads the group texts that need no parser: a plain integer and a string
+// holding nothing the quoting had to escape. Between them they are very nearly every group
+// anything groups by -- an owner, a status, a hold code, a bucket floor -- and this runs once
+// per group cell of every row a server without FeatTypedGroups returns, which is the whole of
+// the fallback path's cost. ParseExpr allocates a lexer, an AST and an evaluation to answer
+// `42`, and said no to doing that per cell.
+//
+// It declines anything it is not certain of, including a string with a backslash in it, and
+// that goes to the real parser. A fast path that is wrong is worth nothing.
+func parseGroupValueFast(text string) (classad.Value, bool) {
+	if n := len(text); n >= 2 && text[0] == '"' && text[n-1] == '"' {
+		body := text[1 : n-1]
+		if !strings.ContainsAny(body, "\\\"") {
+			return classad.NewStringValue(body), true
+		}
+		return classad.Value{}, false
+	}
+	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+		// ParseInt accepts a leading "+" and Go's underscores, neither of which this
+		// renderer emits, so the text has to render back to itself to be sure the group
+		// is the integer it reads as.
+		if strconv.FormatInt(n, 10) == text {
+			return classad.NewIntValue(n), true
+		}
+	}
+	return classad.Value{}, false
 }
 
 // numberGroupText renders a real so that an integral one reads as the integer it equals, and
