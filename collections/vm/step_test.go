@@ -18,7 +18,8 @@ func chargeCorpus(t testing.TB) (exprs []string, ads []*classad.ClassAd) {
 	exprs = append(exprs, parityCorpusExprs...)
 	exprs = append(exprs, dictExprs...)
 	exprs = append(exprs, reductionOperands...)
-	for _, src := range scopeSources {
+	exprs = append(exprs, subscriptExprs...)
+	for _, src := range append(append([]string(nil), scopeSources...), subscriptScopes...) {
 		if ad, err := classad.Parse(src); err == nil && ad != nil {
 			ads = append(ads, ad)
 		}

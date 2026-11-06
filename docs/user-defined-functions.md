@@ -376,9 +376,9 @@ every call is visible there and nowhere else.
 ## 7. ClassAd Script
 
 ClassAd Script is a statement language over the same engine: locals, `if`,
-`while`, and a result, compiled to one instruction stream so the optimizer can
-see across the whole thing. It exists for what a single expression says badly — a
-loop, or a derived value used three times.
+`while`, `for`, and a result, compiled to one instruction stream so the optimizer
+can see across the whole thing. It exists for what a single expression says badly
+— a loop, or a derived value used three times.
 
 ```go
 sp, err := vm.ParseScript(`
@@ -403,13 +403,32 @@ Python-shaped statements over ordinary ClassAd expressions: `is` is `=?=`, and
 every expression between the statements is parsed by the same parser an
 attribute's value is. Blocks are introduced by `:` and delimited by indentation,
 which has to be spaces — braces were not available, since `{...}` is already a
-list literal and `[...]` an ad literal. `elif`, `else`, `while`, `break`,
+list literal and `[...]` an ad literal. `elif`, `else`, `while`, `for`, `break`,
 `continue`, `pass`, `def`, `return` and the compound assignments (`+=`, `-=`,
-`*=`, `/=`, `%=`) are there; `for` is not, and neither are writes back to the ad.
+`*=`, `/=`, `%=`) are there; writes back to the ad are not.
 
-`break` leaves the innermost enclosing `while` and `continue` starts its next
-iteration, re-testing the condition on the way. Both take no operand, and both
-are refused with a line and column where no loop encloses them:
+**`for NAME in SEQUENCE:`** walks a list:
+
+```
+largest = 0
+for request in MY.Requests:
+    if request > largest:
+        largest = request
+result = largest
+```
+
+The sequence is evaluated once, before the first trip. `NAME` is an ordinary
+local — function-scoped like any other, still bound after the loop, holding the
+last element visited. An empty list runs the body zero times. A sequence that is
+**not a list** is a fault: the script ends with `error`, the same way an `if` on
+an undefined condition does, so a misspelled attribute says so rather than
+turning the loop into one that quietly does nothing. The step budget bounds the
+loop; there is no separate iteration limit.
+
+**`break` and `continue`** work in either loop. `break` leaves the innermost
+enclosing loop and `continue` starts its next iteration — re-testing a `while`
+condition, or advancing to the next element of a `for`. Both take no operand,
+and both are refused with a line and column where no loop encloses them:
 
 ```
 i = 0
@@ -431,11 +450,16 @@ wants to add to it. The builder API it returns is also usable directly.
 anything else is an attribute. So `want = MY.RequestMemory` binds a local, and
 every later `want` is that local, while `MY.want` always means the attribute.
 
+**A local can be indexed.** `seq = MY.Sizes` followed by `seq[0]` reads the
+local, and `rec["K"]` reads a key out of a nested ad the same way. An index past
+the end of a list is `error` rather than `undefined`, which is the reference
+engine's answer, so `?:` — which defaults only an `undefined` — does not catch
+it.
+
 **A local is not visible to every expression**, and the compiler now says so
 rather than quietly answering from the ad. A few constructs are handed to the
-tree-walking evaluator — a ternary, a list or ad literal, a subscript, a
-selection — and that evaluator resolves names against the ad, which has never
-heard of your local:
+tree-walking evaluator — a ternary, a list or ad literal, a selection — and that
+evaluator resolves names against the ad, which has never heard of your local:
 
 ```
 x = Cpus + 1
@@ -494,10 +518,10 @@ Three things a script function will not do:
   half of that applies, because a module's own functions are the ones being
   registered; whether the name is free is answered by the registry, as
   `ErrFunctionExists`.
-- **Being called from a ternary, a list or ad literal, a subscript or a
-  selection.** Those are the same constructs that cannot see a local, for the
-  same reason, and the refusal carries a line and column. Call the function from
-  a statement and use the local.
+- **Being called from a ternary, a list or ad literal, or a selection.** Those
+  are the same constructs that cannot see a local, for the same reason, and the
+  refusal carries a line and column. Call the function from a statement and use
+  the local.
 
 A function defined inside a script belongs to that script, and nothing outside it
 can call one. A script can also *call* a UDF, which is how one rule is shared

@@ -58,8 +58,16 @@ import (
 // evaluator, this reasoning would fail and both constructs would have to decline again.
 //
 // NOT HANDLED, returning ok=false so the caller falls back rather than guessing: the magic CurrentTime
-// attribute, delegated subtrees (OpEvalNode, which Native() already excludes), and any built-in call
-// whose result a vector cannot hold (a list or a nested ad -- see callFuncVec).
+// attribute, delegated subtrees (OpEvalNode, which Native() already excludes), any built-in call
+// whose result a vector cannot hold (a list or a nested ad -- see callFuncVec), and the element load
+// OpSubscript.
+//
+// THE ELEMENT LOAD DECLINES BECAUSE A Vec CANNOT HOLD A CONTAINER. Its operands are a list or an ad
+// and its result is an arbitrary element, so a kernel would need a plane of lists to read from and
+// a plane of anything to write to -- neither of which a Vec has, and both of which are a larger
+// change than the opcode. Declining costs the batch nothing but the fallback to the per-record path,
+// which is where a subscript was evaluated before the opcode existed. TestSubscriptDeclinesVector
+// pins the decline so it stays a decline and never becomes a partial answer.
 //
 // FUNCTION CALLS are handled, but elementwise rather than as kernels: see callFuncVec for why that is
 // the useful increment and what would change that. member/identicalMember over a constant list is the
@@ -536,7 +544,8 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			}
 			next = t
 		default:
-			return nil, false // OpEvalNode, OpFault, anything added later
+			// OpEvalNode, OpFault, OpShortSubscript/OpSubscript, anything added later.
+			return nil, false
 		}
 		ip = next
 	}

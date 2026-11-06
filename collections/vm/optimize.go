@@ -67,9 +67,10 @@ func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 	switch in.Op {
 	case RNop, RConst, RTrue, RFalse, RUndef, RError, RLoadRef, REvalNode, RJump, RFault:
 		// No register operands.
-	case RBinop, RCombineAnd, RCombineOr:
+	case RBinop, RCombineAnd, RCombineOr, RSubscript:
 		buf = append(buf, in.A, in.B)
-	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
+	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond,
+		RShortSubscript:
 		buf = append(buf, in.A)
 	case RCallFunc:
 		buf = append(buf, rp.args[in.Args]...)
@@ -199,14 +200,14 @@ func copyProp(rp *RegProgram) {
 func substitute(rp *RegProgram, j int, from, to int32) {
 	in := &rp.code[j]
 	switch in.Op {
-	case RBinop, RCombineAnd, RCombineOr:
+	case RBinop, RCombineAnd, RCombineOr, RSubscript:
 		if in.A == from {
 			in.A = to
 		}
 		if in.B == from {
 			in.B = to
 		}
-	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
+	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond, RShortSubscript:
 		if in.A == from {
 			in.A = to
 		}
