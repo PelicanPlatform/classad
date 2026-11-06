@@ -391,6 +391,9 @@ func (r recAttr) lookup(a wire.Ad) ([]byte, bool) {
 // attributes are categorically indexed.
 func (c *Collection) categoricalAttrID(spec *indexSpec, attr string) (uint32, bool) {
 	for _, id := range spec.catIDs {
+		if _, isPath := spec.paths[id]; isPath {
+			continue // keyed on a nested path, not on an attribute anything can group by
+		}
 		var name string
 		var ok bool
 		if spec.inline {

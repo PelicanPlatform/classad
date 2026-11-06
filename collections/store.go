@@ -223,6 +223,12 @@ type Options struct {
 	// names numeric attributes to index for equality and range (`Attr >= n`). A
 	// query filtering on an indexed attribute visits only candidate ads instead of
 	// scanning all of them. Optional.
+	//
+	// A name holding a dot indexes a NESTED PATH, written the way a query writes it:
+	// "Res.Mem" indexes what `Res.Mem` selects, so a constraint on it is a probe rather
+	// than a scan. An attribute whose own name contains a dot therefore cannot be indexed
+	// as itself -- a path is what a dot means here, and that ambiguity is resolved once,
+	// at configuration, rather than at every query (see indexSpec.paths).
 	CategoricalAttrs []string
 	ValueAttrs       []string
 	// Ordered configures maintained, filtered, ordered indexes -- the schedd
@@ -896,7 +902,7 @@ func New(opts Options) *Collection {
 		for _, n := range opts.ZoneAttrs {
 			addZone(n)
 		}
-		for _, n := range opts.ValueAttrs { // value-indexed attrs are zoned automatically
+		for _, n := range topLevelNames(opts.ValueAttrs) { // value-indexed attrs are zoned automatically
 			addZone(n)
 		}
 		c.hasZones.Store(len(zattrs) > 0)
@@ -928,8 +934,17 @@ func New(opts Options) *Collection {
 	if c.sealer = sealer; c.sealer != nil {
 		enc := foldedSet(opts.EncryptedAttrs)
 		for _, idxAttr := range append(append([]string{}, opts.CategoricalAttrs...), opts.ValueAttrs...) {
-			_, explicit := enc[strings.ToLower(idxAttr)]
-			if explicit || classad.IsPrivateAttribute(idxAttr) {
+			// A nested path is judged by its ROOT attribute: that is the one stored, and
+			// sealing it makes every value under it opaque, so an index on anything inside
+			// it could never match. The index would not be wrong, only useless -- every
+			// record an exception -- and a useless index that was asked for is a
+			// misconfiguration worth naming.
+			root := idxAttr
+			if comps := splitAttrPath(idxAttr); comps != nil {
+				root = comps[0]
+			}
+			_, explicit := enc[strings.ToLower(root)]
+			if explicit || classad.IsPrivateAttribute(root) {
 				panic("collections.New: attribute " + idxAttr + " cannot be both encrypted and indexed")
 			}
 		}

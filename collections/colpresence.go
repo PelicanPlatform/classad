@@ -61,6 +61,9 @@ func (c *Collection) presencePredOnField(q *vm.Query, s *adSchema) (presencePred
 	if p.Op != "absent" && p.Op != "present" {
 		return presencePred{}, false
 	}
+	if p.Nested() {
+		return presencePred{}, false // a columnar field is one top-level attribute (see index_query.go)
+	}
 	id, ok := c.intern.LookupID(p.Attr)
 	if !ok {
 		return presencePred{}, false
