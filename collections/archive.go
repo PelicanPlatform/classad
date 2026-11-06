@@ -721,6 +721,10 @@ func (a *Archive) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool, k
 // evictable page cache), broken out by structure. An operator diagnostic.
 func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
 
+// HasSealedSidecar reports whether any segment carries a mapped sidecar index. See
+// Collection.HasSealedSidecar for why this is not SidecarSizes().Segments > 0.
+func (a *Archive) HasSealedSidecar() bool { return a.c.HasSealedSidecar() }
+
 // HotAttrNames reports the attributes stored in the hot header, mirroring Collection.HotAttrNames. An
 // archive has a hot set exactly as a mutable collection does; only the accessor was missing, which made
 // an archive look like it had none.

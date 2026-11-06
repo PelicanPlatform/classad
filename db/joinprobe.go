@@ -326,8 +326,10 @@ func (cat *Catalog) joinSideStats(table, attr string) (rows, segments int, index
 		c, v := a.IndexedAttrs()
 		cfg := covers(c, v)
 		// A sealed segment's index is in its sidecar; with none sealed there is nothing to
-		// probe, whatever the configuration says.
-		return a.Count(), a.Stats().Segments, cfg && a.SidecarSizes().Segments > 0, cfg, true
+		// probe, whatever the configuration says. Asked through HasSealedSidecar rather
+		// than SidecarSizes, which parses every sidecar to break its bytes out and is a
+		// diagnostic rather than something a query path may call.
+		return a.Count(), a.Stats().Segments, cfg && a.HasSealedSidecar(), cfg, true
 	}
 	// A view's two halves have separate indexes and separate sizes; narrowing one of them
 	// is a decision this does not try to make.
