@@ -29,30 +29,58 @@ func gcAndChurn() {
 // push/pop and every operator call, and it is also the element type of the VM's
 // evaluation stack and of every materialized list, so its size is a direct
 // multiplier on copy traffic and on allocation volume. It went 48 -> 40 by
-// merging the mutually exclusive *ClassAd and *listData fields into one pointer
-// discriminated by valueType; growing it back silently would undo that, so the
-// number is asserted rather than left to a benchmark to notice.
+// merging the mutually exclusive *ClassAd and *listData fields into one pointer,
+// then 40 -> 32 by aliasing that pointer onto strVal's data word; growing it back
+// silently would undo that, so the number is asserted rather than left to a
+// benchmark to notice. 32 also means two Values to a 64-byte cache line.
 //
-// Five words is the floor for a Value that keeps a real Go string: the type tag,
-// the scalar slot, the two-word string header, and the payload pointer. Going
-// lower means hand-rolling the string header (see the comment on Value.strVal
-// for why that trade is refused).
+// Four words is the floor for a Value that keeps strVal a real Go string: the
+// type tag, the scalar slot, and the two-word string header. Going lower means
+// hand-rolling the string header, which costs content equality (see the comment
+// on Value for why that trade is refused).
 func TestValueSize(t *testing.T) {
-	const want = 40
+	const want = 32
 	if got := unsafe.Sizeof(Value{}); got != want {
 		t.Errorf("unsafe.Sizeof(Value{}) = %d, want %d", got, want)
 	}
+	if got := unsafe.Sizeof(Value{}) * 2; got > 64 {
+		t.Errorf("two Values are %d bytes, want <= one 64-byte cache line", got)
+	}
+}
+
+// TestValueSizeIsAGoSizeClass guards a trap that a plain size assertion misses.
+// Go rounds every individual heap allocation up to a size class, and the classes
+// run 8, 16, 24, 32, 48, 64, 80, ... with NOTHING between 32 and 48. A Value of
+// 33..48 bytes therefore occupies a 48-byte slot: the intermediate 40-byte layout
+// this type passed through saved nothing at all for a boxed *Value, only for the
+// contiguous []Value that the VM stack and materialized lists use.
+//
+// So "smaller" is not automatically "cheaper" here, and someone adding a field
+// could take Value to 40 bytes, watch the slice benchmarks improve over 48, and
+// never notice that every boxed Value still costs 48. Pin the size to a real
+// class so that regression has to be deliberate.
+func TestValueSizeIsAGoSizeClass(t *testing.T) {
+	// The small-object size classes, up to well past any plausible Value.
+	classes := []uintptr{8, 16, 24, 32, 48, 64, 80, 96, 112, 128}
+	got := unsafe.Sizeof(Value{})
+	for _, c := range classes {
+		if got == c {
+			return
+		}
+	}
+	t.Errorf("unsafe.Sizeof(Value{}) = %d, which is not a Go size class (%v): a boxed Value would be rounded up and the extra bytes paid for but unused", got, classes)
 }
 
 // TestValuePointerWords pins the number of pointer-shaped words in a Value, which
 // is what the garbage collector must scan for every live Value -- in a VM stack,
-// in a materialized list, in a program's const pool. Merging the two payload
-// pointers took it from three (string data, *ClassAd, *listData) to two (string
-// data, payload). Size alone would not catch a regression here: a future field
-// could keep the struct at 40 bytes while adding a word for the GC to chase, so
-// the count is walked out of the type rather than asserted alongside the size.
+// in a materialized list, in a program's const pool. It went from three (string
+// data, *ClassAd, *listData) to two, and then to one once the payload moved onto
+// strVal's data word. Size alone would not catch a regression here: a future
+// field could keep the struct at 32 bytes while adding a word for the GC to
+// chase, so the count is walked out of the type rather than asserted alongside
+// the size.
 func TestValuePointerWords(t *testing.T) {
-	const want = 2
+	const want = 1
 	if got := pointerWords(reflect.TypeOf(Value{})); got != want {
 		t.Errorf("Value has %d pointer-shaped words, want %d", got, want)
 	}
@@ -142,10 +170,10 @@ func TestPayloadPointerDiscrimination(t *testing.T) {
 	adVal := NewClassAdValue(ad)
 	listVal := NewListValue([]Value{NewIntValue(1), NewIntValue(2)})
 
-	if _, err := adVal.ListValue(); err == nil {
+	if _, lerr := adVal.ListValue(); lerr == nil {
 		t.Error("ListValue() on a ClassAd value: want error, got nil")
 	}
-	if _, err := listVal.ClassAdValue(); err == nil {
+	if _, cerr := listVal.ClassAdValue(); cerr == nil {
 		t.Error("ClassAdValue() on a list value: want error, got nil")
 	}
 	got, err := adVal.ClassAdValue()
@@ -177,12 +205,14 @@ func TestPayloadPointerDiscrimination(t *testing.T) {
 	}
 }
 
-// TestPayloadPointerKeepsReferentAlive is the GC check. ptr is an unsafe.Pointer,
-// so the compiler cannot tell what it addresses -- but the runtime still treats
-// it as a pointer word, which is the whole reason it is unsafe.Pointer and not
-// uintptr. If it were not in Value's pointer map, the only reference to a list's
-// payload or to a nested ad would be invisible to the collector and the object
-// would be freed under us. Force several collections with no other reference
+// TestPayloadPointerKeepsReferentAlive is the GC check, and it matters more in
+// this layout than it did when the payload had a field of its own: the only
+// reference to a nested ad or a list's payload is now the data word of a
+// ZERO-LENGTH string. A reader could reasonably assume the collector skips the
+// data word of an empty string -- it does not, because the pointer map is static
+// and that word is a pointer word in every string. If that were ever untrue the
+// object would be freed while a live Value still addressed it, and the corruption
+// would surface far from here. Force several collections with no other reference
 // alive and read the payload back.
 func TestPayloadPointerKeepsReferentAlive(t *testing.T) {
 	makeList := func() Value {
@@ -207,8 +237,8 @@ func TestPayloadPointerKeepsReferentAlive(t *testing.T) {
 	if len(elems) != 2 {
 		t.Fatalf("ListValue() len = %d, want 2", len(elems))
 	}
-	if s, err := elems[0].StringValue(); err != nil || s != "alice" {
-		t.Errorf("elems[0] = %q, %v; want \"alice\", nil", s, err)
+	if s, serr := elems[0].StringValue(); serr != nil || s != "alice" {
+		t.Errorf("elems[0] = %q, %v; want \"alice\", nil", s, serr)
 	}
 	ad, err := av.ClassAdValue()
 	if err != nil {
@@ -216,5 +246,116 @@ func TestPayloadPointerKeepsReferentAlive(t *testing.T) {
 	}
 	if v, ok := ad.EvaluateAttrString("Owner"); !ok || v != "alice" {
 		t.Errorf("Owner after GC = %q, %v; want \"alice\", true", v, ok)
+	}
+}
+
+// TestZeroLengthAliasRoundTrip guards the one assumption this layout makes about
+// the Go runtime that the language does not promise: that a zero-length string
+// built by unsafe.String keeps the data pointer it was given instead of being
+// canonicalized to the empty string. The standard library documents the data
+// pointer of an empty string as unspecified, so if a future release ever does
+// canonicalize, classAd() and list() would hand back nil and the failure would
+// look like an unrelated nil dereference deep in evaluation. This test turns
+// that into a loud, obvious failure at the layout instead.
+func TestZeroLengthAliasRoundTrip(t *testing.T) {
+	ad, err := Parse(`[Owner = "alice"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := payloadString(unsafe.Pointer(ad))
+	if s != "" {
+		t.Fatalf("payloadString length = %d, want 0 (a nonzero length makes == read the ad's raw memory)", len(s))
+	}
+	if got := (*ClassAd)(unsafe.Pointer(unsafe.StringData(s))); got != ad {
+		t.Fatalf("aliased pointer round-trip: got %p, want %p -- the Go runtime canonicalized a zero-length string's data pointer", got, ad)
+	}
+	// A nil payload must survive too: NewClassAdValue(nil) is legal and String()
+	// renders it "[]". unsafe.String panics on a nil pointer only when len > 0.
+	if nilAd := NewClassAdValue(nil); nilAd.classAd() != nil {
+		t.Errorf("NewClassAdValue(nil).classAd() = %p, want nil", nilAd.classAd())
+	}
+}
+
+// TestEqualitySemantics pins what Go's `==` does for every pair of Value types.
+// Value is an exported comparable struct, so `==` and use as a map key are part
+// of its API whether or not this repo writes them, and this layout deliberately
+// changes one cell of the table: aliasing the payload onto a ZERO-LENGTH string
+// means Go compares ad and list values on the length alone and never reaches the
+// pointers, so two DIFFERENT ads now compare equal. That is the price of the
+// fourth word. It is pinned here, per cell, so it is a documented decision rather
+// than something a reader discovers in production.
+func TestEqualitySemantics(t *testing.T) {
+	adA, err := Parse(`[A = 1]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adB, err := Parse(`[B = 2]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Built from separate backing arrays on purpose: the whole reason strVal
+	// stays a real Go string is that these must still compare equal.
+	aliceLit := "alice"
+	aliceBuilt := string([]byte{'a', 'l', 'i', 'c', 'e'})
+
+	cases := []struct {
+		name string
+		a, b Value
+		want bool
+	}{
+		// Strings: CONTENT equality, the property the 24-byte layout gave up.
+		{"string/string same content, different backing", NewStringValue(aliceLit), NewStringValue(aliceBuilt), true},
+		{"string/string different content", NewStringValue("alice"), NewStringValue("bob"), false},
+		{"string/string differing only in case", NewStringValue("Alice"), NewStringValue("alice"), false},
+		{"string/string both empty", NewStringValue(""), NewStringValue(""), true},
+		// Scalars: unchanged.
+		{"int/int same", NewIntValue(7), NewIntValue(7), true},
+		{"int/int different", NewIntValue(7), NewIntValue(8), false},
+		{"real/real same", NewRealValue(1.5), NewRealValue(1.5), true},
+		{"bool/bool same", NewBoolValue(true), NewBoolValue(true), true},
+		{"bool/bool different", NewBoolValue(true), NewBoolValue(false), false},
+		{"undefined/undefined", NewUndefinedValue(), NewUndefinedValue(), true},
+		{"error/error", NewErrorValue(), NewErrorValue(), true},
+		// THE CHANGED CELLS: ad/ad and list/list are now always equal within
+		// their type, where they used to compare by pointer identity.
+		{"ad/ad same pointer", NewClassAdValue(adA), NewClassAdValue(adA), true},
+		{"ad/ad DIFFERENT pointers (was false)", NewClassAdValue(adA), NewClassAdValue(adB), true},
+		{"list/list DIFFERENT pointers (was false)", NewListValue([]Value{NewIntValue(1)}), NewListValue([]Value{NewIntValue(2)}), true},
+		// Cross-type: still separated by valueType, including the cases that
+		// would otherwise collide now that ad/list carry a zero-length string.
+		{"ad vs empty string", NewClassAdValue(adA), NewStringValue(""), false},
+		{"list vs empty string", NewListValue(nil), NewStringValue(""), false},
+		{"ad vs list", NewClassAdValue(adA), NewListValue(nil), false},
+		{"undefined vs error", NewUndefinedValue(), NewErrorValue(), false},
+		{"int vs real same numeric", NewIntValue(1), NewRealValue(1), false},
+		{"string vs int", NewStringValue("1"), NewIntValue(1), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.a == tc.b; got != tc.want {
+				t.Errorf("a == b = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValueAsMapKey is the other half of comparability: a Value must still work
+// as a map key, which is what would have broken outright had strVal stopped
+// being a real string. Separately built equal strings must hit the same bucket.
+func TestValueAsMapKey(t *testing.T) {
+	m := map[Value]string{}
+	m[NewStringValue("alice")] = "first"
+	m[NewStringValue(string([]byte{'a', 'l', 'i', 'c', 'e'}))] = "second"
+	if len(m) != 1 {
+		t.Errorf("map has %d entries, want 1: separately built equal strings must be one key", len(m))
+	}
+	if got := m[NewStringValue("alice")]; got != "second" {
+		t.Errorf("lookup = %q, want %q", got, "second")
+	}
+	m[NewIntValue(1)] = "int"
+	m[NewRealValue(1)] = "real"
+	m[NewBoolValue(true)] = "bool"
+	if len(m) != 4 {
+		t.Errorf("map has %d entries, want 4: the scalar types must stay distinct keys", len(m))
 	}
 }

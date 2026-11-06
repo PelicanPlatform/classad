@@ -39,66 +39,88 @@ const (
 // words and only used by list values) lives out-of-line behind the payload
 // pointer, leaving a Value that is a scalar/string/classad in one compact struct.
 //
-// The struct is five words laid out as a tagged union, and every payload a Value
-// can carry is squeezed into two of them:
+// The struct is four words laid out as a tagged union. Every payload a Value can
+// carry is squeezed into two slots, and the slots are shared only ever
+// pointer-with-pointer or scalar-with-scalar, never across the two:
 //
 //   - intVal is the non-pointer slot, shared by every scalar payload.
-//   - ptr is the pointer slot, shared by every out-of-line payload.
+//   - strVal's DATA POINTER is the pointer slot, shared by the string's bytes,
+//     the *ClassAd of a ClassAdValue and the *listData of a ListValue.
 //
-// Sharing is only ever pointer-with-pointer or scalar-with-scalar, never across
-// the two. That is not stylistic: Go's garbage collector decides which words of a
-// value to scan from the STATIC type of the field, so a word that is sometimes a
-// pointer and sometimes an integer is unrepresentable -- scanned, an integer is
+// Never crossing is not stylistic: Go's garbage collector decides which words of
+// a value to scan from the STATIC type of the field, so a word that is sometimes
+// a pointer and sometimes an integer is unrepresentable -- scanned, an integer is
 // followed as a pointer; unscanned, a live object is freed. No amount of unsafe
 // changes this, because the pointer map is baked into the type descriptor at
-// compile time. It is what keeps Value at five words instead of three: intVal
-// cannot be folded into ptr's word, and the string header's length cannot be
-// folded into intVal's word unless the string's data pointer also moves into ptr
-// (see the note on strVal below, where that alternative is weighed).
+// compile time. strVal's data word is a pointer word in every layout it takes
+// here, so the collector's view of a Value is correct whatever the tag says.
+//
+// Four words is the floor for a Value that keeps strVal a real Go string, which
+// is what preserves the property a core value type should not give up: two
+// separately built "alice" values still compare equal, and a Value still works as
+// a map key. The alternative -- splitting the string into a raw {data pointer,
+// length} pair across the two slots -- reaches three words and is equally
+// GC-legal, but it makes string values compare by ADDRESS instead of by
+// characters, a silent change that the whole test suite passes straight through.
+// Eight more bytes are not worth that. See payloadString for what the aliasing
+// does cost, which is narrower but not nothing.
 type Value struct {
 	valueType ValueType
 	// intVal holds an integer value, a boolean (0 or 1), and -- for a RealValue --
 	// the IEEE-754 bits of the float64 (see real()/NewRealValue). Folding all three
 	// scalar payloads here keeps Value one word smaller than a separate bool/real
 	// field would, and the bits round-trip exactly (NaN/Inf/-0 included).
-	intVal int64
-	// strVal is a string value's payload, kept as a real Go string rather than a
-	// hand-rolled {data pointer, length} pair split across ptr and intVal. That pair
-	// would be GC-legal (the data pointer is a pointer, the length is not) and would
-	// take Value from 40 bytes to 24, but it costs the one thing a core value type
-	// should not give up: a Value stops being comparable by content. `a == b` on an
-	// exported comparable struct is part of this package's API whether or not this
-	// repo writes it, and today it compares two string values by their characters;
-	// with a raw data pointer it would compare them by address, so two separately
-	// built "alice" values -- one from a parsed ad, one from a literal -- would stop
-	// being equal, and a Value used as a map key would stop working. Eight bytes is
-	// not worth a silent, type-checks-fine behavior change in downstream code.
-	strVal string
-	// ptr is the out-of-line payload, discriminated by valueType: the *ClassAd for a
-	// ClassAdValue and the *listData for a ListValue (see classAd() and list()).
-	// Those two are mutually exclusive -- a Value is one type -- so giving each its
-	// own typed field wasted a word on every Value of every other type, and cost the
-	// GC a third pointer word to scan on every Value it walked. valueType already
-	// discriminates them, so the typed fields carried no information the tag did not.
 	//
-	// unsafe.Pointer, not uintptr: it is a real pointer as far as the runtime is
-	// concerned, so it appears in Value's pointer map, keeps its referent alive, and
-	// is updated like any other pointer. The unsafety here is purely that the
-	// compiler no longer checks which type comes back out, which is why every read
-	// goes through classAd() or list() and those are the only two conversion sites.
-	ptr unsafe.Pointer
+	// It is zero for every other type. A string value leaves it zero too; see the
+	// prefix discussion on NewStringValue for what was measured for that slot.
+	intVal int64
+	// strVal is a string value's characters, and for a ClassAdValue or a ListValue
+	// it is a ZERO-LENGTH string whose data pointer is the *ClassAd or *listData
+	// (see payloadString, classAd() and list()). Those three are mutually exclusive
+	// -- a Value is one type, and valueType says which -- so a separate payload
+	// pointer field was a word that every Value paid for and no Value used twice,
+	// plus a third pointer word for the GC to scan on every Value it walked.
+	strVal string
 }
 
-// classAd reinterprets ptr as the *ClassAd it holds. Valid only when
-// valueType == ClassAdValue.
+// payloadString packs an out-of-line payload pointer into strVal's data word as a
+// zero-length string, so that a ClassAdValue and a ListValue need no field of
+// their own. It is the only place that builds one.
+//
+// The length MUST be zero. It is not a free choice:
+//
+//   - Any nonzero length makes Go's string equality run memequal over the
+//     pointed-at object's raw memory, so two unrelated ads would compare by their
+//     bytes; a length exceeding the object reads out of bounds outright.
+//   - With length zero, Go short-circuits string equality on the length alone and
+//     never looks at the pointers, so ALL ClassAd values compare equal to each
+//     other and all list values compare equal to each other. valueType still
+//     separates the types, so an ad value never equals a string or a list value.
+//
+// That second point is the real price of this layout, and it is a deliberate
+// trade: ad/list equality goes from pointer identity to always-equal-within-type.
+// It is narrower than breaking string equality (which is why the string stays a
+// string) but it is still silent, so TestEqualitySemantics pins every case.
+//
+// unsafe.String with a zero length keeps the pointer rather than canonicalizing
+// to "" -- the standard library documents the data pointer of an empty string as
+// unspecified, so TestZeroLengthAliasRoundTrip asserts the round trip and will
+// fail loudly on a Go release that changes it, rather than silently handing back
+// a nil ad.
+func payloadString(p unsafe.Pointer) string {
+	return unsafe.String((*byte)(p), 0)
+}
+
+// classAd reinterprets strVal's data pointer as the *ClassAd it holds. Valid only
+// when valueType == ClassAdValue.
 func (v Value) classAd() *ClassAd {
-	return (*ClassAd)(v.ptr)
+	return (*ClassAd)(unsafe.Pointer(unsafe.StringData(v.strVal)))
 }
 
-// list reinterprets ptr as the *listData it holds. Valid only when
-// valueType == ListValue, where it is always non-nil.
+// list reinterprets strVal's data pointer as the *listData it holds. Valid only
+// when valueType == ListValue, where it is always non-nil.
 func (v Value) list() *listData {
-	return (*listData)(v.ptr)
+	return (*listData)(unsafe.Pointer(unsafe.StringData(v.strVal)))
 }
 
 // listData is a list value's payload, stored out-of-line to keep Value small. It
@@ -182,13 +204,13 @@ func NewStringValue(s string) Value {
 // NewListValue creates a list value.
 func NewListValue(list []Value) Value {
 	countValue()
-	return Value{valueType: ListValue, ptr: unsafe.Pointer(&listData{vals: list})}
+	return Value{valueType: ListValue, strVal: payloadString(unsafe.Pointer(&listData{vals: list}))}
 }
 
 // NewClassAdValue creates a ClassAd value.
 func NewClassAdValue(ad *ClassAd) Value {
 	countValue()
-	return Value{valueType: ClassAdValue, ptr: unsafe.Pointer(ad)}
+	return Value{valueType: ClassAdValue, strVal: payloadString(unsafe.Pointer(ad))}
 }
 
 // Type returns the type of the value.
@@ -1074,7 +1096,7 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 		exprs = []ast.Expr{}
 	}
 	countValue()
-	return Value{valueType: ListValue, ptr: unsafe.Pointer(&listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind})}
+	return Value{valueType: ListValue, strVal: payloadString(unsafe.Pointer(&listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind}))}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
