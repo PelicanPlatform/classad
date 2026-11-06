@@ -3,6 +3,7 @@ package dbrpc
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"iter"
 	"strings"
@@ -398,6 +399,55 @@ func catalogJoinsChains(cat any) bool {
 // client joins the two sides itself, which is what it did before this opcode existed.
 type joinCatalog interface {
 	Join(spec db.JoinSpec, want db.JoinLimits, stats *db.JoinStats) (iter.Seq[*classad.ClassAd], error)
+}
+
+// joinExplainCatalog is the optional Catalog capability to report how a join WOULD run.
+//
+// Separate from joinCatalog because running a join and describing the plan are different
+// abilities: every catalog that joins makes these decisions, and only one that has been
+// taught to name them can answer this.
+type joinExplainCatalog interface {
+	ExplainJoin(spec db.JoinSpec, want db.JoinLimits) (db.JoinExplain, error)
+}
+
+// explainJoin answers opJoinExplain / opJoinChainExplain: how the catalog would run the
+// join, with no records read.
+//
+// It goes through the same private-attribute gate the join itself does. The report names
+// the plan's expressions back to the caller, so a caller barred from referencing a private
+// attribute in a condition must not be able to get it echoed out of the explainer either.
+func (s *Server) explainJoin(reqID uint64, r *reader, includePrivate, chain bool) []byte {
+	jr, ok := readJoinRequest(r, chain)
+	if !ok {
+		return respBad(reqID)
+	}
+	cat, ok := s.cat.(joinExplainCatalog)
+	if !ok {
+		return respBad(reqID)
+	}
+	// BOTH gates the join itself applies, for the same reasons and in the same order. The
+	// first catches a bare reference, which is how a side's OWN constraint is written; the
+	// second catches an alias-qualified one, which is how a condition over the joined row
+	// is. Applying only the second let a private attribute through in a side constraint.
+	var refused []byte
+	catch := func(b []byte) { refused = b }
+	for _, src := range joinExprs(jr.Spec) {
+		if refusePrivateConstraint(reqID, src, includePrivate, catch) {
+			return refused
+		}
+	}
+	if refusePrivateJoinRef(reqID, jr.Spec, includePrivate, catch) {
+		return refused
+	}
+	ex, err := cat.ExplainJoin(jr.Spec, jr.Limits)
+	if err != nil {
+		return respErr(reqID, err.Error())
+	}
+	data, err := json.Marshal(ex)
+	if err != nil {
+		return respErr(reqID, err.Error())
+	}
+	return putStr(resp(reqID, stOK), string(data))
 }
 
 // joinExprs is every expression in the plan that the server will evaluate.

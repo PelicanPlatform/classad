@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -644,6 +645,38 @@ func (c *Client) ExplainTable(ctx context.Context, table, constraint string) (*d
 		return nil, statusErr(status, body)
 	}
 	var ex db.QueryExplain
+	if err := json.Unmarshal([]byte(body.str()), &ex); err != nil {
+		return nil, err
+	}
+	return &ex, nil
+}
+
+// ExplainJoin reports how the server would run this join, without running it.
+//
+// It reads no records, so it is safe to ask about a join too expensive to execute. What it
+// cannot tell you is how many distinct key values the streamed side turns out to hold --
+// counting those means reading that side -- so a step reported with a probe attribute is
+// ELIGIBLE for an index probe rather than promised one. See db.JoinExplain.
+//
+// A server that does not implement the opcode reports ErrJoinUnsupported, the same sentinel
+// Join uses, so a caller classifies both the same way.
+func (c *Client) ExplainJoin(ctx context.Context, jr JoinRequest) (*db.JoinExplain, error) {
+	if !c.SupportsNewer(FeatJoinExplain) {
+		return nil, ErrJoinUnsupported
+	}
+	o, _ := joinOpFor(jr, opJoinExplain, opJoinChainExplain, FeatJoinExplain, FeatJoinExplain)
+	status, body, err := c.callCtx(ctx, joinFrameOp(jr, o, false, false))
+	if err != nil {
+		return nil, err
+	}
+	if status != stOK {
+		serr := statusErr(status, body)
+		if errors.Is(serr, ErrBadRequest) {
+			return nil, ErrJoinUnsupported
+		}
+		return nil, serr
+	}
+	var ex db.JoinExplain
 	if err := json.Unmarshal([]byte(body.str()), &ex); err != nil {
 		return nil, err
 	}

@@ -94,7 +94,10 @@ type joinProbes struct {
 
 // probeCandidate is one step that passed every gate a scan is not needed for.
 type probeCandidate struct {
-	step     int
+	step int
+	// equi is which of the step's equalities this candidate would narrow on, and attr the
+	// attribute of the step's own table that equality names.
+	equi     int
 	attr     string
 	rows     int
 	segments int
@@ -128,17 +131,24 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	stats.ProbeSteps = make([]JoinProbeStat, len(p.steps))
 	var cands []*probeCandidate
 	for i, sp := range p.steps {
-		attr, rows, segments, why := cat.probeGate(sp, sides[sp.side])
+		attrs, rows, segments, why := cat.probeGateAll(sp, sides[sp.side])
 		// EstRecords is recorded even when the gate declines, because the decline that
 		// reads on the size is the one a reader most needs the size for.
 		stats.ProbeSteps[i] = JoinProbeStat{Alias: p.aliases[sp.side], Why: why, EstRecords: rows}
 		if why != "" {
 			continue
 		}
-		stats.ProbeSteps[i].Attr = attr
-		cands = append(cands, &probeCandidate{
-			step: i, attr: attr, rows: rows, segments: segments, seen: map[string]bool{},
-		})
+		// One candidate per probeable equality. Which of them is worth narrowing on is
+		// not knowable yet -- it turns on how many distinct keys the FROM side holds for
+		// each, which the scan below counts -- so all of them collect keys and the choice
+		// is made once the counts are in.
+		stats.ProbeSteps[i].Attr = attrs[0].attr
+		for _, pa := range attrs {
+			cands = append(cands, &probeCandidate{
+				step: i, equi: pa.equi, attr: pa.attr,
+				rows: rows, segments: segments, seen: map[string]bool{},
+			})
+		}
 	}
 	if len(cands) == 0 {
 		stats.syncFirstProbe()
@@ -174,7 +184,7 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 				continue // already past the cap; keep reading so the held side stays complete
 			}
 			sp := p.steps[c.step]
-			v, ok := p.rowHalfValue(sp, rows)
+			v, ok := p.rowHalfValueAt(sp, rows, c.equi)
 			if !ok {
 				continue
 			}
@@ -192,29 +202,54 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	}
 	out.held = held
 
-	for _, c := range cands {
-		lookups := c.segments * len(c.lits)
-		st := &stats.ProbeSteps[c.step]
+	// One constraint per STEP, conjoining every equality that collected keys.
+	//
+	// All of them rather than the best one, because which is "best" is not knowable here.
+	// A constraint's selectivity is its key count over the attribute's distinct values IN
+	// THE HASHED TABLE, and that second number lives in the segment statistics, which this
+	// layer cannot see. Choosing on key count alone gets the common case backwards: a join
+	// on (ClusterId, ProcId) may offer fifty ClusterIds and four ProcIds, and the four
+	// would win while matching every row in the table.
+	//
+	// Conjoining them hands the choice to the query planner, which does have those
+	// statistics and already orders conjuncts by estimated selectivity before intersecting
+	// their postings. A row matching all the equalities matches each of them, so the
+	// conjunction is as sound a superset filter as any one of them, and strictly narrower.
+	for _, g := range groupByStep(cands) {
+		st := &stats.ProbeSteps[g[0].step]
+		keys, lookups := 0, 0
+		for _, c := range g {
+			keys += len(c.lits)
+			lookups += c.segments * len(c.lits)
+		}
+		rows := g[0].rows
 		switch {
-		case len(c.lits) == 0:
+		case keys == 0:
 			st.Why = "no row of the FROM side has a usable key value"
 			continue
-		case len(c.lits) > maxProbeKeys:
+		case tooManyKeys(g):
 			st.Why = fmt.Sprintf("the FROM side has more than %d distinct keys", maxProbeKeys)
 			continue
-		case lookups*probeLookupCost > c.rows:
+		case lookups*probeLookupCost > rows:
 			st.Why = fmt.Sprintf("%d keys across %d segments is %d index lookups against a "+
-				"read of %d records, which costs more than it saves", len(c.lits), c.segments,
-				lookups, c.rows)
+				"read of %d records, which costs more than it saves", keys, g[0].segments,
+				lookups, rows)
 			continue
 		}
-		sort.Strings(c.lits) // so the same join builds the same constraint
-		terms := make([]string, len(c.lits))
-		for i, l := range c.lits {
-			terms[i] = c.attr + " == " + l
+		parts := make([]string, 0, len(g))
+		attrs := make([]string, 0, len(g))
+		for _, c := range g {
+			sort.Strings(c.lits) // so the same join builds the same constraint
+			terms := make([]string, len(c.lits))
+			for i, l := range c.lits {
+				terms[i] = c.attr + " == " + l
+			}
+			parts = append(parts, "("+strings.Join(terms, " || ")+")")
+			attrs = append(attrs, c.attr)
 		}
-		out.cons[c.step] = "(" + strings.Join(terms, " || ") + ")"
-		st.Keys = len(c.lits)
+		out.cons[g[0].step] = strings.Join(parts, " && ")
+		st.Attr = strings.Join(attrs, ", ")
+		st.Keys = keys
 	}
 	stats.syncFirstProbe()
 	return out
@@ -222,38 +257,63 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 
 // probeGate applies every test that can be made without reading a row, and names the attribute
 // a constraint would be built on when they all pass.
-func (cat *Catalog) probeGate(sp *joinStepPlan, side JoinSide) (attr string, rows, segments int, why string) {
-	if len(sp.equiSide) != 1 {
-		if len(sp.equiSide) == 0 {
-			return "", 0, 0, "the condition has no equality to probe an index with"
+// probeGateAll applies every test that can be made without reading a row and returns EVERY
+// equality of the step a membership constraint could be built on.
+//
+// More than one is useful because a constraint narrows on ONE equality and the choice
+// matters. Narrowing on any of them is sound -- a row matching all the equalities matches
+// each of them, so a constraint built from one is a superset filter, and the hash key is
+// still built from all of them while the ON condition re-checks every pair. But which one
+// is worth narrowing on differs enormously: a join on a composite key like
+// (ClusterId, ProcId) may see fifty distinct ClusterIds and five thousand ProcIds from the
+// same FROM side, and narrowing on the second would replace a scan with more index lookups
+// than the scan reads records. So the gate names the candidates and the scan, which counts
+// each one's distinct keys anyway, picks between them.
+//
+// This is also why a step is no longer refused outright for having several equalities. That
+// refusal cost the probe on exactly the shape it is most wanted for: a two-attribute key is
+// how jobs are identified, so the join that most wants an index was the one declining it.
+func (cat *Catalog) probeGateAll(sp *joinStepPlan, side JoinSide) (out []probeAttr, rows, segments int, why string) {
+	if len(sp.equiSide) == 0 {
+		return nil, 0, 0, "the condition has no equality to probe an index with"
+	}
+	var names []string
+	for i, ex := range sp.equiSide {
+		if i < len(sp.rowOnSide0) && !sp.rowOnSide0[i] {
+			continue // its key values are not known from a scan of the FROM side
 		}
-		return "", 0, 0, fmt.Sprintf("the condition has %d equality terms and a membership "+
-			"constraint can narrow on only one", len(sp.equiSide))
-	}
-	if !sp.rowReadsOnlySide0 {
-		return "", 0, 0, "the equality's row half reads a side an earlier step folds in, so " +
-			"its key values are not known from a scan of the FROM side"
-	}
-	attr, ok := bareAttr(sp.equiSide[0])
-	if !ok {
-		return "", 0, 0, "the equality's table half is computed, so there is no attribute to name"
-	}
-	rows, segments, indexed, configured, ok := cat.joinSideStats(side.Table, attr)
-	if !ok {
-		return "", 0, 0, "the hashed side's size could not be learned"
-	}
-	if !indexed {
-		// Configured-but-not-built is reported as its own case, because it is the one a
-		// reader is most likely to mistake for a working probe: the table says it indexes
-		// the attribute, and a constraint naming it still parses and still filters -- over
-		// a full scan, at a cost that grows with the key count.
-		if configured {
-			return "", 0, 0, fmt.Sprintf("%s.%s is configured for an index but none is built "+
-				"yet (postings appear as segments seal), so a membership constraint would "+
-				"filter a full scan rather than replace it", side.Alias, attr)
+		if a, ok := bareAttr(ex); ok {
+			out = append(out, probeAttr{equi: i, attr: a})
+			names = append(names, a)
 		}
-		return "", 0, 0, fmt.Sprintf("no index covers %s.%s, so a membership constraint would "+
-			"filter a full scan rather than replace it", side.Alias, attr)
+	}
+	if len(out) == 0 {
+		if !sp.rowReadsOnlySide0 {
+			return nil, 0, 0, "the equality's row half reads a side an earlier step folds " +
+				"in, so its key values are not known from a scan of the FROM side"
+		}
+		return nil, 0, 0, "the equality's table half is computed, so there is no attribute to name"
+	}
+	// Every candidate reads the same table, so its size and segment count are asked once.
+	// Which attributes are INDEXED is per attribute, and is what the filter below is for.
+	rows, segments, _, _, ok := cat.joinSideStats(side.Table, "")
+	if !ok {
+		return nil, 0, 0, "the hashed side's size could not be learned"
+	}
+	kept := out[:0]
+	var configuredOnly []string
+	for _, pa := range out {
+		_, _, indexed, configured, statsOK := cat.joinSideStats(side.Table, pa.attr)
+		switch {
+		case statsOK && indexed:
+			kept = append(kept, pa)
+		case configured:
+			configuredOnly = append(configuredOnly, pa.attr)
+		}
+	}
+	out = kept
+	if len(out) == 0 {
+		return nil, 0, 0, noIndexWhy(side.Alias, names, configuredOnly)
 	}
 	// A side with a constraint of its own does not read the whole table, so the table's size
 	// is not what a membership constraint would save. Price the read it actually does; the
@@ -262,37 +322,64 @@ func (cat *Catalog) probeGate(sp *joinStepPlan, side JoinSide) (attr string, row
 	// date far more often than not.
 	rows, why = cat.sideRows(side, rows)
 	if why != "" {
-		return "", 0, 0, why
+		return nil, 0, 0, why
 	}
 	if rows < minProbeRows {
 		// rows is returned with the decline: it is the whole reason for it.
-		return "", rows, segments, fmt.Sprintf("the hashed side's read visits %d records, "+
+		return nil, rows, segments, fmt.Sprintf("the hashed side's read visits %d records, "+
 			"below the %d where narrowing is worth deciding", rows, minProbeRows)
 	}
-	return attr, rows, segments, ""
+	return out, rows, segments, ""
 }
 
-// rowHalfValue evaluates the accumulated row's half of a step's single equality, which is
-// what a probe narrows the step's table to.
-func (p *joinPlan) rowHalfValue(sp *joinStepPlan, rows []*joinRow) (classad.Value, bool) {
-	if len(sp.equiRow) != 1 {
+// probeAttr is one equality of a step that a membership constraint could narrow on: which
+// equality it is, and the attribute of the step's own table it names.
+type probeAttr struct {
+	equi int
+	attr string
+}
+
+// noIndexWhy explains that no candidate attribute is indexed.
+//
+// Configured-but-not-built is reported as its own case, because it is the one a reader is
+// most likely to mistake for a working probe: the table says it indexes the attribute, and
+// a constraint naming it still parses and still filters -- over a full scan, at a cost that
+// grows with the key count.
+func noIndexWhy(alias string, names, configured []string) string {
+	if len(configured) > 0 {
+		return fmt.Sprintf("%s.%s is configured for an index but none is built yet (postings "+
+			"appear as segments seal), so a membership constraint would filter a full scan "+
+			"rather than replace it", alias, configured[0])
+	}
+	if len(names) == 1 {
+		return fmt.Sprintf("no index covers %s.%s, so a membership constraint would filter a "+
+			"full scan rather than replace it", alias, names[0])
+	}
+	return fmt.Sprintf("no index covers any of %s (%s), so a membership constraint would "+
+		"filter a full scan rather than replace it", alias, strings.Join(names, ", "))
+}
+
+// rowHalfValueAt evaluates the accumulated row's half of the step's k'th equality, which is
+// what a probe narrowing on that equality would restrict the step's table to.
+func (p *joinPlan) rowHalfValueAt(sp *joinStepPlan, rows []*joinRow, k int) (classad.Value, bool) {
+	if k < 0 || k >= len(sp.equiRow) {
 		return classad.Value{}, false
 	}
 	// The same bare-attribute shortcut the hash key uses: the probe reads one half of every
 	// scanned row, so decoding each one to read one attribute is the cost this scan exists
 	// to avoid.
-	if name := sp.equiRowAttr[0]; name != "" {
+	if name := sp.equiRowAttr[k]; name != "" {
 		if rows[0] == nil {
 			return classad.Value{}, false
 		}
 		return rows[0].eval(name), true
 	}
-	if al := sp.rowAliased[0]; al != nil {
+	if al := sp.rowAliased[k]; al != nil {
 		if v, ok := al.eval(rows); ok {
 			return v, true
 		}
 	}
-	return sp.equiRow[0].Eval(p.rowHalfScope(sp, rows)), true
+	return sp.equiRow[k].Eval(p.rowHalfScope(sp, rows)), true
 }
 
 // joinSideStats reports what the decision needs about the side about to be hashed: how many
@@ -402,4 +489,35 @@ func quoteClassAdString(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// groupByStep gathers the per-equality candidates by the step they narrow, keeping both the
+// steps and the equalities within a step in the order they were written, so the same join
+// builds the same constraint twice.
+func groupByStep(cands []*probeCandidate) [][]*probeCandidate {
+	byStep := map[int][]*probeCandidate{}
+	order := make([]int, 0, len(cands))
+	for _, c := range cands {
+		if _, seen := byStep[c.step]; !seen {
+			order = append(order, c.step)
+		}
+		byStep[c.step] = append(byStep[c.step], c)
+	}
+	out := make([][]*probeCandidate, 0, len(order))
+	for _, step := range order {
+		out = append(out, byStep[step])
+	}
+	return out
+}
+
+// tooManyKeys reports that some equality of the step blew the per-constraint key cap. Per
+// equality rather than on the total: each is its own OR-chain, and the cap is on how long
+// one of those may get before building and evaluating it costs more than any scan it saves.
+func tooManyKeys(g []*probeCandidate) bool {
+	for _, c := range g {
+		if len(c.lits) > maxProbeKeys {
+			return true
+		}
+	}
+	return false
 }
