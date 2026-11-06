@@ -104,7 +104,8 @@ type ArchiveOptions struct {
 	// It is a property of the archive, not of a query, because a per-query flag would let one
 	// caller's "I do not care" reorder another caller's results.
 	Unordered bool
-	// CategoricalAttrs / ValueAttrs configure the per-segment indexes (see Collection).
+	// CategoricalAttrs / ValueAttrs configure the per-segment indexes (see Collection),
+	// including nested paths such as "Res.Mem".
 	CategoricalAttrs []string
 	ValueAttrs       []string
 	// CompositeAttrs configures composite (multi-column) indexes over attribute tuples
@@ -950,6 +951,12 @@ func zonePrune(zones map[uint32]zoneRange, probes []vm.Probe, intern *wire.Inter
 		return false
 	}
 	for _, p := range probes {
+		if p.Nested() {
+			// A zone map holds one [min,max] per TOP-LEVEL attribute, so it has nothing to
+			// say about a nested path -- and an attribute that happens to be NAMED "Res.Mem"
+			// would answer in its place, ruling out segments that do hold matches.
+			continue
+		}
 		id, ok := intern.LookupID(p.Attr)
 		if !ok {
 			continue

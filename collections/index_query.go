@@ -1011,6 +1011,53 @@ func (c *Collection) explainZonePruned(q *vm.Query) (pruned, total int) {
 	return pruned, total
 }
 
+// NESTED PROBES AND THE COLUMNAR FAST PATHS.
+//
+// A columnar segment stores one field per TOP-LEVEL attribute, keyed by that attribute's
+// interned id; a nested path has no field of its own, and its value lives inside the parent
+// attribute's node, which the field holds whole. Resolving `Res.Mem` against the field for
+// `Res` would compare a record literal with a number; resolving it by NAME would find a field
+// only if some ad carried an attribute literally called "Res.Mem", whose values have nothing
+// to do with the path's. Both answer a question the query did not ask, and both do it in the
+// block-pruning position, where a wrong answer is a block never scanned rather than a row
+// re-verified and dropped.
+//
+// So the columnar prefilters, aggregates, string-zone prunes and presence fast paths all
+// decline a probe whose Nested() is true; the row scan -- and the postings index, which does
+// resolve paths -- answers it instead.
+//
+// None of those declines is reachable today: a select compiles to a delegated subtree, so a
+// query carrying a nested probe is never Native, and every columnar fast path is gated on
+// Native. They are written anyway because that gate is a statement about the PROGRAM, not
+// about the probe, and the day a select compiles natively it would stop covering this.
+
+// probeAttrID resolves the index key a probe is about, REQUIRING the probe's shape to match
+// the spec's: a nested-path probe only resolves to an index configured on that same path, and
+// a probe on a top-level attribute never resolves to a path index. Both land on the same id
+// when an ad carries an attribute literally named like a configured path (see indexSpec.paths),
+// and reading either one's postings for the other would answer with a candidate set that is
+// missing matching records. A mismatch declines, and the query scans.
+func (c *Collection) probeAttrID(spec *indexSpec, p vm.Probe) (uint32, bool) {
+	var id uint32
+	var ok bool
+	if spec.inline {
+		id, ok = spec.nameToID[strings.ToLower(p.Attr)]
+	} else {
+		id, ok = c.intern.LookupID(p.Attr)
+	}
+	if !ok {
+		return 0, false
+	}
+	have, isPath := spec.paths[id]
+	if p.Nested() != isPath {
+		return 0, false
+	}
+	if isPath && !samePath(have.comps, p.Path) {
+		return 0, false
+	}
+	return id, true
+}
+
 // probeIndexKind reports whether a probe's attribute is indexed and, if so, its
 // index kind, whether this probe's operator can use it (mirrors planIndex's
 // per-probe decision), and the resolved usableProbe when usable.
@@ -1019,13 +1066,7 @@ func (c *Collection) probeIndexKind(p vm.Probe) (indexed bool, kind string, up u
 	if !spec.any() {
 		return false, "", usableProbe{}, false
 	}
-	var id uint32
-	var ok bool
-	if spec.inline {
-		id, ok = spec.nameToID[strings.ToLower(p.Attr)]
-	} else {
-		id, ok = c.intern.LookupID(p.Attr)
-	}
+	id, ok := c.probeAttrID(spec, p)
 	if !ok {
 		return false, "", usableProbe{}, false
 	}
@@ -1111,13 +1152,7 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 	}
 	var out []usableProbe
 	for _, p := range probes {
-		var id uint32
-		var ok bool
-		if spec.inline {
-			id, ok = spec.nameToID[strings.ToLower(p.Attr)]
-		} else {
-			id, ok = c.intern.LookupID(p.Attr)
-		}
+		id, ok := c.probeAttrID(spec, p)
 		if !ok {
 			continue
 		}

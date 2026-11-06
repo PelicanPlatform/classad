@@ -296,16 +296,20 @@ func TestScriptFuncRefusesWrongArgumentCount(t *testing.T) {
 
 // TestScriptFuncRefusesACallInADelegatedSubtree pins guard four.
 //
-// A ternary, a list literal, an ad literal, a subscript, a select and a lazy built-in are all
-// evaluated by the tree-walker against the ad, which resolves a function name against the built-ins
-// and the UDF registry. A script's own function is in neither, so the call would evaluate to ERROR
-// -- quietly, as a value, with nothing to say why.
+// A ternary, a list literal, an ad literal, a select and a lazy built-in are all evaluated by the
+// tree-walker against the ad, which resolves a function name against the built-ins and the UDF
+// registry. A script's own function is in neither, so the call would evaluate to ERROR -- quietly,
+// as a value, with nothing to say why.
+//
+// A subscript is not among them: it compiles to an element load whose operands are ordinary
+// compiled expressions, so a call inside one is expanded like any other. See
+// TestSubscriptCarriesAScriptFunctionCall.
 func TestScriptFuncRefusesACallInADelegatedSubtree(t *testing.T) {
 	cases := []struct{ name, src string }{
 		{"conditional", "result = f(1) ? 2 : 3\n"},
 		{"list literal", "result = {f(1), 2}\n"},
 		{"lazy built-in", "result = eval(f(1))\n"},
-		{"subscript", "result = {1, 2}[f(0)]\n"},
+		{"ad literal", "result = [a = f(1)]\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -119,6 +119,16 @@ const (
 	// RJmpIfDefined is the Elvis test: if A is not UNDEFINED it sets Dst to A and jumps to T;
 	// otherwise it falls through to the fallback, which ends in an RMove into the same Dst.
 	RJmpIfDefined
+
+	// RShortSubscript is the subscript's container test: if A is UNDEFINED or ERROR it sets Dst to
+	// A and jumps to T; otherwise it falls through to the index's code, which ends in an RSubscript
+	// writing the same Dst. See OpShortSubscript for why the index must be skipped.
+	//
+	// Unlike the Elvis join, the fall-through needs no RMove: RSubscript computes straight into Dst.
+	RShortSubscript
+
+	// RSubscript sets Dst to ApplySubscript(A, B) -- the container indexed by the index.
+	RSubscript
 )
 
 // RegInstr is one register-form instruction. Dst, A and B are register numbers; Imm is an index into
@@ -274,6 +284,11 @@ type lowerer struct {
 	// shortDst is the destination register allocated by each pending RShort, popped by the matching
 	// RCombine. A stack because logical operators nest.
 	shortDst []int32
+
+	// subDst is shortDst for the subscript: the destination allocated by each pending
+	// RShortSubscript, popped by the matching RSubscript. Its own stack rather than a share of
+	// shortDst, so that an unbalanced one of either kind is found where it happened.
+	subDst []int32
 
 	// pending maps a stack-form jump target to the joins that land there, innermost last.
 	pending map[int][]*joinPoint
@@ -530,6 +545,29 @@ func (l *lowerer) one(ip int) {
 		j := l.emit(RegInstr{Op: op, Dst: d, A: a, T: in.A})
 		l.jumps = append(l.jumps, j)
 		l.shortDst = append(l.shortDst, d)
+	case OpShortSubscript:
+		// The container stays on the stack for the element load, exactly as a logical operator's
+		// left operand stays for its combine, and both paths write the one destination allocated
+		// here.
+		if len(l.vstack) == 0 {
+			panic("vm: register lowering found a subscript with no container")
+		}
+		a := l.vstack[len(l.vstack)-1]
+		d := l.reg()
+		j := l.emit(RegInstr{Op: RShortSubscript, Dst: d, A: a, T: in.A})
+		l.jumps = append(l.jumps, j)
+		l.subDst = append(l.subDst, d)
+	case OpSubscript:
+		b := l.pop()
+		a := l.pop()
+		n := len(l.subDst)
+		if n == 0 {
+			panic("vm: register lowering found an element load with no matching container test")
+		}
+		d := l.subDst[n-1]
+		l.subDst = l.subDst[:n-1]
+		l.emit(RegInstr{Op: RSubscript, Dst: d, A: a, B: b})
+		l.push(d)
 	case OpCombineAnd, OpCombineOr:
 		b := l.pop()
 		a := l.pop()
@@ -783,6 +821,16 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 			} else {
 				ip++
 			}
+		case RShortSubscript:
+			if v := regs[in.A]; v.IsUndefined() || v.IsError() {
+				regs[in.Dst] = v
+				ip = int(in.T)
+			} else {
+				ip++
+			}
+		case RSubscript:
+			regs[in.Dst] = ev.ApplySubscript(regs[in.A], regs[in.B])
+			ip++
 		default:
 			regs[in.Dst] = classad.NewErrorValue()
 			ip++

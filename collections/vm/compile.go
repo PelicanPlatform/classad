@@ -11,7 +11,7 @@ import (
 
 // CompileProgram lowers a ClassAd expression to a Program. Node types with
 // subtle scope/short-circuit/laziness semantics (conditional, list, record,
-// select, subscript) are emitted as OpEvalNode and delegated to the tree-walking
+// select) are emitted as OpEvalNode and delegated to the tree-walking
 // evaluator at run time; the rest are native instructions.
 //
 // A function call is native when classad.StrictFunction accepts it -- the
@@ -38,6 +38,7 @@ func compileProgramAliases(expr ast.Expr, aliases aliasIndex) *Program {
 	} else {
 		c.emit(expr)
 	}
+	c.p.aliases = aliases
 	c.p.readAttrs = collectReads(expr, map[string]bool{}, nil)
 	c.p.expr = expr
 	c.p.vops = vopPrefix(c.p.code)
@@ -262,10 +263,12 @@ func (c *compiler) emit(expr ast.Expr) {
 			return
 		}
 		c.delegate(expr)
+	case *ast.SubscriptExpr:
+		c.emitSubscript(v)
 	default:
-		// ConditionalExpr, ListLiteral, RecordLiteral, SubscriptExpr, or any future
-		// node: delegate to the evaluator. (A FunctionCall reaches the evaluator too,
-		// but only the ones StrictFunction refuses; the case above compiles the rest.)
+		// ConditionalExpr, ListLiteral, RecordLiteral, or any future node: delegate to
+		// the evaluator. (A FunctionCall reaches the evaluator too, but only the ones
+		// StrictFunction refuses; the case above compiles the rest.)
 		c.delegate(expr)
 	}
 }
@@ -286,8 +289,8 @@ func (c *compiler) emit(expr ast.Expr) {
 // The ternary is not an oversight that will be fixed next week: an UNDEFINED condition evaluates
 // BOTH of its branches, which a jump-based lowering can express only by emitting each branch twice,
 // exponentially in nesting depth. See OpBranchCond, which lowers ifThenElse for exactly the reason
-// the ternary cannot be lowered that way. The same goes for a list literal, an ad literal, a
-// subscript, a select and a lazy built-in, each of which needs the record itself.
+// the ternary cannot be lowered that way. The same goes for a list literal, an ad literal, a select
+// and a lazy built-in, each of which needs the record itself.
 //
 // So the compiler refuses rather than silently reading the wrong thing. The refusal is what makes
 // the restriction discoverable: a script that cannot say what it means should say so at compile
@@ -473,4 +476,27 @@ func collectReads(expr ast.Expr, seen map[string]bool, out []string) []string {
 		}
 	}
 	return out
+}
+
+// emitSubscript compiles `container[index]` to an element load.
+//
+// The layout is the Elvis operator's, for the same reason: the index must not be evaluated when the
+// container already settles the result.
+//
+//	<container>
+//	shortSubscript -> END      ; container UNDEFINED or ERROR: it is the result
+//	<index>
+//	subscript                  ; pop index, container; push the element
+//	END:
+//
+// The operands are ordinary compiled expressions, so each is native or delegated on its own merits:
+// `{1, x}[0]` has a delegated list literal under a native element load. What matters is that the
+// load itself is native, because that is what a script needs to index one of its own locals and
+// what `for` is built on.
+func (c *compiler) emitSubscript(v *ast.SubscriptExpr) {
+	c.emit(v.Container)
+	j := c.ins(OpShortSubscript, -1)
+	c.emit(v.Index)
+	c.ins(OpSubscript, 0)
+	c.patch(j, len(c.p.code))
 }

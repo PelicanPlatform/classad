@@ -154,6 +154,20 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) 
 				stack = append(stack, ev.Evaluate(r.node))
 			}
 			ip++
+		case OpShortSubscript:
+			// The container is the result when it is UNDEFINED or ERROR, and it is already on the
+			// stack, so the jump path writes nothing. Falling through evaluates the index.
+			if v := stack[len(stack)-1]; v.IsUndefined() || v.IsError() {
+				ip = int(in.A)
+			} else {
+				ip++
+			}
+		case OpSubscript:
+			n := len(stack)
+			index, container := stack[n-1], stack[n-2]
+			stack = stack[:n-1]
+			stack[n-2] = ev.ApplySubscript(container, index)
+			ip++
 		case OpStrListMember:
 			stack[len(stack)-1] = p.strLists[in.A].eval(stack[len(stack)-1])
 			ip++

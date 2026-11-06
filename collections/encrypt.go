@@ -266,6 +266,13 @@ func (c *Collection) checkNotIndexed(names []string) error {
 	for _, a := range val {
 		indexed[strings.ToLower(a)] = struct{}{}
 	}
+	// A path index is keyed on the path but READS through its root attribute, so sealing the
+	// root breaks it exactly as sealing a plain indexed attribute does.
+	for _, a := range append(append([]string{}, cat...), val...) {
+		if comps := splitAttrPath(a); comps != nil {
+			indexed[strings.ToLower(comps[0])] = struct{}{}
+		}
+	}
 	for _, n := range names {
 		if _, clash := indexed[strings.ToLower(n)]; clash {
 			return fmt.Errorf("collections: attribute %q cannot be both encrypted and indexed", n)

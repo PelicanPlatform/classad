@@ -413,3 +413,60 @@ func (e *Evaluator) ResolveAlias(alias int, name string) (Value, bool) {
 	}
 	return e.aliasResolver(alias, name), true
 }
+
+// ApplySubscript indexes an already-evaluated container with an already-evaluated index, returning
+// the same value the tree-walking evaluator produces for the equivalent *ast.SubscriptExpr. It is
+// the subscript counterpart of ApplyBinaryOp, and evaluateSubscriptExpr is this function plus the
+// evaluation of its two operands, so the two cannot hold different ideas of what an index means.
+//
+// e materializes a LAZY list element, which is evaluated in the scope the list value captured
+// rather than in e's own, so only the indexed element is evaluated: {selfRef, x}[1] is x and does
+// not cycle. Pass the evaluator the operands were evaluated with.
+//
+// AN UNDEFINED OR ERROR CONTAINER SETTLES THE RESULT whatever the index is, so a caller that has
+// already evaluated both operands gets the right value from this function alone. It does not get
+// the right behaviour: the tree-walker never evaluates the index in that case, and evaluating one
+// can panic on a cyclic reference. A compiled form skips the index the same way.
+func (e *Evaluator) ApplySubscript(container, index Value) Value {
+	if container.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if container.IsError() {
+		return NewErrorValue()
+	}
+	if index.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if index.IsError() {
+		return NewErrorValue()
+	}
+
+	// A list takes an integer index, and nothing else: the accessor's error IS the type test, since
+	// it reports exactly the index that is not an integer. An out-of-range index -- including a
+	// negative one -- is ERROR in the reference engine rather than UNDEFINED.
+	if container.IsList() {
+		i, err := index.IntValue()
+		if err != nil {
+			return NewErrorValue()
+		}
+		if i < 0 || i >= int64(container.listLen()) {
+			return NewErrorValue()
+		}
+		return container.listElementAt(int(i), e)
+	}
+
+	// An ad takes a string key, read the same way.
+	if container.IsClassAd() {
+		key, err := index.StringValue()
+		if err != nil {
+			return NewErrorValue()
+		}
+		ad, err := container.ClassAdValue()
+		if err != nil {
+			return NewErrorValue()
+		}
+		return ad.EvaluateAttr(key)
+	}
+
+	return NewErrorValue()
+}

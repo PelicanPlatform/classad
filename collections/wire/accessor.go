@@ -629,6 +629,84 @@ func (a Ad) LookupByName(name string) ([]byte, bool) {
 	return nil, false
 }
 
+// RecordMemberID returns the raw node bytes of the member with interned id `id` inside the
+// record-literal node `node` (an nRecord node as returned by Lookup/ForEach), or (nil, false)
+// if node is not a record literal, has no such member, or is malformed.
+//
+// node must come from an ID-KEYED ad: a nested record's members are keyed the way the
+// enclosing ad's attributes are and nothing in the node says which, exactly as NodeLenKeyed
+// documents. An inline-keyed record is read with RecordMemberName. Reading one as the other
+// takes a name's length for an id and its bytes for a value, which surfaces as a missing
+// member or a malformed node rather than as another member's value -- but the caller is what
+// knows the encoding, so it is the caller that must choose.
+//
+// The hot header is skipped rather than consulted: it is an offset index into the entries that
+// follow, so the linear walk finds every member either way, and a nested body's header is
+// empty in everything this package writes.
+func RecordMemberID(node []byte, id uint32) ([]byte, bool) {
+	var cur cursor
+	n, ok := recordBodyIn(&cur, node, false)
+	if !ok {
+		return nil, false
+	}
+	c := &cur
+	for i := uint64(0); i < n && c.ok; i++ {
+		aid := c.id32()
+		start := c.pos
+		skipNode(c, 0)
+		if !c.ok {
+			return nil, false
+		}
+		if aid == id {
+			return node[start:c.pos], true
+		}
+	}
+	return nil, false
+}
+
+// RecordMemberName is RecordMemberID for a record literal from an INLINE-KEYED ad, matching
+// the member name case-insensitively as attribute names compare.
+func RecordMemberName(node []byte, name string) ([]byte, bool) {
+	var cur cursor
+	n, ok := recordBodyIn(&cur, node, true)
+	if !ok {
+		return nil, false
+	}
+	c := &cur
+	for i := uint64(0); i < n && c.ok; i++ {
+		nm := c.readNameBytes()
+		start := c.pos
+		skipNode(c, 0)
+		if !c.ok {
+			return nil, false
+		}
+		if foldEqualBytes(nm, name) {
+			return node[start:c.pos], true
+		}
+	}
+	return nil, false
+}
+
+// recordBodyIn positions c at the first member entry of record-literal node b and returns the
+// member count, reading member keys in the enclosing ad's encoding (inline). ok is false when
+// b does not begin with a record literal or its body is malformed.
+func recordBodyIn(c *cursor, b []byte, inline bool) (uint64, bool) {
+	if len(b) == 0 || b[0] != nRecord {
+		return 0, false
+	}
+	*c = cursor{b: b, pos: 1, ok: true, inline: inline}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	n := c.uvarint()
+	if !c.ok {
+		return 0, false
+	}
+	return n, true
+}
+
 // readNameBytes reads an inline name (uvarint len + bytes) as a subslice of the
 // cursor's buffer (no allocation).
 func (c *cursor) readNameBytes() []byte {

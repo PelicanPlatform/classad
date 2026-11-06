@@ -243,28 +243,17 @@ func TestChainReorderDeclines(t *testing.T) {
 			want: "not an inner join",
 		},
 		{
-			name: "two join keys rather than one",
-			build: func(t *testing.T) (*Catalog, JoinSpec) {
-				spec := orderSpec()
-				// The second step now hangs off hist, not jobs: a path, not a star.
-				spec.Steps[1].Cond = []string{"hist.K == small.K"}
-				spec.Steps[1].Equi = []JoinEqui{{Left: "hist.K", Right: "K"}}
-				return orderFixture(t, 4000, 40), spec
-			},
-			want: "does not read exactly one attribute of jobs",
-		},
-		{
-			// Both halves read the FROM side, so the star test above passes -- but on two
-			// different attributes, which is two join keys. Promoting a spoke would leave
-			// the other hanging off a table that no longer supplies the probe keys.
-			name: "two attributes of the FROM side",
+			// Every table is reachable, but through two unrelated attributes: K joins jobs
+			// to hist, Prio joins jobs to small, and nothing makes those equal. There is
+			// no one attribute the tables could be re-attached by.
+			name: "two unrelated join keys",
 			build: func(t *testing.T) (*Catalog, JoinSpec) {
 				spec := orderSpec()
 				spec.Steps[1].Cond = []string{"jobs.Prio == small.MinPrio"}
 				spec.Steps[1].Equi = []JoinEqui{{Left: "jobs.Prio", Right: "MinPrio"}}
 				return orderFixture(t, 4000, 40), spec
 			},
-			want: "two join keys rather than one",
+			want: "joins on more than one key",
 		},
 		{
 			name: "tables small enough to read in any order",
@@ -370,5 +359,80 @@ func TestChainReordersUnderAnAggregateOverOrderedArchives(t *testing.T) {
 	got, want := aggRowKeys(rows), aggRowKeys(plain)
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("re-planned groups %v, as written %v", got, want)
+	}
+}
+
+// pathChainSpec is the same join as probeChainSpec written as a PATH: each step hangs off
+// the table the previous one folded in, rather than all of them off the FROM table. On one
+// key the two spell the same relation, and the path is the more natural way to write it.
+func pathChainSpec(from, s1, s2 string) JoinSpec {
+	return JoinSpec{
+		Left: JoinSide{Table: from, Alias: from},
+		Steps: []JoinStep{
+			{
+				Kind: JoinInner,
+				Side: JoinSide{Table: s1, Alias: s1},
+				Cond: []string{from + ".ClusterId == " + s1 + ".ClusterId"},
+				Equi: []JoinEqui{{Left: from + ".ClusterId", Right: "ClusterId"}},
+			},
+			{
+				Kind: JoinInner,
+				Side: JoinSide{Table: s2, Alias: s2},
+				Cond: []string{s1 + ".ClusterId == " + s2 + ".ClusterId"},
+				Equi: []JoinEqui{{Left: s1 + ".ClusterId", Right: "ClusterId"}},
+			},
+		},
+	}
+}
+
+// A chain written as a path is re-centred like the star it is.
+//
+// This is the spelling a caller is most likely to write -- each step joined to the table
+// before it -- and reading the equalities as a graph rather than as "every step must name
+// the FROM table" is what makes it reachable. The second step's row half names big2, which
+// is a STEP, so nothing about the syntax says sel could be read FROM.
+func TestChainReorderTakesAPathSpelling(t *testing.T) {
+	cat := probeChainFixture(t, 8192, 32, true)
+	spec := pathChainSpec("big1", "big2", "sel")
+
+	var want int
+	withoutChainReorder(func() { want, _ = drainChain(t, cat, spec) })
+	got, st := drainChain(t, cat, spec)
+	if got != want {
+		t.Fatalf("the re-planned path joined %d rows, the path as written %d", got, want)
+	}
+	if want == 0 {
+		t.Fatal("the fixture joined nothing, so this would pass without a join")
+	}
+	if st.ChainFromAlias != "sel" {
+		t.Fatalf("a path-spelled chain read FROM %q, want sel: %s",
+			st.ChainFromAlias, st.ChainOrderWhy)
+	}
+	for _, p := range st.ProbeSteps {
+		if p.Keys == 0 {
+			t.Errorf("%s was not narrowed (%s)", p.Alias, p.Why)
+		}
+	}
+	t.Logf("hashed %d, streamed %d, pairs %d", st.HashRows, st.ScanRows, st.Pairs)
+}
+
+// A chain where the steps join only to each other leaves the FROM table paired by nothing,
+// which is a cross product however the tables are ordered. compileJoin refuses this spec
+// outright -- both steps read a side the other folds in -- and the planner must not rewrite
+// it on the way there.
+func TestChainReorderDeclinesAFromTableJoinedToNothing(t *testing.T) {
+	cat := orderFixture(t, 4000, 40)
+	spec := orderSpec()
+	spec.Steps[0].Cond = []string{"small.K == hist.K"}
+	spec.Steps[0].Equi = []JoinEqui{{Left: "small.K", Right: "K"}}
+	spec.Steps[1].Cond = []string{"hist.K == small.K"}
+	spec.Steps[1].Equi = []JoinEqui{{Left: "hist.K", Right: "K"}}
+	var st JoinStats
+	out := cat.planJoinOrder(spec, false, &st)
+	if !strings.Contains(st.ChainOrderWhy, "joined to no other table") {
+		t.Errorf("declined with %q, want it to say jobs is joined to nothing", st.ChainOrderWhy)
+	}
+	if out.Left.Alias != "jobs" {
+		t.Errorf("declined but moved the FROM side to %q", out.Left.Alias)
 	}
 }

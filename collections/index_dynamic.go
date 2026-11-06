@@ -43,13 +43,15 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 	for {
 		cur := c.spec.Load()
 		next := cur.clone()
-		// ok is false only when an inline id collides with a different attribute; that
-		// attribute is then left unindexed rather than aliased onto another's postings.
+		// ok is false only when an id collides with a different attribute -- an inline id
+		// hashing onto another name, or a path whose dotted spelling is also an attribute
+		// name. That attribute is then left unindexed rather than aliased onto another's
+		// postings.
 		intern := func(name string) (uint32, bool) {
 			if next.inline {
-				return next.inlineID(name)
+				return next.indexID(nil, name)
 			}
-			return c.intern.Intern(name), true
+			return next.indexID(c.intern, name)
 		}
 		// mark records id's provenance, judged against the PRE-EXISTING spec (cur): an
 		// auto add marks it auto unless it was already a human index (no downgrade); a
@@ -99,7 +101,7 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 			// extend the zone set too -- otherwise a range query on it would prune
 			// postings but never whole segments, unlike an identical index configured at
 			// creation. No-op for a mutable collection.
-			c.addZoneAttrs(value)
+			c.addZoneAttrs(topLevelNames(value))
 			return true
 		}
 	}
@@ -112,7 +114,12 @@ func (c *Collection) withoutSealed(names []string) []string {
 	}
 	out := names[:0:0]
 	for _, n := range names {
-		if !c.shouldEncrypt(n) {
+		// A path is judged by its root attribute, which is the one stored and sealed (see New).
+		root := n
+		if comps := splitAttrPath(n); comps != nil {
+			root = comps[0]
+		}
+		if !c.shouldEncrypt(root) {
 			out = append(out, n)
 		}
 	}
@@ -141,6 +148,10 @@ func (c *Collection) DropIndex(names ...string) bool {
 			}
 			removeID(&next.catIDs, next.cat, id)
 			removeID(&next.valIDs, next.val, id)
+			// The id stops meaning anything, so it stops meaning a path too: a later AddIndex
+			// on the plain attribute of that name must not be refused by a shape this spec no
+			// longer indexes.
+			delete(next.paths, id)
 			delete(next.auto, id)
 		}
 		next.pruneComposites() // a composite outlives neither of its components

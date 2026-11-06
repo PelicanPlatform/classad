@@ -197,7 +197,6 @@ func TestScriptFuncPurityGate(t *testing.T) {
 		// parameter. Different rule, same outcome, and worth pinning so a change that moved the
 		// refusal shows up here.
 		{"ternary_over_param", "def f(x):\n    return (x ? 1 : 0)\n", `reads the local "x"`},
-		{"subscript_over_param", "def f(x):\n    return x[0]\n", `reads the local "x"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
