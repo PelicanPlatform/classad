@@ -84,16 +84,19 @@ type listData struct {
 
 // NewUndefinedValue creates an undefined value.
 func NewUndefinedValue() Value {
+	countValue()
 	return Value{valueType: UndefinedValue}
 }
 
 // NewErrorValue creates an error value.
 func NewErrorValue() Value {
+	countValue()
 	return Value{valueType: ErrorValue}
 }
 
 // NewBoolValue creates a boolean value.
 func NewBoolValue(b bool) Value {
+	countValue()
 	var i int64
 	if b {
 		i = 1
@@ -103,11 +106,13 @@ func NewBoolValue(b bool) Value {
 
 // NewIntValue creates an integer value.
 func NewIntValue(i int64) Value {
+	countValue()
 	return Value{valueType: IntegerValue, intVal: i}
 }
 
 // NewRealValue creates a real value.
 func NewRealValue(r float64) Value {
+	countValue()
 	return Value{valueType: RealValue, intVal: int64(math.Float64bits(r))}
 }
 
@@ -120,16 +125,19 @@ func (v Value) real() float64 {
 
 // NewStringValue creates a string value.
 func NewStringValue(s string) Value {
+	countValue()
 	return Value{valueType: StringValue, strVal: s}
 }
 
 // NewListValue creates a list value.
 func NewListValue(list []Value) Value {
+	countValue()
 	return Value{valueType: ListValue, list: &listData{vals: list}}
 }
 
 // NewClassAdValue creates a ClassAd value.
 func NewClassAdValue(ad *ClassAd) Value {
+	countValue()
 	return Value{valueType: ClassAdValue, classAdVal: ad}
 }
 
@@ -813,6 +821,16 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 		return e.evaluateShortCircuit(op)
 	}
 
+	// Predicate fast path: a comparison whose operands are both literal-backed is
+	// decided straight off the stored AST, with no Value built for either side (see
+	// predicate.go). Everything it cannot prove it reproduces exactly falls through to
+	// the ordinary Value comparison, from inside evaluateComparison, which resolves
+	// each operand ONCE whichever way it goes. This is the only hook: nested && / ||
+	// reach it once per conjunct through evaluateShortCircuit's existing recursion.
+	if c := comparisonKind(op.Op); c != cmpNone && e.predicateEligible() {
+		return e.evaluateComparison(c, op)
+	}
+
 	left := e.Evaluate(op.Left)
 	right := e.Evaluate(op.Right)
 	return e.applyBinaryValues(op.Op, left, right)
@@ -827,6 +845,12 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 // the right operand must be evaluated); the AST path never reaches here for them
 // because evaluateBinaryOp short-circuits first.
 func (e *Evaluator) applyBinaryValues(op string, left, right Value) Value {
+	// Comparison accounting (compiled out unless -tags classadmetrics). This is the
+	// dispatch site both the tree-walking evaluator and the bytecode interpreter
+	// reach, and counting here rather than inside valuesEqual is what keeps != --
+	// implemented by negating == -- from being counted twice.
+	countComparisonOp(op)
+
 	// Logical and meta-equality operators do not propagate errors generically.
 	switch op {
 	case "&&":
@@ -995,6 +1019,7 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 	if exprs == nil {
 		exprs = []ast.Expr{}
 	}
+	countValue()
 	return Value{valueType: ListValue, list: &listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind}}
 }
 
