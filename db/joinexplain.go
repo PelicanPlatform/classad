@@ -24,7 +24,10 @@ package db
 // order and is planned with that freedom (see joinbuildside.go), so its plan may reorder
 // where this one reports it may not.
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // JoinExplain is how a join would be executed.
 type JoinExplain struct {
@@ -172,7 +175,15 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 
 	for i := range steps {
 		sp := p.steps[i]
-		attr, rows, _, why := cat.probeGate(sp, sides[sp.side])
+		attrs, rows, _, why := cat.probeGateAll(sp, sides[sp.side])
+		// Every attribute the probe would narrow on, not one: a composite key is narrowed
+		// on all of its equalities, and a report naming one of them would describe a
+		// narrower plan than the join runs.
+		names := make([]string, 0, len(attrs))
+		for _, pa := range attrs {
+			names = append(names, pa.attr)
+		}
+		attr := strings.Join(names, ", ")
 		out.Steps = append(out.Steps, JoinStepExplain{
 			Alias:      p.aliases[sp.side],
 			Kind:       joinKindName(steps[i].Kind),

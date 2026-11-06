@@ -180,15 +180,17 @@ func (cat *Catalog) orientationCost(stream, hash JoinSide, equi []JoinEqui, swap
 		return orientation{}, false
 	}
 	read := hashRows
-	if attr, found := equiHashAttr(equi, swapped); found {
-		if _, segments, indexed, _, statsOK := cat.joinSideStats(hash.Table, attr); statsOK && indexed {
-			// The streamed side's ROWS bound its distinct keys, so this overstates the
-			// probe and understates its benefit -- the safe direction, since the gate
-			// that actually decides errs towards reading.
-			keys := min(streamRows, maxProbeKeys)
-			if lookups := segments * keys * probeLookupCost; lookups < read {
-				read = lookups
-			}
+	for _, attr := range equiHashAttrs(equi, swapped) {
+		_, segments, indexed, _, statsOK := cat.joinSideStats(hash.Table, attr)
+		if !statsOK || !indexed {
+			continue
+		}
+		// The streamed side's ROWS bound its distinct keys, so this overstates the probe
+		// and understates its benefit -- the safe direction, since the gate that actually
+		// decides errs towards reading.
+		keys := min(streamRows, maxProbeKeys)
+		if lookups := segments * keys * probeLookupCost; lookups < read {
+			read = lookups
 		}
 	}
 	return orientation{
@@ -208,22 +210,30 @@ func (cat *Catalog) sideReadSize(side JoinSide) (int, bool) {
 	return rows, why == ""
 }
 
-// equiHashAttr names the attribute the HASHED side's half of a single equality reads, when
-// it is a bare reference. Anything else -- more than one equality, or a computed half -- has
-// no attribute an index could be probed on, and the orientation is priced at a full read.
-func equiHashAttr(equi []JoinEqui, swapped bool) (string, bool) {
-	if len(equi) != 1 {
-		return "", false
+// equiHashAttrs names the attributes the HASHED side's halves read, for every equality
+// whose half is a bare reference. A computed half names nothing an index could be probed
+// on and is skipped; a join with none is priced at a full read.
+//
+// Every equality, not just one, because a probe narrows on all of them (joinprobe.go) and
+// pricing has to see the same plan the probe would build. Pricing only single-equality
+// joins said a composite key could never be narrowed, which was true until it wasn't, and
+// would have left the cost model recommending against the orientation that now wins.
+func equiHashAttrs(equi []JoinEqui, swapped bool) []string {
+	out := make([]string, 0, len(equi))
+	for _, e := range equi {
+		src := e.Right
+		if swapped {
+			src = e.Left
+		}
+		ex, err := classad.ParseExpr(src)
+		if err != nil {
+			continue
+		}
+		if a, ok := bareAttr(ex); ok {
+			out = append(out, a)
+		}
 	}
-	src := equi[0].Right
-	if swapped {
-		src = equi[0].Left
-	}
-	ex, err := classad.ParseExpr(src)
-	if err != nil {
-		return "", false
-	}
-	return bareAttr(ex)
+	return out
 }
 
 // orderFree reports that a side's rows come back in no order the caller may rely on, so a

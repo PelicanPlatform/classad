@@ -413,6 +413,10 @@ type joinStepPlan struct {
 	// what lets a step past the first be index-probed: the keys it would be narrowed to are
 	// the FROM side's keys, which one scan yields for every such step at once.
 	rowReadsOnlySide0 bool
+	// rowOnSide0 is the same test per equality. A membership constraint narrows on ONE of
+	// them, so a step whose halves are mixed still has probeable equalities even though
+	// rowReadsOnlySide0 is false for the step as a whole.
+	rowOnSide0 []bool
 }
 
 // JoinsChains reports that this catalog's join accepts a chain of more than two tables.
@@ -668,6 +672,7 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 			sp.rowAliased = append(sp.rowAliased, al)
 		}
 		sp.rowReadsOnlySide0 = rowHalvesReadOnlySide0(st.Equi, p.aliases, sp.side)
+		sp.rowOnSide0 = rowHalvesOnSide0(st.Equi, p.aliases, sp.side)
 		p.steps = append(p.steps, sp)
 	}
 	return p, nil
@@ -753,27 +758,46 @@ func rowHalvesReadOnlySide0(equi []JoinEqui, aliases []string, side int) bool {
 	if len(equi) == 0 {
 		return false
 	}
-	if side == 1 {
-		// The row holds the FROM side and nothing else, so every half reads it whatever
-		// shape the half is.
-		return true
-	}
-	for _, e := range equi {
-		q, err := vm.ParseAliases(e.Left, aliases)
-		if err != nil || !q.AliasNative() {
+	for _, ok := range rowHalvesOnSide0(equi, aliases, side) {
+		if !ok {
 			return false
-		}
-		refs := q.AliasRefs()
-		if len(refs) == 0 {
-			return false
-		}
-		for _, r := range refs {
-			if r.Alias != 0 {
-				return false
-			}
 		}
 	}
 	return true
+}
+
+// rowHalvesOnSide0 is rowHalvesReadOnlySide0 per equality, for a caller that can use SOME of
+// them: a membership constraint narrows on one equality, so one half reaching a later side
+// costs that equality rather than the whole step's probe.
+func rowHalvesOnSide0(equi []JoinEqui, aliases []string, side int) []bool {
+	out := make([]bool, len(equi))
+	if side == 1 {
+		// The row holds the FROM side and nothing else, so every half reads it whatever
+		// shape the half is.
+		for i := range out {
+			out[i] = true
+		}
+		return out
+	}
+	for i, e := range equi {
+		q, err := vm.ParseAliases(e.Left, aliases)
+		if err != nil || !q.AliasNative() {
+			continue
+		}
+		refs := q.AliasRefs()
+		if len(refs) == 0 {
+			continue
+		}
+		onlySide0 := true
+		for _, r := range refs {
+			if r.Alias != 0 {
+				onlySide0 = false
+				break
+			}
+		}
+		out[i] = onlySide0
+	}
+	return out
 }
 
 func compileAll(what string, srcs []string) ([]*classad.Expr, error) {
