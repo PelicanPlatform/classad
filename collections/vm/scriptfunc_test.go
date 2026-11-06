@@ -603,3 +603,70 @@ func traceSeen() string {
 	defer traceMu.Unlock()
 	return strings.Join(traceLog, ",")
 }
+
+// TestScriptFuncInEveryExpressionPosition pins the assumption the whole mechanism rests on: an
+// expansion sits in the middle of an enclosing expression's operands, so the statements it emits
+// run with the operand stack NOT empty. A branch's arms have to reach their merge with the same
+// stack, and the lowering has to end with exactly one value on it.
+//
+// The positions that make that non-trivial are collected here: a loop inside a body, a call in a
+// condition, a call in each arm of an if, and a call as the right operand of a short-circuiting
+// operator, where the expansion lives inside the region the short circuit jumps over.
+func TestScriptFuncInEveryExpressionPosition(t *testing.T) {
+	t.Run("return out of a while in the body", func(t *testing.T) {
+		wants(t, runScript(t, `def firstOver(limit):
+    i = 1
+    while i < 1000:
+        if i > limit:
+            return i
+        i = i * 2
+    return 0
+
+result = firstOver(10)
+`, `[]`), "16")
+	})
+	t.Run("call in a while condition", func(t *testing.T) {
+		wants(t, runScript(t, `def small(v):
+    return v < 4
+
+n = 1
+while small(n):
+    n = n + 1
+result = n
+`, `[]`), "4")
+	})
+	t.Run("call in an if condition and both arms", func(t *testing.T) {
+		wants(t, runScript(t, `def d(v):
+    return v * 2
+
+x = 0
+if d(2) > 3:
+    x = d(5)
+else:
+    x = d(1)
+result = x
+`, `[]`), "10")
+	})
+	t.Run("call as a short-circuit right operand", func(t *testing.T) {
+		src := `def t(v):
+    if v > 0:
+        return true
+    return false
+
+result = t(FirstOne) && t(-1)
+`
+		wants(t, runScript(t, src, `[FirstOne = 1]`), "false")
+		// The left operand settles the answer, so the right -- and the whole expansion inside it --
+		// is jumped over.
+		wants(t, runScript(t, src, `[FirstOne = -1]`), "false")
+	})
+	t.Run("body rebinds a parameter", func(t *testing.T) {
+		wants(t, runScript(t, `def clamp(v):
+    if v < 0:
+        v = 0
+    return v
+
+result = clamp(-5) + clamp(3)
+`, `[]`), "3")
+	})
+}
