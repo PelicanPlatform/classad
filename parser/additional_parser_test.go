@@ -296,12 +296,30 @@ func TestStreamingLexerUnterminatedEscape(t *testing.T) {
 	}
 }
 
-func TestStreamingLexerInvalidEscape(t *testing.T) {
-	lex := NewStreamingLexer(strings.NewReader("\"\\y\""))
-	lex.stopAfterClassAd = false
-	_ = lex.Lex(&yySymType{})
-	if lex.err == nil || !strings.Contains(lex.err.Error(), "invalid escape sequence") {
-		t.Fatalf("expected invalid escape sequence error, got %v", lex.err)
+// TestStreamingLexerUndefinedEscape: an escape the language does not define is accepted,
+// with the backslash dropped, as convert_escapes() does in the reference ("pass char after
+// \ unmodified"). It used to be an error here, which rejected expressions the schedd parses.
+func TestStreamingLexerUndefinedEscape(t *testing.T) {
+	for _, tc := range []struct{ src, want string }{
+		{`"\y"`, "y"},
+		{`"a\.b"`, "a.b"},
+		{`"\?"`, "?"},
+		{`"\a"`, "\a"},
+		{`"\v"`, "\v"},
+	} {
+		lex := NewStreamingLexer(strings.NewReader(tc.src))
+		lex.stopAfterClassAd = false
+		var sym yySymType
+		tok := lex.Lex(&sym)
+		if tok != STRING_LITERAL {
+			t.Fatalf("%s: expected STRING_LITERAL, got %d", tc.src, tok)
+		}
+		if lex.err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.src, lex.err)
+		}
+		if sym.str != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.src, sym.str, tc.want)
+		}
 	}
 }
 

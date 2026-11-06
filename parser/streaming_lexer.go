@@ -630,12 +630,16 @@ func (l *StreamingLexer) scanString() string {
 				return result.String()
 			}
 			switch escaped {
+			case 'a':
+				result.WriteRune('\a')
 			case 'b':
 				result.WriteRune('\b')
 			case 't':
 				result.WriteRune('\t')
 			case 'n':
 				result.WriteRune('\n')
+			case 'v':
+				result.WriteRune('\v')
 			case 'f':
 				result.WriteRune('\f')
 			case 'r':
@@ -646,6 +650,8 @@ func (l *StreamingLexer) scanString() string {
 				result.WriteRune('"')
 			case '\'':
 				result.WriteRune('\'')
+			case '?':
+				result.WriteRune('?')
 			case '0', '1', '2', '3', '4', '5', '6', '7':
 				var octalStr strings.Builder
 				octalStr.WriteRune(escaped)
@@ -681,7 +687,8 @@ func (l *StreamingLexer) scanString() string {
 				}
 				result.WriteByte(byte(val)) // one byte, as convert_escapes writes it
 			default:
-				l.Error(fmt.Sprintf("invalid escape sequence \\%c at position %d", escaped, l.pos-2))
+				// Not an error: the reference's convert_escapes() passes the character
+				// after an undefined escape through unmodified (see bytelexer.go).
 				writeLexRune(&result, escaped)
 			}
 			continue
