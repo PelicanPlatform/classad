@@ -403,9 +403,9 @@ Python-shaped statements over ordinary ClassAd expressions: `is` is `=?=`, and
 every expression between the statements is parsed by the same parser an
 attribute's value is. Blocks are introduced by `:` and delimited by indentation,
 which has to be spaces — braces were not available, since `{...}` is already a
-list literal and `[...]` an ad literal. `elif`, `else`, `while`, `for`, `pass`,
-`def`, `return` and the compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are
-there; writes back to the ad are not.
+list literal and `[...]` an ad literal. `elif`, `else`, `while`, `for`, `break`,
+`continue`, `pass`, `def`, `return` and the compound assignments (`+=`, `-=`,
+`*=`, `/=`, `%=`) are there; writes back to the ad are not.
 
 **`for NAME in SEQUENCE:`** walks a list:
 
@@ -424,6 +424,24 @@ last element visited. An empty list runs the body zero times. A sequence that is
 an undefined condition does, so a misspelled attribute says so rather than
 turning the loop into one that quietly does nothing. The step budget bounds the
 loop; there is no separate iteration limit.
+
+**`break` and `continue`** work in either loop. `break` leaves the innermost
+enclosing loop and `continue` starts its next iteration — re-testing a `while`
+condition, or advancing to the next element of a `for`. Both take no operand,
+and both are refused with a line and column where no loop encloses them:
+
+```
+i = 0
+total = 0
+while i < 100:
+    i = i + 1
+    if i % 3 == 0:
+        continue        # skip the multiples of three
+    if total > 50:
+        break           # and stop as soon as we have enough
+    total = total + i
+result = total
+```
 
 `ParseScriptBuilder` returns the script before compilation, for a caller that
 wants to add to it. The builder API it returns is also usable directly.
@@ -481,6 +499,13 @@ well as of its arguments, and one with no parameters at all is still useful.
 
 Every argument is evaluated, left to right, before the body starts, even where
 the body never reads it.
+
+A `break` or a `continue` in a body names a loop **in that body**, and is
+refused when there is none — even where the call itself sits inside a loop. The
+call is written out where it appears, so a `break` bound by the call site would
+leave the caller's loop, and the same function would mean one thing where it is
+called from a loop and nothing at all where it is not. A function that wants to
+stop a caller's loop returns a value the caller breaks on.
 
 Three things a script function will not do:
 

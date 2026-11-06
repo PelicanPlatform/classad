@@ -29,10 +29,16 @@ import (
 //	else:
 //	    pass
 //	while want > 65536:
+//	    if want is error:
+//	        break                   # leave the innermost enclosing 'while'
 //	    want = want / 2
 //	for size in MY.Sizes:           # one trip per element of a list
 //	    want += size
 //	result = want                   # the script's value; top level, last, exactly once
+//
+// `break` leaves the innermost enclosing `while` and `continue` starts its next iteration, which
+// re-tests the condition exactly as falling off the end of the body does. Both take no operand, and
+// both are refused with a line and column when no loop encloses them.
 //
 // FUNCTIONS:
 //
@@ -50,6 +56,11 @@ import (
 // and falling off the end, both give UNDEFINED. Recursion is refused, directly or in a cycle,
 // because an expansion that contains itself has no end; see scriptfunc.go.
 //
+// A `break` or a `continue` in a body is bound by a loop IN THAT BODY, and refused when there is
+// none -- including when the call itself sits inside a loop. The expansion puts the body's
+// instructions inside the caller's loop, so a `break` bound by the call site would make the same
+// function mean one thing where it is called from a loop and nothing at all where it is not.
+//
 // SOFT KEYWORDS, which is a requirement and not a style choice. ClassAd attribute names are
 // case-insensitive, so `For`, `IF` and `Result` have to stay usable as attributes. A word is a
 // keyword only when it is spelled in lowercase AND leads a statement; everywhere else it lexes as an
@@ -65,11 +76,11 @@ import (
 // `if x: y = 1` would destroy that: the line would end in `1`, and finding the block colon would
 // require backtracking over an arbitrary expression.
 //
-// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), `break`,
-// `continue`, `fail` and `defer` are all refused by name with a message saying so. None of them has
-// a machine behind it -- the compiler has no opcode that mutates the scope and no way out of a loop
-// -- and a parser that accepted them would have to invent one. Refusing a word the language is
-// going to grow is a better failure than parsing it into something that is not what it says.
+// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), `fail` and
+// `defer` are all refused by name with a message saying so. None of them has a machine behind it --
+// the compiler has no opcode that mutates the scope -- and a parser that accepted them would have
+// to invent one. Refusing a word the language is going to grow is a better failure than parsing it
+// into something that is not what it says.
 //
 // `for NAME in SEQUENCE:` IS A COUNTED `while`, and the parser spells it rather than implements it:
 // the sequence is bound once, its length is bound once, and an index reads one element per trip.
@@ -197,6 +208,13 @@ type returnStmt struct {
 	stmtAt
 	expr ast.Expr
 }
+
+// breakStmt and continueStmt carry nothing but their position. Which loop each one names is settled
+// by the builder, which is the only thing that knows the loop's addresses; the parser does not even
+// track whether one encloses the statement.
+type breakStmt struct{ stmtAt }
+
+type continueStmt struct{ stmtAt }
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -394,7 +412,17 @@ func (p *scriptParser) statement(indent int) (stmt, error) {
 	case "return":
 		p.idx++
 		return p.returnLine(ln, after)
-	case "break", "continue", "del", "fail", "defer":
+	case "break", "continue":
+		p.idx++
+		if p.text(after, ln.end) != "" {
+			return nil, p.pos.errorAt(after, fmt.Sprintf("expected end of line after '%s': it "+
+				"takes no operand", word))
+		}
+		if word == "break" {
+			return &breakStmt{stmtAt{ln.off}}, nil
+		}
+		return &continueStmt{stmtAt{ln.off}}, nil
+	case "del", "fail", "defer":
 		return nil, p.at(ln, fmt.Sprintf("'%s' is not implemented in ClassAd Script", word))
 	case "result":
 		p.idx++
@@ -987,6 +1015,10 @@ func (e *emitter) block(s *Script, stmts []stmt) {
 		e.one(s, st)
 		s.flush()
 		switch {
+		case e.err != nil:
+			// A statement whose lowering expanded a call already blamed the line INSIDE the body
+			// that the compiler refused, through this same loop one level down. That line is the
+			// one the author edits, so the statement that contained the call does not take it over.
 		case !hadCapture && s.c.capture != nil:
 			e.err = e.pos.errorAt(st.at(), captureDetail(s.c.capture))
 		case hadErr == nil && s.err != nil:
@@ -1017,6 +1049,10 @@ func (e *emitter) one(s *Script, st stmt) {
 		s.For(v.name, v.seq, e.suite(v.body))
 	case *returnStmt:
 		s.Return(v.expr)
+	case *breakStmt:
+		s.Break()
+	case *continueStmt:
+		s.Continue()
 	case *defStmt:
 	}
 }
