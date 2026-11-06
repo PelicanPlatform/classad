@@ -592,6 +592,15 @@ func TestNestedPathZoneMapDeclines(t *testing.T) {
 // top-level attribute: when an ad carries attributes literally named like the configured
 // paths, their fields sit under the paths' ids. Prefiltering a nested probe against them
 // skips blocks without reading a row, so nothing re-verifies the skip.
+//
+// IT DOES NOT CURRENTLY EXERCISE THAT GUARD, and the honest place to say so is here rather
+// than in a review comment nobody will find again. A select compiles to a delegated subtree,
+// so a query carrying a nested probe is not Native(), and every columnar fast path is gated
+// on Native() before it ever consults a probe -- which was confirmed by making the guard's
+// call site panic and watching this test pass. The guard stays because that gate is a
+// statement about the PROGRAM and not about the probe: the moment a select compiles
+// natively, a nested probe reaches the prefilter and this test stops being vacuous. Deleting
+// it as unreachable would make the next person's optimisation silently return too few rows.
 func TestNestedPathColumnarDeclines(t *testing.T) {
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
