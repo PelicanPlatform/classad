@@ -192,6 +192,7 @@ func publishColRecord(c *Collection, seg *segment, o uint32) error {
 	// multi-GB reopen leak on a large archive). A nil cache (creation failed) is valid --
 	// blockCache methods then decompress every time -- so it never damages the segment.
 	cs.bindNative(c, seg)
+	c.noteListFields(cs)
 	cn := &colNative{seg: cs, cache: c.sharedColCache(), rec: o}
 	cn.dict = seg.dict.Load()
 	// A columnarized segment's dictionary is published before its payload is looked for, so a

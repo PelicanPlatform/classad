@@ -431,6 +431,10 @@ func appendColSegmentAs(dst []byte, cs *colSegment, nameOf func(uint32) (string,
 	if cs.hasComputed() {
 		dst = appendComputedTrailer(dst, cs.blocks)
 	}
+	// Then the extension trailer, which a reader skips section by section (see colExtTrailer).
+	if cs.hasLists() {
+		dst = appendExtTrailer(dst, cs)
+	}
 	return dst
 }
 
@@ -759,12 +763,22 @@ func unmarshalColSegmentAs(data []byte, codec Codec, internName func(string) uin
 }
 
 // readPayloadTrailers decodes what follows the group section: an optional remnant-name trailer, then an
-// optional computed-value trailer (colComputedTrailer), together occupying exactly rest. It attaches the
+// optional computed-value trailer (colComputedTrailer), then an optional extension trailer
+// (colExtTrailer), together occupying exactly rest. It attaches the
 // computed values to cs and returns the remnant set. Anything that does not parse drops both, so the
 // segment reads as one that predates them -- correct, only slower.
 func readPayloadTrailers(rest []byte, cs *colSegment, internName func(string) uint32) *remnantSet {
 	names, tail, hasNames := splitRemnantTrailer(rest)
-	if len(tail) > 0 && !readComputedTrailer(tail, cs) {
+	if len(tail) >= 4 && binary.LittleEndian.Uint32(tail) == colComputedTrailer {
+		n, ok := readComputedTrailerPrefix(tail, cs, false)
+		if !ok {
+			return nil
+		}
+		tail = tail[n:]
+	}
+	// The extension trailer, last. Bytes here that are not one are damage, and drop every trailer.
+	if len(tail) > 0 && !readExtTrailer(tail, cs, internName) {
+		cs.dropTrailerState()
 		return nil
 	}
 	if !hasNames {

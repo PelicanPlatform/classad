@@ -304,6 +304,13 @@ type columnarBlock struct {
 	computed     []computedEntry
 	computedComp []byte
 
+	// listIDs and listNames are the list-valued attributes this block keeps a typed copy of, in the
+	// order listComp lays them out, and listComp that copy, compressed (see collist.go). All empty for a
+	// block with none, and always for a block that is not a columnarized segment's base block.
+	listIDs   []uint32
+	listNames []string
+	listComp  []byte
+
 	// remDictComp is the block's remnant dictionary, compressed, and remDictN its entry count: the nodes
 	// its records' remnants repeat, each stored once and referenced in place (see colremdict.go). Empty
 	// for a block with none, and always for a block that is not part of a columnarized segment.
@@ -552,15 +559,16 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 // segment either. Used to drop DELTA records: each holds the attributes one write changed, so its
 // row would be almost entirely absent fields, and it is dead by the time its segment seals.
 func buildColumnarFromSegmentGrouped(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
-	return buildColumnarFromSegmentComputed(data, upto, dm, arenaCodec, regionCodec, s, hot, groups, g, toInterned, toLocal, skip, nil)
+	return buildColumnarFromSegmentComputed(data, upto, dm, arenaCodec, regionCodec, s, hot, groups, g, toInterned, toLocal, skip, nil, nil)
 }
 
 // buildColumnarFromSegmentComputed is buildColumnarFromSegmentGrouped writing computed cells into the
 // columns: cellsFor(lo, hi) returns the cells of the records fed in positions [lo, hi), or nil for none
 // (see colBuild.cellsFor).
-func buildColumnarFromSegmentComputed(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool, cellsFor func(lo, hi int) [][]computedCell) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+func buildColumnarFromSegmentComputed(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool, cellsFor func(lo, hi int) [][]computedCell, listsFor func(b *columnarBlock, lo, hi int)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
 	cb.cellsFor = cellsFor
+	cb.listsFor = listsFor
 	var buf []byte
 	for off := 0; off < upto; {
 		o := uint32(off)
@@ -589,9 +597,10 @@ func buildColumnarFromSegmentComputed(data []byte, upto int, dm *damageSet, aren
 // columnarized segment's records are remnants, so its full ads are reconstructed (remnant spliced
 // with the existing columns) before being re-split under a new group set. Sharing colBuild keeps the
 // block/group/offset logic byte-for-byte identical with the from-data path.
-func buildColumnarFromWires(offs []uint32, fulls [][]byte, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), cellsFor func(lo, hi int) [][]computedCell) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+func buildColumnarFromWires(offs []uint32, fulls [][]byte, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), cellsFor func(lo, hi int) [][]computedCell, listsFor func(b *columnarBlock, lo, hi int)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
 	cb.cellsFor = cellsFor
+	cb.listsFor = listsFor
 	for i, w := range fulls {
 		cb.feed(offs[i], w)
 	}
@@ -628,16 +637,24 @@ type colBuild struct {
 	// sealed from the front of the pending records, so its first record's position is
 	// len(offs) - len(recs).
 	cellsFor func(lo, hi int) [][]computedCell
+	// listsFor, when set, attaches the list columns (collist.go) of the records fed in positions [lo, hi)
+	// to the block sealed from them.
+	listsFor func(b *columnarBlock, lo, hi int)
 }
 
-// sealBlock encodes the first seal pending records as a base block, with their computed cells.
+// sealBlock encodes the first seal pending records as a base block, with their computed cells and list
+// columns.
 func (cb *colBuild) sealBlock(seal int) *columnarBlock {
 	var cells [][]computedCell
+	lo := len(cb.offs) - len(cb.recs)
 	if cb.cellsFor != nil {
-		lo := len(cb.offs) - len(cb.recs)
 		cells = cb.cellsFor(lo, lo+seal)
 	}
-	return encodeColumnarBlockComputed(cb.s, cb.recs[:seal], cells, cb.baseLayout, cb.regionCodec, cb.coldToField)
+	b := encodeColumnarBlockComputed(cb.s, cb.recs[:seal], cells, cb.baseLayout, cb.regionCodec, cb.coldToField)
+	if cb.listsFor != nil {
+		cb.listsFor(b, lo, lo+seal)
+	}
+	return b
 }
 
 func newColBuild(regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) *colBuild {

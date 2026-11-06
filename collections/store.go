@@ -643,6 +643,11 @@ type Collection struct {
 	// or -1 when it never was. See computedTrusted.
 	sealGen      atomic.Uint64
 	sealCleanGen atomic.Int64
+	// listHint holds the global ids of the attributes some columnarized block keeps a list column of
+	// (collist.go), so a block columnarized later carries a column of each even where none of its records
+	// holds a list of it. Only ever grown; an id here that no record holds costs a block a column of
+	// absent cells.
+	listHint sync.Map
 
 	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex/
 	// columnarize/rotate/merge) for OpStats; per-shard write/segment/sync timings live on

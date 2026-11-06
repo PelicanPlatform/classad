@@ -98,6 +98,10 @@ type blockVecSource struct {
 
 	// refs memoizes attribute-name resolution across the blocks of one scan (see resolveRef).
 	refs []colRef
+
+	// listBuf is the string dictionary buffer for a list column (see LoadListColumn), reused across
+	// blocks; a list column is consumed by its call before the next one loads.
+	listBuf []string
 }
 
 // colRef is one attribute name's resolution, held across blocks.
