@@ -597,8 +597,8 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	writeAggRows(reqID, rows, typed, write)
 }
 
-// isScalarGroup reports whether a group value is one the wire carries AS a value. A list or a
-// nested ad is not: see appendAggRow for why those cross as their group text instead.
+// isScalarGroup reports whether a group value is one the value codec carries AS a value. A
+// list or a nested ad is not: see appendAggRow for why those cross as their group text.
 func isScalarGroup(v classad.Value) bool {
 	switch v.Type() {
 	case classad.ListValue, classad.ClassAdValue:
@@ -628,15 +628,19 @@ func readAggRow(body *reader, nGroup, nAgg int, typed bool) AggRow {
 				// frame cannot be trusted further, which body.err reports to the caller.
 				return row
 			}
-			row.GroupValues[i] = v
 			if nonScalar {
 				// excExpr: the cell holds the group's TEXT, because the group is a list
-				// or a nested ad and groups by text (see appendAggRow). The label is
-				// that text as it stands -- running it through GroupValueText would
-				// quote it and name a group no server ever sent.
-				row.Group[i], _ = v.StringValue() //nolint:errcheck // excExpr decodes to a string value, which readExcValue guarantees
+				// or a nested ad, which the value codec has no scalar form for (see
+				// appendAggRow). The label is that text as it stands; the VALUE is that
+				// text read back, which is exact because a group's text is a ClassAd
+				// literal. Reading it here rather than leaving the string in place is
+				// what keeps GroupValues the group's value for every kind.
+				text, _ := v.StringValue() //nolint:errcheck // excExpr decodes to a string value, which readExcValue guarantees
+				row.Group[i] = text
+				row.GroupValues[i] = db.ParseGroupValue(text)
 				continue
 			}
+			row.GroupValues[i] = v
 			row.Group[i] = db.GroupValueText(v)
 			continue
 		}
@@ -669,12 +673,13 @@ func writeAggRows(reqID uint64, rows []db.AggRow, typed bool, write func([]byte)
 // selects the group encoding -- tagged values for opAggregateTyped and its archive twin,
 // rendered text for every older opcode. The aggregate cells are text either way.
 //
-// A LIST OR A NESTED AD CROSSES AS ITS GROUP TEXT, in a string cell, rather than as the value
-// it is. Those group by text (see db.GroupValueText) and their text is not ClassAd literal
-// syntax -- a list's group reads "[1 2]" while unparsing the same value gives "{ 1,2 }". Send
-// the value and the client would have to reconstruct the label from it, and would get a
-// different label than every older server sends for the same group. The text is what the
-// group IS here, so the text is what crosses, and both replies name the group identically.
+// A LIST OR A NESTED AD CROSSES AS ITS GROUP TEXT, in a string cell tagged excExpr, because
+// the value codec has no form that keeps such a value whole -- appendExcValue would send the
+// unparser's text for it, and the unparser is not this renderer (it keeps a literal's
+// unevaluated source and writes reals in sink form, so one group could cross under two names).
+// Sending the group text instead costs nothing: a group's text is a ClassAd literal, so the
+// client reads the value back out of it exactly, and the label it shows is byte-identical to
+// the one an older server sends for the same group.
 //
 // The typed form falls back to the row's TEXT for any group column the producer left without
 // a value. A producer that fills GroupValues fills all of them, so this is reachable only

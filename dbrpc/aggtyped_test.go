@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -42,8 +43,9 @@ func seedGroupKinds(t *testing.T, c *Client) {
 		t.Fatal(err)
 	}
 	// One ad per group shape a group key can take: a string, an integer, a real that is
-	// integral (which groups WITH the integer), a non-integral real, a bool, and a list,
-	// whose group is its text rather than its value.
+	// integral (which groups WITH the integer), a non-integral real, a bool, a list, and a
+	// nested ad. The last two group by their text rather than by a relation, and the list is
+	// written two ways that are one value, to pin that they land in one group.
 	ads := []string{
 		`Owner = "alice"` + "\n" + `Shape = 1` + "\n",
 		`Owner = "alice"` + "\n" + `Shape = 1.0` + "\n",
@@ -51,6 +53,9 @@ func seedGroupKinds(t *testing.T, c *Client) {
 		`Owner = "carol"` + "\n" + `Shape = true` + "\n",
 		`Owner = "dave"` + "\n" + `Shape = {1,2}` + "\n",
 		`Owner = "erin"` + "\n" + `Shape = "1"` + "\n",
+		`Owner = "frank"` + "\n" + `Shape = {1,1+1}` + "\n",
+		`Owner = "grace"` + "\n" + `Shape = {  }` + "\n",
+		`Owner = "heidi"` + "\n" + `Shape = [x = 1]` + "\n",
 	}
 	for i, ad := range ads {
 		if err := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), ad); err != nil {
@@ -66,9 +71,11 @@ func seedGroupKinds(t *testing.T, c *Client) {
 // reply must name every group identically. They are two encodings of one answer, and a client
 // that upgrades must not see its labels change underneath it.
 //
-// It is also the regression for getting this wrong once. A list's group text is a RENDERING
-// ("[1 2]"), not a literal ("{ 1,2 }"), so sending the list as a value and rebuilding the
-// label from it gave the typed path a different label for the same group.
+// It is also the regression for getting this wrong once. The two paths build the label from
+// different things -- the text path from the server's rendering, the typed path from the value
+// beside it -- so any kind whose value does not render back to its own group text splits into
+// two differently-named groups the moment a client upgrades. A list did, while its group text
+// was a Go rendering ("[1 2]") rather than a literal ("{ 1,2 }").
 func TestTypedGroupsAgreeWithTheTextPath(t *testing.T) {
 	typed, text, cleanup := typedPair(t)
 	defer cleanup()
@@ -120,13 +127,20 @@ func TestTypedGroupsCarryValuesBothWays(t *testing.T) {
 				t.Fatalf("%s: group %v has %d values for %d columns",
 					name, r.Group, len(r.GroupValues), len(r.Group))
 			}
-			// The value beside a label must name the label's own group. A list is the
-			// documented exception: its group is text, and it arrives as that text.
-			if got, want := db.GroupValueText(r.GroupValues[0]), r.Group[0]; got != want {
-				if s, serr := r.GroupValues[0].StringValue(); serr == nil && s == want {
-					continue // the list/nested-ad case, carrying its group text
-				}
+			// The value beside a label must name the label's own group, for EVERY kind
+			// of group -- no exception for the list and the nested ad, which is the
+			// point of their group text being a ClassAd literal.
+			want := r.Group[0]
+			if got := db.GroupValueText(r.GroupValues[0]); got != want {
 				t.Errorf("%s: group %q carries a value that renders as %q", name, want, got)
+			}
+			// And it arrives as the KIND it is, not as a string spelling that kind --
+			// which is what a list did while its group text was not a literal.
+			if kind := r.GroupValues[0].Type(); want == "{ 1,2 }" && kind != classad.ListValue {
+				t.Errorf("%s: the list group arrived as %v, not as a list", name, kind)
+			}
+			if kind := r.GroupValues[0].Type(); want == "[x = 1]" && kind != classad.ClassAdValue {
+				t.Errorf("%s: the nested-ad group arrived as %v, not as an ad", name, kind)
 			}
 		}
 	}

@@ -91,12 +91,10 @@ type AggRow struct {
 	// group" is not well defined, and a parallel fan-out would otherwise report
 	// whichever arrived first.
 	//
-	// A LIST OR A NESTED AD is the one kind whose group is its TEXT rather than its value
-	// (GroupValueText reaches no relation for them, so they group by canonical text). Here
-	// it is still the value itself; over dbrpc it arrives as a string holding that group
-	// text, because the text is what names the group and is not ClassAd literal syntax to
-	// rebuild it from. A caller that must tell the two apart has Group, which is that text
-	// in both cases.
+	// Every kind arrives here as the value it is, lists and nested ads included. Those two
+	// are grouped by their canonical text rather than by a relation (GroupValueText reaches
+	// no relation for them), but that text is a ClassAd literal, so the value survives the
+	// trip over dbrpc as well and a caller never finds a list standing in as a string.
 	GroupValues []classad.Value
 }
 
@@ -597,7 +595,9 @@ func trimFloat(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) }
 // A LIST OR A NESTED AD is reached by no operator at all: `{1,2} =?= {1,2}` is error, so even
 // reflexivity fails there. They group by canonical text, which collects identical ones
 // together -- the most that can be said about values no relation reaches, and more useful than
-// one group per row.
+// one group per row. That text is a ClassAd literal like every other group's: a list reads
+// "{ 1,2 }" and a nested ad "[a = 1]", so there is no kind whose group text has to be read
+// differently from the rest, and ParseGroupValue inverts all of them.
 func GroupValueText(v classad.Value) string {
 	switch {
 	case v.IsString():
@@ -612,8 +612,42 @@ func GroupValueText(v classad.Value) string {
 		if f, err := v.RealValue(); err == nil {
 			return numberGroupText(f)
 		}
+	case v.IsList():
+		if elems, err := v.ListValue(); err == nil {
+			return groupListText(elems)
+		}
 	}
 	return v.String()
+}
+
+// groupListText renders a list's group as a ClassAd list literal -- "{ 1,2 }", and "{  }" when
+// empty -- with every element rendered by GroupValueText in turn.
+//
+// THE ELEMENTS GO THROUGH GroupValueText AND NOT THE UNPARSER so a list is grouped by the same
+// relation its elements are grouped by on their own: {1} and {1.0} are one group exactly as 1
+// and 1.0 are. Value.Unparse cannot serve here on either count. It keeps a list literal's
+// UNEVALUATED source, so {1,1+1} unparses as "{ 1,1 + 1 }" against {1,2}'s "{ 1,2 }" -- two
+// names for one value -- and it renders a real in the reference sink form, so {1.5} would read
+// "{ 1.500000000000000E+00 }" where the same number alone reads "1.5".
+//
+// Literal syntax rather than Go's "[1 2]" is what makes the text of EVERY group a ClassAd
+// literal, which is what lets ParseGroupValue invert all of them. It also stops one collision:
+// an empty list and an empty nested ad both printed "[]" and so shared a group, though they are
+// values of different kinds.
+func groupListText(elems []classad.Value) string {
+	if len(elems) == 0 {
+		return "{  }"
+	}
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, e := range elems {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(GroupValueText(e))
+	}
+	b.WriteString(" }")
+	return b.String()
 }
 
 // GroupValue is GroupValueText's typed twin: the canonical VALUE of the group v belongs to.
@@ -632,6 +666,12 @@ func GroupValueText(v classad.Value) string {
 //
 // Only the integral real needs moving: its text is the integer's text, so the integer is the
 // representative. Every other kind already renders uniquely for its group, so it is its own.
+//
+// A LIST IS REBUILT from its elements mapped through this same function, because a list's
+// group is decided element-wise (see groupListText) and so {1} and {1.0} are one group with
+// one representative, {1}. Rebuilding also drops the unevaluated source expressions a list
+// parsed from a literal carries, which are a property of how the value was written and not of
+// the group -- {1,1+1} and {1,2} are one group and now one value.
 func GroupValue(v classad.Value) classad.Value {
 	if v.IsReal() {
 		if f, err := v.RealValue(); err == nil {
@@ -639,6 +679,15 @@ func GroupValue(v classad.Value) classad.Value {
 			if f == math.Trunc(f) && f >= -twoPow63 && f < twoPow63 {
 				return classad.NewIntValue(int64(f))
 			}
+		}
+	}
+	if v.IsList() {
+		if elems, err := v.ListValue(); err == nil {
+			canon := make([]classad.Value, len(elems))
+			for i, e := range elems {
+				canon[i] = GroupValue(e)
+			}
+			return classad.NewListValue(canon)
 		}
 	}
 	return v
@@ -649,16 +698,16 @@ func GroupValue(v classad.Value) classad.Value {
 // to send AggRow.GroupValues, so a caller gets values from every server and needs one path
 // rather than two.
 //
-// It inverts every SCALAR group exactly: GroupValueText renders those as ClassAd literal
-// syntax and nothing else, so a string arrives quoted and escaped, undefined and error as
-// their keywords, a number as itself. Parsing that text is the exact reverse of writing it --
-// the reason the rendering had to be faithful, and why the two must change together.
+// It inverts EVERY group exactly, with no kind excepted: GroupValueText renders a group as
+// ClassAd literal syntax and nothing else, so a string arrives quoted and escaped, undefined
+// and error as their keywords, a number as itself, a list as "{ 1,2 }" and a nested ad as
+// "[a = 1]". Parsing that text is the exact reverse of writing it -- the reason the rendering
+// had to be faithful, and why the two must change together.
 //
-// A list or a nested ad is NOT invertible and does not pretend to be. Their group text is a
-// rendering, not a literal ("[1 2]", where the literal would be "{ 1,2 }"), so this returns
-// it as the string it is. That is the right answer rather than a lossy one: the group IS that
-// text, so a string holding it names the group exactly, and reconstructing a list value would
-// produce something whose own rendering is a DIFFERENT group.
+// The invariant it rests on, which TestParseGroupValueInvertsEveryGroup pins: for any value v,
+// GroupValueText(ParseGroupValue(GroupValueText(v))) == GroupValueText(v). Round-tripping a
+// group through its text lands in the same group, which is what lets a caller treat a label
+// from an old server and a value from a new one as the same thing.
 //
 // A text that does not parse comes back as the string it is, not an error value. This is the
 // fallback path, and text that reached here came out of some server's renderer; reporting the
