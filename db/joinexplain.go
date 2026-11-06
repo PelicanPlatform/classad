@@ -165,7 +165,10 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 		}
 		out.Sides = append(out.Sides, se)
 	}
-	out.Reordered = !sameOrder(out.AsWritten, out.Sides)
+	// Asked of the planner rather than re-derived by comparing the two orders. The planner
+	// sets exactly one of these when it rewrites the spec and neither when it declines, so
+	// this is its own answer rather than a second opinion about it.
+	out.Reordered = stats.BuildSideSwapped || stats.ChainFromAlias != ""
 
 	for i := range steps {
 		sp := p.steps[i]
@@ -181,17 +184,4 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 		})
 	}
 	return out, nil
-}
-
-// sameOrder reports whether the plan reads the tables in the order they were written.
-func sameOrder(written []string, planned []JoinSideExplain) bool {
-	if len(written) != len(planned) {
-		return false
-	}
-	for i := range written {
-		if written[i] != planned[i].Alias {
-			return false
-		}
-	}
-	return true
 }

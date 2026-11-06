@@ -150,3 +150,86 @@ func TestExplainJoinRefusesWhatItCannotPlan(t *testing.T) {
 		t.Error("explained a join whose ON condition does not parse")
 	}
 }
+
+// A plan the planner left alone says so, and still describes itself fully. The order rules
+// live in joinbuildside.go and joinchainorder.go; what matters here is that a decline is
+// reported as "not reordered" rather than as an absent answer.
+func TestExplainJoinReportsAPlanItDidNotChange(t *testing.T) {
+	// Archives that keep their newest-first promise, which no plan may reorder.
+	cat := probeChainFixture(t, 8192, 32, false)
+	ex, err := cat.ExplainJoin(probeChainSpec("big1", "big2", "sel"), JoinLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex.Reordered {
+		t.Errorf("an ordered archive's chain reports a reorder: %s", ex.OrderWhy)
+	}
+	if !strings.Contains(ex.OrderWhy, "fixed order") {
+		t.Errorf("reason %q does not say why the order was kept", ex.OrderWhy)
+	}
+	if ex.Sides[0].Alias != "big1" {
+		t.Errorf("streams %s, want the table as written", ex.Sides[0].Alias)
+	}
+	// Declined before pricing anything: an order it may not change costs nothing to not
+	// compare, and reporting a cost here would invent a comparison that never happened.
+	if ex.OrderCost != 0 || ex.OrderAsWrittenCost != 0 {
+		t.Errorf("priced at %d against %d without comparing anything",
+			ex.OrderCost, ex.OrderAsWrittenCost)
+	}
+}
+
+// Each step reports its own kind, because a chain may mix them and which one a step is
+// decides what its unmatched rows do.
+func TestExplainJoinNamesEachStepsKind(t *testing.T) {
+	cat := probeChainFixture(t, 8192, 32, true)
+	spec := probeChainSpec("big1", "big2", "sel")
+	spec.Steps[0].Kind = JoinLeft
+	spec.Steps[1].Kind = JoinCross
+	ex, err := cat.ExplainJoin(spec, JoinLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []string{}
+	for _, s := range ex.Steps {
+		got = append(got, s.Alias+":"+s.Kind)
+	}
+	if strings.Join(got, ",") != "big2:left,sel:cross" {
+		t.Errorf("steps %v, want big2:left,sel:cross", got)
+	}
+	// A chain with a non-inner step may not be reordered, and the report must say that
+	// rather than leave the reader to infer it from the order being unchanged.
+	if ex.Reordered {
+		t.Error("a chain with a non-inner step was reported as reordered")
+	}
+	if !strings.Contains(ex.OrderWhy, "inner") {
+		t.Errorf("reason %q does not mention the inner-join rule", ex.OrderWhy)
+	}
+}
+
+// A side whose table the catalog does not have is reported as a side with no access path,
+// not as a failure of the whole report: the other sides' plans are still worth having, and
+// the missing one is named.
+func TestExplainJoinReportsASideItCannotRead(t *testing.T) {
+	cat := probeChainFixture(t, 8192, 32, true)
+	spec := probeChainSpec("big1", "big2", "sel")
+	spec.Steps[1].Side.Table = "nosuchtable"
+	ex, err := cat.ExplainJoin(spec, JoinLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing *JoinSideExplain
+	for i := range ex.Sides {
+		if ex.Sides[i].Table == "nosuchtable" {
+			missing = &ex.Sides[i]
+		}
+	}
+	if missing == nil {
+		t.Fatal("the report dropped the side it could not read")
+	}
+	if missing.Read != nil {
+		t.Error("a table the catalog does not have reported an access path")
+	}
+	if !strings.Contains(missing.ReadWhy, "nosuchtable") {
+		t.Errorf("ReadWhy is %q, want it to name the table", missing.ReadWhy)
+	}
+}
