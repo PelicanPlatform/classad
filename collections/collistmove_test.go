@@ -37,6 +37,44 @@ func listMovedCells(c *Collection) int {
 	return n
 }
 
+// listPresentCells counts the cells c's list columns hold a list for, over every block.
+func listPresentCells(t *testing.T, c *Collection) int {
+	t.Helper()
+	n := 0
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		segs := slices.Clone(sh.segs)
+		sh.mu.RUnlock()
+		for _, seg := range segs {
+			if seg == nil || seg.colNative.Load() == nil {
+				continue
+			}
+			for _, b := range seg.colNative.Load().seg.blocks {
+				if len(b.listIDs) == 0 {
+					continue
+				}
+				raw, err := c.regionCodec().Decompress(nil, b.listComp)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var buf []string
+				for j := range b.listIDs {
+					lc, _, ok := b.listColumn(raw, j, &buf)
+					if !ok {
+						t.Fatal("a list column does not parse")
+					}
+					for k := 0; k < b.n; k++ {
+						if lc.Has(k) {
+							n++
+						}
+					}
+				}
+			}
+		}
+	}
+	return n
+}
+
 // payloadVersions reads every columnarized segment's payload version from its stored header, and checks
 // that version 3 is written exactly for the segments holding a moved list.
 func payloadVersions(t *testing.T, c *Collection) map[uint32]int {
@@ -93,7 +131,7 @@ func nonCanonicalList(t *testing.T, node []byte) []byte {
 
 // putNonCanonical writes ad under key with each named list attribute's node re-spelled by
 // nonCanonicalList, as Put would otherwise write it.
-func putNonCanonical(t *testing.T, c *Collection, key []byte, src string, lists map[string]bool) {
+func putNonCanonical(t *testing.T, c *Collection, key []byte, src string, lists map[string]bool) int {
 	t.Helper()
 	raw, err := c.encodeAd(mustAd(t, src).AST())
 	if err != nil {
@@ -129,6 +167,7 @@ func putNonCanonical(t *testing.T, c *Collection, key []byte, src string, lists 
 	sh.commitOne(pendingPut{hash: h, key: key, ad: codec.Compress(nil, w), codec: codec, ct: c.namesCurrentTime(w)})
 	c.indexSealedSegments()
 	c.collapseSealedChains()
+	return changed
 }
 
 // collectRawReads gathers every raw read of c, sorted per path: full and projected (with and without a list
@@ -225,10 +264,12 @@ func TestListMovesByteIdentical(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
 		archive, interned bool
+		remDict           int
 	}{
-		{"mutable", false, false},
-		{"archive", true, false},
-		{"archive-interned", true, true},
+		{"mutable", false, false, 0},
+		{"mutable-no-remnant-dictionary", false, false, -1},
+		{"archive", true, false, 0},
+		{"archive-interned", true, true, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			colListColumns = false
@@ -239,7 +280,8 @@ func TestListMovesByteIdentical(t *testing.T) {
 				f = buildFormFixtureOpts(t, adir, 1100, 50, true, tc.interned, -1, listAd)
 			} else {
 				dir := t.TempDir()
-				c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1, MoveListColumns: -1})
+				c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1, MoveListColumns: -1,
+					RemnantDictionary: tc.remDict})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -248,8 +290,7 @@ func TestListMovesByteIdentical(t *testing.T) {
 				for i := range 1100 {
 					key := []byte(fmt.Sprintf("%d.0", i))
 					if i%3 == 0 && i%9 != 0 && i%37 == 3 {
-						putNonCanonical(t, c, key, listAd(i, 50), lists)
-						nonCanon++
+						nonCanon += putNonCanonical(t, c, key, listAd(i, 50), lists)
 						continue
 					}
 					if err := c.Put(key, mustAd(t, listAd(i, 50))); err != nil {
@@ -282,8 +323,27 @@ func TestListMovesByteIdentical(t *testing.T) {
 			if listMovedCells(c) == 0 || payloadVersions(t, c)[colPayloadVersionLists] == 0 {
 				t.Fatal("move arm: no list cell moved, or no version 3 payload")
 			}
-			if !tc.archive && kept1-kept0 < int64(nonCanon) {
-				t.Fatalf("move arm: %d cells kept for non-canonical bytes, want at least %d", kept1-kept0, nonCanon)
+			// Every cell a column holds moves, except the ones written non-canonically, which all stay.
+			if kept := int(kept1 - kept0); kept != nonCanon {
+				t.Fatalf("move arm: %d cells kept for their bytes, want the %d written non-canonically", kept, nonCanon)
+			}
+			if moved, present := listMovedCells(c), listPresentCells(t, c); moved != present-nonCanon {
+				t.Fatalf("move arm: %d cells moved of %d the columns hold, want all but the %d non-canonical", moved, present, nonCanon)
+			}
+			if tc.remDict < 0 {
+				only := false
+				for _, sh := range c.shards {
+					for _, seg := range sh.segs {
+						if seg != nil && seg.colNative.Load() != nil {
+							for _, b := range seg.colNative.Load().seg.blocks {
+								only = only || (b.listMoved > 0 && b.remDictN == 0)
+							}
+						}
+					}
+				}
+				if !only {
+					t.Fatal("fixture: no block holds moved lists without a remnant dictionary")
+				}
 			}
 			moved := collectRawReads(t, c, !tc.archive)
 			sameReads(t, "lists moved", base, moved)
@@ -950,6 +1010,17 @@ func TestListMovesSealedPolicy(t *testing.T) {
 			}
 		}
 	}
+	// Re-columnarized after the widen and before the migration: the list the policy now names comes back
+	// out of its column into its record, where the migration will seal it. Nothing moves it again.
+	if recolumnarizeAll(t, c) == 0 {
+		t.Fatal("nothing was re-columnarized")
+	}
+	if m, _ := placeholdersOf(t, c, "ChildRemoteUser"); m != 0 {
+		t.Fatalf("after the widen %d ChildRemoteUser lists stay only in a column", m)
+	}
+	if m, _ := placeholdersOf(t, c, "ChildCpus"); m == 0 {
+		t.Fatal("after the widen the clear ChildCpus lists were not moved")
+	}
 	if c.MigrateSealedAttrs(0) == 0 {
 		t.Fatal("the migration rewrote nothing")
 	}
@@ -1007,5 +1078,107 @@ func TestListNodeAtBounds(t *testing.T) {
 	}
 	if _, ok := listNodeAt(nodes[:len(nodes)-1], 0, 3); ok {
 		t.Error("a cell cut short by a truncated region resolved")
+	}
+}
+
+// TestListMovesFsckFindsUndecodableSection: a list column that passes its payload's checksum but does not
+// decompress -- what a writer bug would leave -- is named by Fsck, repair leaves the segment alone, and the
+// records holding a placeholder into it fail to read rather than read short.
+func TestListMovesFsckFindsUndecodableSection(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	f := buildFormFixtureOpts(t, dir, 900, 50, true, false, 1, listAd)
+	var path string
+	var comp []byte
+	var recOff uint32
+	for _, sh := range f.c.shards {
+		for _, s := range sh.segs {
+			if s == nil {
+				continue
+			}
+			if cn := s.colNative.Load(); cn != nil && path == "" {
+				for _, b := range cn.seg.blocks {
+					if b.listMoved > 0 {
+						path, comp, recOff = s.path, bytes.Clone(b.listComp), cn.rec
+						break
+					}
+				}
+			}
+		}
+	}
+	if path == "" {
+		t.Fatal("fixture: no moved list")
+	}
+	if err := f.close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := bytes.Index(data, comp)
+	if at < 0 || bytes.Index(data[at+1:], comp) >= 0 {
+		t.Fatal("the list column is not found exactly once in its segment")
+	}
+	for i := range comp {
+		data[at+i] = 0
+	}
+	// Re-sealed with a valid checksum, so only the section's own check can find it.
+	kl := recKeyLen(data, recOff)
+	adLenOff := int(recOff) + recKeyOff + int(kl)
+	crcOff := adLenOff + 4 + int(binary.LittleEndian.Uint32(data[adLenOff:]))
+	binary.LittleEndian.PutUint32(data[crcOff:], recCRC(data[recOff:crcOff+4], crcOff-int(recOff)))
+	if !recVerifyCRC(data, recOff) {
+		t.Fatal("the re-sealed payload does not verify")
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Fsck(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seg *FsckSegment
+	for i := range rep.Segments {
+		if filepath.Base(rep.Segments[i].Path) == filepath.Base(path) {
+			seg = &rep.Segments[i]
+		}
+	}
+	if seg == nil || seg.ListSectionDamage == "" {
+		t.Fatalf("fsck does not name the undecodable list column:\n%s", rep)
+	}
+	if !strings.Contains(rep.String(), "LIST COLUMNS DAMAGED") {
+		t.Fatalf("the report does not say so:\n%s", rep)
+	}
+	rr, err := Repair(dir, RepairOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(rr.Columnarized, path) {
+		t.Fatalf("repair did not leave the segment alone: %+v", rr)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, data) {
+		t.Fatal("repair modified the segment")
+	}
+	a, err := OpenArchive(ArchiveOptions{Dir: dir, SegmentSize: 1 << 16, GroupSchemaCount: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	all, _ := vm.Parse("true")
+	n := 0
+	for ad := range a.Query(all) {
+		n++
+		if cid, _ := ad.EvaluateAttrInt("ClusterId"); cid%3 == 0 && cid%9 != 0 {
+			if _, ok := ad.Lookup("ChildCpus"); !ok {
+				t.Fatalf("record %d read without its list", cid)
+			}
+		}
+	}
+	if n == len(f.src) {
+		t.Fatalf("every record read over an undecodable list column")
 	}
 }
