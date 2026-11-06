@@ -54,6 +54,13 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 	if err := c.refuseNamedAggregate(aggs, form); err != nil {
 		return nil, err
 	}
+	// A server that can send typed group cells is asked to: the reply then carries the
+	// groups as values and nothing parses a label. The typed opcode's frame is the NAMED
+	// one, so asking for it widens the request form to match.
+	typed := c.SupportsNewer(FeatTypedGroups)
+	if typed {
+		form = aggSpecNamed
+	}
 	build := func(id uint64) []byte {
 		// A request naming a user-defined aggregate goes out on the named opcode, a filtered
 		// one on the extended opcode, and each of those group tuples carries a bucket width;
@@ -62,6 +69,9 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 			o := opAggregateFiltered
 			if form >= aggSpecNamed {
 				o = opAggregateNamed
+			}
+			if typed {
+				o = opAggregateTyped
 			}
 			b := putStr(putStr(req(id, o), table), constraint)
 			b = putI32(b, int32(len(groupBy)))
@@ -97,14 +107,7 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 			}
 			switch status {
 			case stStream:
-				row := AggRow{Group: make([]string, len(groupBy)), Values: make([]string, len(aggs))}
-				for i := range row.Group {
-					row.Group[i] = body.str()
-				}
-				for i := range row.Values {
-					row.Values[i] = body.str()
-				}
-				out = append(out, row)
+				out = append(out, readAggRow(body, len(groupBy), len(aggs), typed))
 			case stErr:
 				return out, statusErr(status, body)
 			case stBadReq:
@@ -144,9 +147,17 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 	if err := c.refuseNamedAggregate(aggs, form); err != nil {
 		return nil, err
 	}
+	// See AggregateTable: a server that can type the group cells is asked to, which widens
+	// the request to the named frame the typed opcode carries.
+	typed := c.SupportsNewer(FeatTypedGroups)
+	if typed {
+		form = aggSpecNamed
+	}
 	build := func(id uint64) []byte {
 		o := opAggregateBucketed
 		switch {
+		case typed:
+			o = opAggregateTyped // the named request shape, with typed group cells back
 		case form >= aggSpecNamed:
 			o = opAggregateNamed // same request shape, specs carry a filter and a name
 		case form >= aggSpecFiltered:
@@ -179,14 +190,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 			}
 			switch status {
 			case stStream:
-				row := AggRow{Group: make([]string, len(groups)), Values: make([]string, len(aggs))}
-				for i := range row.Group {
-					row.Group[i] = body.str()
-				}
-				for i := range row.Values {
-					row.Values[i] = body.str()
-				}
-				out = append(out, row)
+				out = append(out, readAggRow(body, len(groups), len(aggs), typed))
 			case stErr:
 				return out, statusErr(status, body)
 			case stBadReq:
@@ -211,6 +215,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 // streamAggregate performs a server-side GROUP BY (raw group columns) and streams
 // one frame per group.
 func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	const typed = false
 	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -226,20 +231,20 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 	if !ok {
 		return
 	}
-	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write, qlog)
+	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, typed, write, qlog)
 }
 
 // streamAggregateBucketed is streamAggregate where each group column may carry a
 // bucket width (opAggregateBucketed).
 func (s *Server) streamAggregateBucketed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
-	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecBase, write, qlog)
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecBase, false, write, qlog)
 }
 
 // streamAggregateFiltered is streamAggregateBucketed whose specs carry a per-aggregate
 // filter (opAggregateFiltered). The request shape is otherwise identical, so a filtered
 // plain aggregate rides the bucketed frame with every width zero.
 func (s *Server) streamAggregateFiltered(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
-	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecFiltered, write, qlog)
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecFiltered, false, write, qlog)
 }
 
 // streamAggregateNamed is streamAggregateFiltered whose specs also carry the NAME of a
@@ -248,10 +253,16 @@ func (s *Server) streamAggregateFiltered(ctx context.Context, reqID uint64, r *r
 // against this process's registry (db.RegisterAggregate) by the reduction engine, which fails
 // the query for one it does not know rather than answering that column undefined.
 func (s *Server) streamAggregateNamed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
-	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecNamed, write, qlog)
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecNamed, false, write, qlog)
 }
 
-func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate bool, form aggSpecForm, write func([]byte), qlog func(QueryLog)) {
+// streamAggregateTyped is streamAggregateNamed whose reply carries the group cells as values
+// (opAggregateTyped). The request frame is the Named one, so only the reply differs.
+func (s *Server) streamAggregateTyped(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecNamed, true, write, qlog)
+}
+
+func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate bool, form aggSpecForm, typed bool, write func([]byte), qlog func(QueryLog)) {
 	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -268,7 +279,7 @@ func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *rea
 	if !ok {
 		return
 	}
-	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write, qlog)
+	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, typed, write, qlog)
 }
 
 // aggSpecForm selects which of the three aggregate-spec tails a frame carries. It is one
@@ -456,7 +467,7 @@ var ErrFilteredAggregateUnsupported = ErrExtendedAggregateUnsupported
 // private attributes for an unprivileged connection, projects only the attributes
 // the aggregation reads (so the scan stays wire-native), reduces via the db module's
 // shared aggregate engine, and streams one frame per group.
-func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint string, groupCols []GroupCol, aggs []AggSpec, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint string, groupCols []GroupCol, aggs []AggSpec, includePrivate, typed bool, write func([]byte), qlog func(QueryLog)) {
 	// The observed query is recorded when the handler returns, however it returns: a
 	// refused private attribute and a cancelled scan cost the server time too, and a
 	// shape that always fails is one an operator wants to see rather than one the report
@@ -545,7 +556,7 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		}
 		obs.Rows = len(rows)
 		// writeAggRows terminates the stream itself.
-		writeAggRows(reqID, rows, write)
+		writeAggRows(reqID, rows, typed, write)
 		return
 	default:
 		write(respErr(reqID, "no such table: "+table))
@@ -583,21 +594,110 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	if cancelled(ctx) {
 		return // client gone mid-scan: nothing left to stream
 	}
-	writeAggRows(reqID, rows, write)
+	writeAggRows(reqID, rows, typed, write)
+}
+
+// isScalarGroup reports whether a group value is one the wire carries AS a value. A list or a
+// nested ad is not: see appendAggRow for why those cross as their group text instead.
+func isScalarGroup(v classad.Value) bool {
+	switch v.Type() {
+	case classad.ListValue, classad.ClassAdValue:
+		return false
+	}
+	return true
+}
+
+// readAggRow decodes one streamed aggregate row. typed says the group cells are tagged values
+// (the server answered opAggregateTyped or its archive twin) rather than rendered text.
+//
+// Either way the row comes back with BOTH forms filled: Group is the group's identity and its
+// label, GroupValues is the same group in types. Against a server without FeatTypedGroups the
+// values are read back out of the text with db.ParseGroupValue, so a caller never has to ask
+// which kind of server answered, and never has to parse a label itself.
+func readAggRow(body *reader, nGroup, nAgg int, typed bool) AggRow {
+	row := AggRow{
+		Group:       make([]string, nGroup),
+		GroupValues: make([]classad.Value, nGroup),
+		Values:      make([]string, nAgg),
+	}
+	for i := range row.Group {
+		if typed {
+			v, nonScalar, ok := readExcValue(body)
+			if !ok {
+				// A tag this build does not know. The reader is now mid-cell and the
+				// frame cannot be trusted further, which body.err reports to the caller.
+				return row
+			}
+			row.GroupValues[i] = v
+			if nonScalar {
+				// excExpr: the cell holds the group's TEXT, because the group is a list
+				// or a nested ad and groups by text (see appendAggRow). The label is
+				// that text as it stands -- running it through GroupValueText would
+				// quote it and name a group no server ever sent.
+				row.Group[i], _ = v.StringValue() //nolint:errcheck // excExpr decodes to a string value, which readExcValue guarantees
+				continue
+			}
+			row.Group[i] = db.GroupValueText(v)
+			continue
+		}
+		row.Group[i] = body.str()
+		row.GroupValues[i] = db.ParseGroupValue(row.Group[i])
+	}
+	for i := range row.Values {
+		row.Values[i] = body.str()
+	}
+	return row
 }
 
 // writeAggRows streams aggregate rows and the stream terminator. Shared so a fast path that
 // computed its rows without scanning emits exactly what the scanning path does.
-func writeAggRows(reqID uint64, rows []db.AggRow, write func([]byte)) {
+func writeAggRows(reqID uint64, rows []db.AggRow, typed bool, write func([]byte)) {
+	// One buffer for every row rather than one per row. write hands the bytes to
+	// conn.WriteMsg and returns, retaining nothing, which is what lets the scan's value
+	// frames reuse a buffer the same way; the header is identical on each row, so only the
+	// body past it is rewritten.
+	frame := respHead(reqID, stStream)
+	head := len(frame)
 	for _, row := range rows {
-		frame := respHead(reqID, stStream)
-		for _, gv := range row.Group {
-			frame = putStr(frame, gv)
-		}
-		for _, v := range row.Values {
-			frame = putStr(frame, v)
-		}
+		frame = appendAggRow(frame[:head], row, typed)
 		write(frame)
 	}
 	write(respHead(reqID, stStreamEnd))
+}
+
+// appendAggRow writes one aggregate row: the group cells, then the aggregate cells. typed
+// selects the group encoding -- tagged values for opAggregateTyped and its archive twin,
+// rendered text for every older opcode. The aggregate cells are text either way.
+//
+// A LIST OR A NESTED AD CROSSES AS ITS GROUP TEXT, in a string cell, rather than as the value
+// it is. Those group by text (see db.GroupValueText) and their text is not ClassAd literal
+// syntax -- a list's group reads "[1 2]" while unparsing the same value gives "{ 1,2 }". Send
+// the value and the client would have to reconstruct the label from it, and would get a
+// different label than every older server sends for the same group. The text is what the
+// group IS here, so the text is what crosses, and both replies name the group identically.
+//
+// The typed form falls back to the row's TEXT for any group column the producer left without
+// a value. A producer that fills GroupValues fills all of them, so this is reachable only
+// from one that fills none -- and a group is better sent as the text that names it than as a
+// cell the client would read as undefined.
+func appendAggRow(frame []byte, row db.AggRow, typed bool) []byte {
+	for i, gv := range row.Group {
+		if typed {
+			if i < len(row.GroupValues) && isScalarGroup(row.GroupValues[i]) {
+				frame = appendExcValue(frame, row.GroupValues[i])
+			} else {
+				// excExpr, the codec's existing "text, not a value" tag, so the client
+				// can tell this cell from a string group whose value happens to spell
+				// the same thing. appendExcValue would write the value's UNPARSE here;
+				// the group text is what is wanted, so the tag is written directly.
+				frame = putStr(append(frame, excExpr), gv)
+			}
+			continue
+		}
+		frame = putStr(frame, gv)
+	}
+	for _, v := range row.Values {
+		frame = putStr(frame, v)
+	}
+	return frame
 }

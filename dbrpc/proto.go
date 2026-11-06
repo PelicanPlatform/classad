@@ -474,6 +474,24 @@ const (
 	opJoinExplain op = 76
 	// [opJoinChain body] -> [json db.JoinExplain]
 	opJoinChainExplain op = 77
+
+	// opAggregateTyped and opArchiveAggregateTyped are the Named pair with one change, in
+	// the REPLY: each group cell is a tagged VALUE (appendExcValue) where the others write
+	// the group's rendered text. The aggregate cells are unchanged.
+	//
+	// A pair rather than a flag on the existing opcodes, because an older server reading a
+	// frame it was not built for does not ignore the extra -- it misparses it. And a pair
+	// rather than four, because the Named frame is the widest of them: a request that
+	// neither filters nor names rides it with empty filters and names, which costs two
+	// bytes per spec and spares the protocol two more opcodes that differ in nothing but
+	// their reply.
+	//
+	// The request bodies are byte-for-byte the Named ones, so the server parses them with
+	// the same reader and only the writer branches.
+	// [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name]}
+	opAggregateTyped op = 78
+	// [name][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name]}[stats u8]
+	opArchiveAggregateTyped op = 79
 )
 
 // joinOpCarriesChain reports whether an opcode's body is a chain of steps rather than a pair
@@ -653,6 +671,10 @@ func (o op) String() string {
 		return "AggregateNamed"
 	case opArchiveAggregateNamed:
 		return "ArchiveAggregateNamed"
+	case opAggregateTyped:
+		return "AggregateTyped"
+	case opArchiveAggregateTyped:
+		return "ArchiveAggregateTyped"
 	}
 	return "op(unknown)"
 }
