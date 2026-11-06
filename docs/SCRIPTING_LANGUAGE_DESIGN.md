@@ -8,9 +8,10 @@ building has since made false. Read it before trusting the prose. §12 says what
 order, and §13 covers aggregation, which the rest of this document does not: its reduction half is
 built and its wire half is deliberately refused rather than guessed at.
 
-This document exists so the semantics and the compilation model are argued before a parser or a code
-generator is written — which is still how the work is going: there is no surface syntax yet, by
-design (§12, item 7).
+This document exists so the semantics and the compilation model were argued before a parser or a code
+generator was written. That order held: the binding model, the register machine and the reduction law
+all predate the surface syntax, which now exists — `vm.ParseScript` lowers source onto the same
+builder API the semantics were settled against.
 
 **What it is:** a small imperative language whose *expressions* are ClassAd expressions and which
 adds statements — assignment, conditionals, iteration, functions. Python-shaped surface, ClassAd

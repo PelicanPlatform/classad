@@ -374,38 +374,65 @@ every call is visible there and nowhere else.
 ## 7. ClassAd Script
 
 ClassAd Script is a statement language over the same engine: locals, `if`,
-`while`, and a result, compiled to one instruction stream so the optimizer can see
-across the whole thing. It exists because some things are awkward as a single
-expression — a loop with an accumulator, a derived value used three times.
-
-**What is built today:** a Go builder API in `collections/vm`, with the compiler,
-optimizer and interpreter under it. The effective memory request, with a default
-and a floor:
+`while`, and a result, compiled to one instruction stream so the optimizer can
+see across the whole thing. It exists for what a single expression says badly — a
+loop, or a derived value used three times.
 
 ```go
-sp, err := NewScript().
-	Let("want", must("RequestMemory")).
-	If(must("want is undefined"), func(s *Script) { s.Let("want", must("2048")) }, nil).
-	If(must("want < 512"), func(s *Script) { s.Let("want", must("512")) }, nil).
-	Result(must("want")).
-	Compile()
+sp, err := vm.ParseScript(`
+# Effective memory request, with a floor and an explicit absence case.
+want = MY.RequestMemory
+if want is undefined:
+    want = 2048
+if want < 512:
+    want = 512
+result = want
+`)
+v := sp.Run(ad)
 ```
 
 ```
-[ RequestMemory = 4096 ]   4096
-[ RequestMemory = 100 ]    512
-[ Other = 1 ]              2048
+[RequestMemory = 4096]   -> 4096
+[RequestMemory = 64]     -> 512
+[Owner = "alice"]        -> 2048
 ```
 
-The binding rule is Python's: a bare name that has been bound is the local,
-anything else is an attribute. `want = RequestMemory` reads the attribute and
-binds a local; every later `want` is the local. `MY.want` always means the
-attribute.
+Python-shaped statements over ordinary ClassAd expressions: `is` is `=?=`, and
+every expression between the statements is parsed by the same parser an
+attribute's value is. Blocks are introduced by `:` and delimited by indentation,
+which has to be spaces — braces were not available, since `{...}` is already a
+list literal and `[...]` an ad literal. `elif`, `else`, `while`, `pass` and the
+compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are there; `for` is not,
+and neither are writes back to the ad.
 
-A script cannot define a named function, so it is not a fifth way to write a UDF,
-though a script can *call* one.
+`ParseScriptBuilder` returns the script before compilation, for a caller that
+wants to add to it. The builder API it returns is also usable directly.
 
-The indentation-based source syntax, and what remains to build, are in
+**The binding rule is Python's.** A bare name that has been bound is the local;
+anything else is an attribute. So `want = MY.RequestMemory` binds a local, and
+every later `want` is that local, while `MY.want` always means the attribute.
+
+**A local is not visible to every expression**, and the compiler now says so
+rather than quietly answering from the ad. A few constructs are handed to the
+tree-walking evaluator — a ternary, a list or ad literal, a subscript, a
+selection — and that evaluator resolves names against the ad, which has never
+heard of your local:
+
+```
+x = Cpus + 1
+result = x ? 2 : 3      # refused: the ternary would read the ATTRIBUTE x
+```
+
+That used to compute silently from the wrong `x`. It is now an error carrying the
+line and column. Write it as an `if`, or name the attribute explicitly with
+`MY.x` if that is what you meant. The ternary is not an oversight waiting on a
+fix: an UNDEFINED condition evaluates both branches, which a jump cannot express
+without emitting each branch twice.
+
+A script cannot define a named function, so it is not a fifth way to write a UDF
+— though a script can *call* one.
+
+The language's design, and what remains to build, are in
 [docs/SCRIPTING_LANGUAGE_DESIGN.md](SCRIPTING_LANGUAGE_DESIGN.md).
 
 ## 8. Files
@@ -422,7 +449,8 @@ The samples above, all run by `go test`:
 | | |
 |---|---|
 | `classad/example_udf_test.go` | the Go function |
-| `collections/vm/example_script_test.go` | the ClassAd Script above |
+| `collections/vm/example_scriptparse_test.go` | the ClassAd Script above |
+| `collections/vm/example_script_test.go` | the same script through the builder API |
 | `db/example_udaf_test.go` | the Go aggregate and `CheckAggregateEqual` |
 | `wasmudf/example_test.go` | loading and registering both kinds of wasm module |
 | `wasmudf/testdata/examplepct.wat` | the wasm function |
