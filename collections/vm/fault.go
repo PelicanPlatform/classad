@@ -53,7 +53,7 @@ func (c FaultClass) String() string {
 // faultSite is one place in a program that can fault.
 type faultSite struct {
 	class FaultClass
-	kind  string // the construct: "if" or "while"
+	kind  string // the construct: "if", "while" or "for"
 	ord   int    // which one of that kind, counted from 1 in the order they were built
 }
 
@@ -83,6 +83,28 @@ func (p *Program) addFaultSite(class FaultClass, kind string) int32 {
 	}
 	p.faultSites = append(p.faultSites, faultSite{class: class, kind: kind, ord: ord})
 	return int32(len(p.faultSites) - 1)
+}
+
+// renameLastFaultSite relabels the site added most recently, for a construct that is LOWERED ONTO
+// another one and must still name itself in a diagnostic: `for` compiles to the counted `while`
+// that records the site, and "while #1 condition" is not a line the author can find.
+//
+// The ordinal is recomputed, because it counts the sites of one kind and the site has just changed
+// kind. Renaming rather than parameterizing the construct that records the site is what keeps the
+// loop lowering in one place.
+func (p *Program) renameLastFaultSite(kind string) {
+	if len(p.faultSites) == 0 {
+		return
+	}
+	last := len(p.faultSites) - 1
+	ord := 1
+	for _, s := range p.faultSites[:last] {
+		if s.kind == kind {
+			ord++
+		}
+	}
+	p.faultSites[last].kind = kind
+	p.faultSites[last].ord = ord
 }
 
 // faultAt builds the report for a site index, or nil if there is no such site.

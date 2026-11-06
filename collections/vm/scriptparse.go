@@ -30,6 +30,8 @@ import (
 //	    pass
 //	while want > 65536:
 //	    want = want / 2
+//	for size in MY.Sizes:           # one trip per element of a list
+//	    want += size
 //	result = want                   # the script's value; top level, last, exactly once
 //
 // FUNCTIONS:
@@ -69,17 +71,11 @@ import (
 // -- and a parser that accepted them would have to invent one. Refusing a word the language is
 // going to grow is a better failure than parsing it into something that is not what it says.
 //
-// `for` IS REFUSED FOR A MORE SPECIFIC REASON, and it is worth writing down because the shape of it
-// is not obvious. A `for` over a list desugars cleanly into a counted `while` -- bind the sequence,
-// bind its length, bind an index, and read element i each trip -- and every piece of that except one
-// compiles natively today. The exception is `seq[i]`. A subscript is delegated to the tree-walking
-// evaluator, which resolves names against the ad and cannot see a register, so the desugared loop
-// would read the ATTRIBUTE named seq and the ATTRIBUTE named i, both absent, on every trip. (The
-// compiler now refuses that rather than computing it; see LocalCaptureError.) `for` is therefore one
-// native opcode away -- an element load with the semantics of evaluateSubscriptExpr -- and that
-// opcode is a change to the instruction set, with its own vector decline, step cost and parity
-// tests. It is not parser work, and guessing at it here to make a keyword appear would be the
-// expensive half of the job done badly.
+// `for NAME in SEQUENCE:` IS A COUNTED `while`, and the parser spells it rather than implements it:
+// the sequence is bound once, its length is bound once, and an index reads one element per trip.
+// NAME is an ordinary local, function-scoped like every other, and the body is an ordinary suite. A
+// sequence that is not a list is a FAULT rather than an empty loop, for the same reason a
+// non-boolean `if` condition is. See Script.For, which holds the lowering and the reasoning.
 
 // ScriptSyntaxError is a syntax error with the position of the thing that caused it.
 //
@@ -170,6 +166,16 @@ type ifStmt struct {
 type whileStmt struct {
 	stmtAt
 	cond ast.Expr
+	body []stmt
+}
+
+// forStmt is `for name in seq:` over body. It is kept whole rather than desugared here, so the
+// shape the author wrote is the shape a diagnostic names; the lowering into a counted loop is the
+// builder's, in scriptfor.go.
+type forStmt struct {
+	stmtAt
+	name string
+	seq  ast.Expr
 	body []stmt
 }
 
@@ -374,9 +380,8 @@ func (p *scriptParser) statement(indent int) (stmt, error) {
 		}
 		return &whileStmt{stmtAt: stmtAt{ln.off}, cond: cond, body: body}, nil
 	case "for":
-		return nil, p.at(ln, "'for' is not implemented in ClassAd Script: "+
-			"a loop over a list needs an element load the compiler does not have yet; "+
-			"use 'while' with an explicit index once it does")
+		p.idx++
+		return p.forLine(ln, after, indent)
 	case "pass":
 		p.idx++
 		if p.text(after, ln.end) != "" {
@@ -494,6 +499,89 @@ func (p *scriptParser) defHeader(from, to int) (string, []string, error) {
 		params = append(params, pname)
 	}
 	return name, params, nil
+}
+
+// forLine parses `for NAME in <expr>:` and the indented suite that follows it.
+func (p *scriptParser) forLine(ln scriptLine, after, indent int) (stmt, error) {
+	end, err := p.blockColon(ln, after, "for")
+	if err != nil {
+		return nil, err
+	}
+	name, rest, err := p.forTarget(after, end)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(p.text(rest, end)) == "" {
+		return nil, p.pos.errorAt(rest, "expected a sequence after 'in', as in 'for x in MY.Sizes:'")
+	}
+	seq, err := p.expr(rest, end)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.block(ln, indent, "for")
+	if err != nil {
+		return nil, err
+	}
+	return &forStmt{stmtAt: stmtAt{ln.off}, name: name, seq: seq, body: body}, nil
+}
+
+// forTarget reads `NAME in` from the head of a `for` header, returning the name and the offset just
+// past the `in`.
+//
+// `in` is read as a WORD rather than searched for, which is what keeps it out of the expression: a
+// sequence may perfectly well contain the letters -- `for x in Inputs:` -- and a search would cut
+// the header in the wrong place. The loop variable is one token, so the word after it is the only
+// place `in` can be.
+func (p *scriptParser) forTarget(from, to int) (string, int, error) {
+	from, to = trimRange(p.clean, from, to)
+	if from >= to {
+		return "", 0, p.pos.errorAt(from, "expected a loop variable, as in 'for x in MY.Sizes:'")
+	}
+	if p.clean[from] == '\'' {
+		// The quoted form, for a name that is not a bare identifier -- the same escape hatch an
+		// assignment target has.
+		name, n, ok := unquoteIdent(string(p.clean[from:to]))
+		if !ok {
+			return "", 0, p.pos.errorAt(from, "expected a quoted attribute name")
+		}
+		return p.forIn(name, from, from+n, to)
+	}
+	i := from
+	for i < to && identPart(p.clean[i]) {
+		i++
+	}
+	name := string(p.clean[from:i])
+	if !isBareIdent(name) {
+		if i > from {
+			return "", 0, p.pos.errorAt(from, fmt.Sprintf("expected a loop variable name, found %q", name))
+		}
+		return "", 0, p.pos.errorAt(from,
+			fmt.Sprintf("expected a loop variable name, found %q", p.text(from, to)))
+	}
+	return p.forIn(name, from, i, to)
+}
+
+// forIn consumes the `in` that separates a `for` header's variable from its sequence. nameAt is
+// where the variable started, for the one diagnostic that is about the variable and not about `in`.
+func (p *scriptParser) forIn(name string, nameAt, from, to int) (string, int, error) {
+	i := from
+	for i < to && (p.clean[i] == ' ' || p.clean[i] == '\t') {
+		i++
+	}
+	j := i
+	for j < to && identPart(p.clean[j]) {
+		j++
+	}
+	if string(p.clean[i:j]) != "in" {
+		if name == "in" {
+			// `for in L:` read `in` as the variable, which is the one case where the complaint is
+			// about what is missing in FRONT of it.
+			return "", 0, p.pos.errorAt(nameAt,
+				"expected a loop variable before 'in', as in 'for x in MY.Sizes:'")
+		}
+		return "", 0, p.pos.errorAt(i, "expected 'in' after the loop variable, as in 'for x in MY.Sizes:'")
+	}
+	return name, j, nil
 }
 
 // returnLine parses `return` and `return <expr>`.
@@ -925,6 +1013,8 @@ func (e *emitter) one(s *Script, st stmt) {
 		s.If(v.cond, e.suite(v.then), e.suite(v.els))
 	case *whileStmt:
 		s.While(v.cond, e.suite(v.body))
+	case *forStmt:
+		s.For(v.name, v.seq, e.suite(v.body))
 	case *returnStmt:
 		s.Return(v.expr)
 	case *defStmt:

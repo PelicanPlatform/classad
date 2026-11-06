@@ -376,9 +376,9 @@ every call is visible there and nowhere else.
 ## 7. ClassAd Script
 
 ClassAd Script is a statement language over the same engine: locals, `if`,
-`while`, and a result, compiled to one instruction stream so the optimizer can
-see across the whole thing. It exists for what a single expression says badly — a
-loop, or a derived value used three times.
+`while`, `for`, and a result, compiled to one instruction stream so the optimizer
+can see across the whole thing. It exists for what a single expression says badly
+— a loop, or a derived value used three times.
 
 ```go
 sp, err := vm.ParseScript(`
@@ -403,9 +403,27 @@ Python-shaped statements over ordinary ClassAd expressions: `is` is `=?=`, and
 every expression between the statements is parsed by the same parser an
 attribute's value is. Blocks are introduced by `:` and delimited by indentation,
 which has to be spaces — braces were not available, since `{...}` is already a
-list literal and `[...]` an ad literal. `elif`, `else`, `while`, `pass`, `def`,
-`return` and the compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are there;
-`for` is not, and neither are writes back to the ad.
+list literal and `[...]` an ad literal. `elif`, `else`, `while`, `for`, `pass`,
+`def`, `return` and the compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are
+there; writes back to the ad are not.
+
+**`for NAME in SEQUENCE:`** walks a list:
+
+```
+largest = 0
+for request in MY.Requests:
+    if request > largest:
+        largest = request
+result = largest
+```
+
+The sequence is evaluated once, before the first trip. `NAME` is an ordinary
+local — function-scoped like any other, still bound after the loop, holding the
+last element visited. An empty list runs the body zero times. A sequence that is
+**not a list** is a fault: the script ends with `error`, the same way an `if` on
+an undefined condition does, so a misspelled attribute says so rather than
+turning the loop into one that quietly does nothing. The step budget bounds the
+loop; there is no separate iteration limit.
 
 `ParseScriptBuilder` returns the script before compilation, for a caller that
 wants to add to it. The builder API it returns is also usable directly.
