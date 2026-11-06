@@ -106,6 +106,13 @@ type Program struct {
 	// plan (see ReadPlan) for partial-decode evaluation.
 	expr ast.Expr
 
+	// aliases are the join aliases the program was compiled with (CompileAliases), case-folded
+	// to their index. Retained because probe extraction has to tell `j.Owner` -- the Owner of
+	// the other side of a join -- from `Res.Mem`, a select into a nested record of THIS ad:
+	// the two are the same AST node and only the declared alias list separates them. Nil for an
+	// ordinary expression, where every select is a genuine one.
+	aliases aliasIndex
+
 	// now, when nonzero, is the time a CurrentTime reference the scope does not define
 	// evaluates to (see Compile). Zero reads the clock, as the evaluator does.
 	now int64

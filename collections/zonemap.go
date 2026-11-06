@@ -219,6 +219,19 @@ func (c *Collection) ZoneAttrs() []string {
 	return names
 }
 
+// topLevelNames drops the nested paths from a list of configured index names. A zone map
+// holds one [min,max] per top-level attribute of a segment, so a path has nothing to put in
+// one -- and zonePrune declines a nested probe for the same reason.
+func topLevelNames(names []string) []string {
+	out := names[:0:0]
+	for _, n := range names {
+		if splitAttrPath(n) == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // addZoneAttrs extends the zone-mapped attribute set of an append-only collection with
 // names not already covered, so a value index added at RUNTIME gets whole-segment pruning
 // too (construction wires ZoneAttrs + ValueAttrs together; see New). Segments already

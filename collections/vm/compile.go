@@ -38,6 +38,7 @@ func compileProgramAliases(expr ast.Expr, aliases aliasIndex) *Program {
 	} else {
 		c.emit(expr)
 	}
+	c.p.aliases = aliases
 	c.p.readAttrs = collectReads(expr, map[string]bool{}, nil)
 	c.p.expr = expr
 	c.p.vops = vopPrefix(c.p.code)
