@@ -464,6 +464,12 @@ func collectReads(expr ast.Expr, seen map[string]bool, out []string) []string {
 			out = collectReads(a, seen, out)
 		}
 	case *ast.SelectExpr:
+		// Only the record, unlike ReadPlan's walk, which also seeds the member because
+		// it chains out to this ad. This set is the demand signal (which attributes a
+		// scan would profit from having indexed), and an index on the chained-to name
+		// answers nothing: a select yields no probe. ScriptFunc.checkPure, the other
+		// reader of this set, refuses a select outright -- it compiles to a delegated
+		// subtree, which is its rule 4 -- so it does not depend on this case either.
 		out = collectReads(v.Record, seen, out)
 	case *ast.SubscriptExpr:
 		out = collectReads(v.Container, seen, out)

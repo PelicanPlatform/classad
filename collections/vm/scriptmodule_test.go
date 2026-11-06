@@ -223,6 +223,13 @@ func TestScriptFuncPurityGateSentinel(t *testing.T) {
 		"def f():\n    return Optimistic\n",
 		"def f():\n    return MY.RequestMemory\n",
 		"def f():\n    return random(10)\n",
+		// A select reaches the ad through the SCOPING RULE rather than by naming an
+		// attribute: a member the record does not define chains out to the subject ad,
+		// so this reads the ad's Mem. The read set rule 1 works from holds only names
+		// the expression writes down and cannot see that; rule 4 is what refuses it,
+		// because a select compiles to a subtree delegated to an evaluator this
+		// function has no ad for.
+		"def f():\n    return [ a = 1 ].Mem\n",
 	} {
 		m, err := ParseScriptModule(src)
 		if err != nil {
