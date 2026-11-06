@@ -115,6 +115,15 @@ const (
 	FeatJoinChain     Feature = "joinchain"
 	FeatJoinChainWire Feature = "joinchainwire"
 
+	// FeatJoinExplain is the join access-path report (opJoinExplain, opJoinChainExplain).
+	// Postdates advertisement, so silence is a no.
+	//
+	// One feature for both opcodes, unlike the join itself. A server gains the two
+	// together -- they are one handler over the two body layouts -- and the thing that
+	// made FeatJoinChain separate does not apply: a build without chains cannot answer
+	// either, because it has no chain planner to report on.
+	FeatJoinExplain Feature = "joinexplain"
+
 	// FeatEvalTypes is the EVALUATED half of the attribute type report (opAttrTypes with
 	// attrFlagEvaluate). Postdates advertisement, so silence is a no.
 	//
@@ -171,6 +180,7 @@ var serverFeatures = []Feature{
 	FeatValueDict,
 	FeatEvalTypes,
 	FeatNamedAggregate,
+	FeatJoinExplain,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar
@@ -217,6 +227,14 @@ func (s *Server) SessionAttrs() map[string]string {
 		}
 		if f == FeatJoinChainWire {
 			if _, ok := s.cat.(joinWireCatalog); !ok || !catalogJoinsChains(s.cat) {
+				continue
+			}
+		}
+		// Explaining a join is its own capability, not one implied by running one: the
+		// report describes decisions a catalog from an older build makes without being
+		// able to name them.
+		if f == FeatJoinExplain {
+			if _, ok := s.cat.(joinExplainCatalog); !ok {
 				continue
 			}
 		}

@@ -103,7 +103,8 @@ type JoinSide struct {
 // condition, so the hash never has to reproduce ClassAd's equality semantics exactly -- it
 // only has to avoid putting two rows in different buckets when they would compare equal.
 type JoinEqui struct {
-	Left, Right string
+	Left  string `json:"left"`
+	Right string `json:"right"`
 }
 
 // JoinStep folds one more table into the joined row.
