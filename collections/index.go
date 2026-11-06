@@ -58,6 +58,22 @@ type indexSpec struct {
 	// (Options at New, or an explicit AddIndex). The memory-budget trimmer only ever
 	// drops auto indexes, so a human-created index is never removed automatically.
 	auto map[uint32]struct{}
+
+	// comps are the configured composite (multi-column) indexes, ordered by tuple identity
+	// so a build is deterministic. Every component is also indexed on its own (see
+	// newCompositeSpecs), so a composite only ever makes a conjunction cheaper -- it is
+	// never the sole index on an attribute.
+	comps []compositeSpec
+}
+
+// compositeFor returns the configured composite with this tuple identity.
+func (s *indexSpec) compositeFor(key string) (compositeSpec, bool) {
+	for _, cs := range s.comps {
+		if cs.key == key {
+			return cs, true
+		}
+	}
+	return compositeSpec{}, false
 }
 
 // isAuto reports whether the index on id was created by the auto-tuner.
@@ -215,6 +231,30 @@ func (s *indexSpec) signature() uint64 {
 	for _, id := range val {
 		mix(uint64(id))
 	}
+	// Composites join the signature so that adding or dropping one marks every segment's
+	// index stale, exactly as adding an attribute does -- a sealed sidecar carries its
+	// composites (v11), so it has to be rebuilt when the tuple set moves on.
+	//
+	// A spec with NO composite contributes nothing here, so the composite set cannot move
+	// the signature of a configuration that has none. That is deliberate: mixing an empty
+	// tuple set in would give every such configuration a different signature from the one
+	// its sidecars were written under, and every sidecar on disk would read as stale --
+	// re-indexing a whole archive for a feature it does not use.
+	if len(s.comps) > 0 {
+		keys := make([]string, 0, len(s.comps))
+		for _, cs := range s.comps {
+			keys = append(keys, cs.key)
+		}
+		sort.Strings(keys)
+		mix(^uint64(0))
+		for _, k := range keys {
+			for i := 0; i < len(k); i++ {
+				h ^= uint64(k[i])
+				h *= prime64
+			}
+			mix(^uint64(0))
+		}
+	}
 	return h
 }
 
@@ -239,6 +279,7 @@ func (s *indexSpec) clone() *indexSpec {
 			n.auto[id] = struct{}{}
 		}
 	}
+	n.comps = append([]compositeSpec(nil), s.comps...)
 	if s.inline {
 		n.names = make(map[uint32]string, len(s.names))
 		n.nameToID = make(map[string]uint32, len(s.nameToID))
@@ -293,8 +334,13 @@ func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
 // equalIDs reports whether two specs index exactly the same attribute ids in the
 // same buckets (order-insensitive), i.e. an add/drop would be a no-op.
 func (s *indexSpec) equalIDs(o *indexSpec) bool {
-	if len(s.cat) != len(o.cat) || len(s.val) != len(o.val) {
+	if len(s.cat) != len(o.cat) || len(s.val) != len(o.val) || len(s.comps) != len(o.comps) {
 		return false
+	}
+	for i, cs := range s.comps {
+		if cs.key != o.comps[i].key {
+			return false
+		}
 	}
 	for id := range s.cat {
 		if _, ok := o.cat[id]; !ok {
@@ -352,6 +398,7 @@ type segIndex struct {
 	all     *roaring.Bitmap         // offsets of all covered records (for `!=` = all minus value)
 	cat     map[uint32]*catPostings // interned attr id -> postings
 	val     map[uint32]*valPostings
+	comp    map[string]*compPostings // composite tuple identity -> postings (see composite.go)
 }
 
 // buildSegIndex scans a segment's records in [0, upto) and returns its index for
@@ -382,6 +429,9 @@ func (si *segIndex) finish() {
 	for _, vp := range si.val {
 		vp.finishStats()
 	}
+	for _, cp := range si.comp {
+		cp.finishStats()
+	}
 }
 
 // indexSegRange posts seg's records in [from, upto) into a new, UNFINISHED segIndex whose upto is
@@ -396,6 +446,7 @@ func indexSegRange(c *Collection, seg *segment, from, upto int, spec *indexSpec)
 		all:     roaring.New(),
 		cat:     make(map[uint32]*catPostings, len(spec.catIDs)),
 		val:     make(map[uint32]*valPostings, len(spec.valIDs)),
+		comp:    make(map[string]*compPostings, len(spec.comps)),
 	}
 	for _, id := range spec.catIDs {
 		si.cat[id] = &catPostings{
@@ -407,6 +458,9 @@ func indexSegRange(c *Collection, seg *segment, from, upto int, spec *indexSpec)
 	}
 	for _, id := range spec.valIDs {
 		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New(), posted: roaring.New()}
+	}
+	for _, cs := range spec.comps {
+		si.comp[cs.key] = &compPostings{spec: cs, post: map[string]*roaring.Bitmap{}, exc: roaring.New()}
 	}
 	var buf []byte
 	dm := seg.damaged()
@@ -536,6 +590,94 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *seg
 			vp.exc.Add(o) // list / record / computed expression
 		}
 	}
+	for _, cs := range spec.comps {
+		si.indexCompositeRecord(o, ad, spec, dict, cs)
+	}
+}
+
+// indexCompositeRecord posts record o under one composite's tuple key, classifying the
+// record exactly as the components' own indexes classify it (see composite.go):
+//
+//   - every component a key the component's index could post -> the tuple posting;
+//   - some component present but not keyable (an expression, a NaN, a string where a
+//     number was expected) -> the composite's exception set, because the index cannot
+//     tell whether the record matches;
+//   - some component ABSENT -> neither. An equality on an attribute the ad does not carry
+//     is UNDEFINED, so the conjunction cannot be TRUE, and the single-attribute equality
+//     path (post | exc) leaves such a record out for the same reason.
+func (si *segIndex) indexCompositeRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *segDictHandle, cs compositeSpec) {
+	cp := si.comp[cs.key]
+	if cp == nil {
+		return
+	}
+	key := make([]byte, 0, 16*len(cs.ids))
+	for i, id := range cs.ids {
+		node, ok := spec.attrNode(ad, id, dict)
+		if !ok {
+			return // absent component
+		}
+		if cs.cats[i] {
+			k, keyable := compositeCatKey(node)
+			if !keyable {
+				cp.exc.Add(o)
+				return
+			}
+			key = appendCompStr(key, k)
+			continue
+		}
+		f, keyable := compositeValKey(node)
+		if !keyable {
+			cp.exc.Add(o)
+			return
+		}
+		key = appendCompFloat(key, f)
+	}
+	addOffset(cp.post, string(key), o)
+}
+
+// compositeCatKey folds a categorical component's value to the key its own catPostings
+// would post it under: a string folded to lower case, a boolean to "true"/"false".
+// Anything else is not keyable (the catPostings path puts it in exc).
+func compositeCatKey(node []byte) (string, bool) {
+	lit, ok := wire.LiteralValue(node)
+	if !ok {
+		return "", false
+	}
+	switch lit.Kind {
+	case wire.LitString:
+		return strings.ToLower(lit.Str), true
+	case wire.LitBool:
+		if lit.Bool {
+			return "true", true
+		}
+		return "false", true
+	}
+	return "", false
+}
+
+// compositeValKey folds a value component to the float64 its own valPostings would post it
+// under. A NaN is not keyable, for the reason valPostings refuses it: it is equal to
+// nothing, so no lookup could find it again.
+func compositeValKey(node []byte) (float64, bool) {
+	lit, ok := scalarValue(node)
+	if !ok {
+		return 0, false
+	}
+	switch lit.Kind {
+	case wire.LitInt:
+		return float64(lit.Int), true
+	case wire.LitReal:
+		if math.IsNaN(lit.Real) {
+			return 0, false
+		}
+		return lit.Real, true
+	case wire.LitBool:
+		if lit.Bool {
+			return 1, true
+		}
+		return 0, true
+	}
+	return 0, false
 }
 
 // finalizeExact collapses case-uniform buckets: for every folded key whose records

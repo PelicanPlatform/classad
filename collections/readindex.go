@@ -30,6 +30,11 @@ type readIndex interface {
 	// not categorically indexed here or no record spells the value that way. Paired with
 	// catCanonicalValues it answers a GROUP BY count from the index alone.
 	catValueCount(id uint32, key string) (count uint64, ok bool)
+	// compositeCandidates reports the EXACT number of candidates a composite index would
+	// hand the scan for this conjunction, and whether this segment holds one the planner
+	// would take. For EXPLAIN, which otherwise reports the minimum of the per-attribute
+	// estimates -- independent guesses about correlated columns.
+	compositeCandidates(usable []usableProbe) (count float64, tuple string, ok bool)
 }
 
 // indexPrimitives are the per-tier operations the shared planner logic (below) is built on.
@@ -47,6 +52,14 @@ type indexPrimitives interface {
 	// tier it reads the all-records bitmap, which the planner otherwise deliberately avoids
 	// paging in, and which an absent probe's execution clones anyway.
 	recordCount() uint64
+	// compositeMatch reports the composite index this segment holds that covers a
+	// conjunction's equality probes -- which probes it covers, the records posted under the
+	// tuple, and the composite's exception set. ok is false when the segment holds no
+	// composite whose every component the conjunction pins (see composite.go). It is a
+	// primitive because the two tiers hold their composites differently (a map of postings
+	// in RAM, a byte-sorted key run in the sidecar); everything decided FROM the match --
+	// whether to take it, what it replaces -- is shared logic below.
+	compositeMatch(usable []usableProbe) (compositeMatch, bool)
 	// bloomAbsent reports whether a categorical ==/in probe's values are ALL provably absent
 	// (via the per-segment bloom). false when undeterminable: no bloom, a value might be
 	// present, or the probe is not a categorical equality. The tiers differ only here (the
@@ -201,6 +214,16 @@ func indexSkipsPrefix(ix indexPrimitives, usable []usableProbe) bool {
 			return true
 		}
 	}
+	// A composite can prove the prefix empty where no single probe can: `ClusterId == 7 &&
+	// ProcId == 3` is unskippable on either attribute alone whenever the segment holds
+	// cluster 7 and holds some proc 3, and provably empty the moment nothing posted the
+	// PAIR. That is the joint selectivity the per-attribute stats cannot see. Sound because
+	// a record satisfying both equalities carries both components and is exceptional in
+	// neither, so it would be in the tuple's posting -- and cm.empty() requires the
+	// composite's exception set to be empty too.
+	if cm, ok := ix.compositeMatch(usable); ok && cm.empty() {
+		return true
+	}
 	return false
 }
 
@@ -325,9 +348,34 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 	case 1:
 		return ix.probeOffsets(usable[0])
 	}
+	// A composite over the tuple the conjunction pins replaces that whole group of probes
+	// with one lookup -- when it is worth it. compositeWins is the cost test: the composite
+	// is taken only when it admits no more candidates than the most selective probe it
+	// covers, which is what makes it a replacement rather than merely an alternative.
+	// Asked BEFORE the selectivity ordering, because a composite that answers the whole
+	// conjunction (cm.certainWin) makes the ordering dead work -- there is nothing left to
+	// order -- and pricing probes is not free on a high-cardinality attribute.
+	cm, hasComposite := ix.compositeMatch(usable)
+	if hasComposite && cm.certainWin {
+		return cm.candidates() // the composite answers the whole conjunction, exactly
+	}
 	order, est := indexSelectivityOrder(ix, usable)
 	var acc *roaring.Bitmap
+	var covered []bool
+	if hasComposite && compositeWins(cm, est) {
+		acc = cm.candidates()
+		if acc.IsEmpty() {
+			return acc
+		}
+		covered = make([]bool, len(usable))
+		for _, i := range cm.used {
+			covered[i] = true
+		}
+	}
 	for _, i := range order {
+		if len(covered) > 0 && covered[i] {
+			continue // already answered, exactly, by the composite
+		}
 		if acc != nil && !worthProbing(est[i], acc.GetCardinality()) {
 			continue
 		}
@@ -342,6 +390,24 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 		}
 	}
 	return acc
+}
+
+// indexCompositeCandidates is the readIndex surface of the composite plan: it derives the
+// per-probe estimates the cost test needs, so a caller holding only the conjunction can ask,
+// and reports the EXACT candidate count the composite would hand the scan along with the
+// tuple's identity. EXPLAIN reports that in place of the minimum of the per-attribute
+// estimates, which are independent guesses about columns that are typically correlated
+// (ClusterId and ProcId maximally so).
+func indexCompositeCandidates(ix indexPrimitives, usable []usableProbe) (float64, string, bool) {
+	if len(usable) < 2 {
+		return 0, "", false
+	}
+	_, est := indexSelectivityOrder(ix, usable)
+	cm, ok := ix.compositeMatch(usable)
+	if !ok || !compositeWins(cm, est) {
+		return 0, "", false
+	}
+	return float64(cm.count()), cm.spec.key, true
 }
 
 // offsetsPerVerify is how many record offsets can be merged into a candidate bitmap in the

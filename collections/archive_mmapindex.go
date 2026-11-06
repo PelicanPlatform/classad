@@ -28,6 +28,18 @@ type mmapSegIndex struct {
 	// skip/selectivity paths can read them without paging the postings (v7).
 	catStats map[uint32]*segStats
 	valStats map[uint32]*segStats
+	// comps are the composite indexes this sidecar carries (v11), in tuple-identity order.
+	// Empty for an older sidecar, which simply means the segment falls back to intersecting
+	// the components' own postings -- correct, just the cost the composite was built to
+	// avoid.
+	comps []mmapComposite
+}
+
+// mmapComposite is one composite index's directory entry: the tuple it keys, and the file
+// offset of its block.
+type mmapComposite struct {
+	spec compositeSpec
+	off  uint32
 }
 
 // stalePostings reports whether the sidecar was built before negative numbers stored as unary minus
@@ -35,7 +47,7 @@ type mmapSegIndex struct {
 // right either way (exceptions are re-verified); a rebuild only makes them cheaper, and is pointless
 // for a sidecar with no value exception at all.
 func (si *mmapSegIndex) stalePostings() bool {
-	if si.version >= sidecarVersion {
+	if si.version >= sidecarNegPostingVersion {
 		return false
 	}
 	for _, st := range si.valStats {
@@ -95,10 +107,88 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 		si.valDir[id] = m.u32()
 		si.valStats[id] = readSegStats(data, m.u32())
 	}
+	if v >= 11 {
+		compN := m.u32()
+		if compN > maxSidecarComposites {
+			return nil, fmt.Errorf("archive: corrupt sidecar: %d composites", compN)
+		}
+		for i := uint32(0); i < compN; i++ {
+			nAttrs := m.u32()
+			if nAttrs < 2 || nAttrs > maxCompositeAttrs {
+				return nil, fmt.Errorf("archive: corrupt sidecar: composite of %d attributes", nAttrs)
+			}
+			cs := compositeSpec{ids: make([]uint32, nAttrs), cats: make([]bool, nAttrs)}
+			for j := range cs.ids {
+				cs.ids[j] = m.u32()
+			}
+			mask := m.u32()
+			for j := range cs.cats {
+				cs.cats[j] = mask&(1<<uint(j)) != 0
+			}
+			cs.key = compositeKey(cs.ids)
+			si.comps = append(si.comps, mmapComposite{spec: cs, off: m.u32()})
+		}
+	}
 	if m.err != nil {
 		return nil, fmt.Errorf("archive: corrupt sidecar directory: %w", m.err)
 	}
 	return si, nil
+}
+
+// maxSidecarComposites bounds the composite directory a sidecar may declare, so a corrupt
+// length cannot make the parser allocate without limit before the cursor reports an error.
+const maxSidecarComposites = 1024
+
+// compositeMatch finds the composite covering usable's equality conjuncts and reads its
+// block: the tuple's posting (binary search over the byte-sorted key blob, so only the
+// touched pages are faulted in) and the composite's exception set.
+func (si *mmapSegIndex) compositeMatch(usable []usableProbe) (compositeMatch, bool) {
+	if len(si.comps) == 0 || len(usable) < 2 {
+		return compositeMatch{}, false
+	}
+	var best compositeMatch
+	var found bool
+	for _, mc := range si.comps {
+		key, used, ok := compositeTupleKey(mc.spec, usable)
+		if !ok || (found && len(used) <= len(best.used)) {
+			continue
+		}
+		cm := compositeMatch{spec: mc.spec, used: used, excN: le64(si.data, mc.off+4)}
+		if off, hit := si.compFind(mc.off, key); hit {
+			cm.post = si.bitmapAt(off)
+		}
+		if cm.excN > 0 {
+			cm.exc = si.bitmapAt(le32(si.data, mc.off))
+		}
+		cm.certainWin = cm.excN == 0 && len(used) == len(usable)
+		best, found = cm, true
+	}
+	return best, found
+}
+
+// compFind binary-searches a composite block's byte-sorted encoded tuple keys.
+// Block layout: excOff u32; excN u64; n u32; keyOff[n+1] u32; bmOff[n] u32; keysBlob.
+func (si *mmapSegIndex) compFind(blockOff uint32, key string) (bmOff uint32, ok bool) {
+	d := si.data
+	n := le32(d, blockOff+12)
+	keyOffBase := blockOff + 16
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	lo, hi := 0, int(n)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		ks := blobBase + le32(d, keyOffBase+uint32(mid)*4)
+		ke := blobBase + le32(d, keyOffBase+uint32(mid+1)*4)
+		switch cmpStrBytes(key, d[ks:ke]) {
+		case 0:
+			return le32(d, bmOffBase+uint32(mid)*4), true
+		case -1:
+			hi = mid
+		default:
+			lo = mid + 1
+		}
+	}
+	return 0, false
 }
 
 func le32(b []byte, off uint32) uint32 { return binary.LittleEndian.Uint32(b[off:]) }
@@ -128,7 +218,10 @@ func (si *mmapSegIndex) candidateOffsetsGroups(groups [][]usableProbe) *roaring.
 }
 func (si *mmapSegIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
 func (si *mmapSegIndex) estCandidates(up usableProbe) float64  { return indexEstCandidates(si, up) }
-func (si *mmapSegIndex) coveredUpto() uint32                   { return si.upto }
+func (si *mmapSegIndex) compositeCandidates(usable []usableProbe) (float64, string, bool) {
+	return indexCompositeCandidates(si, usable)
+}
+func (si *mmapSegIndex) coveredUpto() uint32 { return si.upto }
 
 // coversProbe reports whether this segment indexes one probe's attribute.
 func (si *mmapSegIndex) coversProbe(up usableProbe) bool {

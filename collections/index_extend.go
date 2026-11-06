@@ -181,8 +181,19 @@ func extendSegIndex(c *Collection, seg *segment, base *segIndex, upto int, spec 
 		np.posted = roaring.Or(bp.posted, np.posted)
 		vals[id] = mergeSorted(bp.sortedKeys, added)
 	}
+	for key, np := range si.comp {
+		bp := base.comp[key]
+		if bp == nil {
+			return buildSegIndex(c, seg, upto, spec)
+		}
+		np.post = mergePostings(bp.post, np.post)
+		np.exc = roaring.Or(bp.exc, np.exc)
+	}
 	for _, cp := range si.cat {
 		cp.finalizeExact()
+		cp.finishStats()
+	}
+	for _, cp := range si.comp {
 		cp.finishStats()
 	}
 	for id, vp := range si.val {

@@ -661,6 +661,13 @@ type QueryExplain struct {
 	IndexSegments        int   `json:"indexSegments,omitempty"`
 	IndexSkippedSegments int   `json:"indexSkippedSegments,omitempty"`
 	UnindexedSegments    int   `json:"unindexedSegments,omitempty"`
+	// CompositeSegments is how many of IndexSegments answered the conjunction from a
+	// COMPOSITE index -- one lookup over the attribute tuple -- instead of probing each
+	// attribute and intersecting. CompositeIndex names the tuple ("ClusterId+ProcId").
+	// A segment indexed before the composite was configured is not counted and falls back
+	// to the intersection, which is why this is a count rather than a flag.
+	CompositeSegments int    `json:"compositeSegments,omitempty"`
+	CompositeIndex    string `json:"compositeIndex,omitempty"`
 	// ZonePrunedSegments is how many segments the zone maps rule out before any record or
 	// posting is read, on either plan. An indexed plan's segment counts above cover only the
 	// segments left after it.
@@ -732,6 +739,9 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		}
 		if ex.UnindexedSegments > 0 {
 			ex.Reason += fmt.Sprintf("; %d segments have no index on it and are scanned in full", ex.UnindexedSegments)
+		}
+		if ex.CompositeSegments > 0 {
+			ex.Reason += fmt.Sprintf("; %d answered it from the composite index on %s, in one lookup", ex.CompositeSegments, ex.CompositeIndex)
 		}
 	case dnfReason != "":
 		ex.Plan = scan
@@ -841,7 +851,22 @@ func (c *Collection) explainGroups(q *vm.Query, plan []vm.ProbeGroup, ex *QueryE
 	if ex.UnindexedSegments > 0 {
 		ex.Reason += fmt.Sprintf("; %d segments have no index on every disjunct and are scanned in full", ex.UnindexedSegments)
 	}
+	if ex.CompositeSegments > 0 {
+		ex.Reason += fmt.Sprintf("; %d answered a disjunct from the composite index on %s, in one lookup", ex.CompositeSegments, ex.CompositeIndex)
+	}
 	return true
+}
+
+// compositeLabel renders a composite's tuple identity as its attribute names
+// ("ClusterId+ProcId"). The identity travels as ids, which is all a sealed sidecar stores;
+// the live spec is what knows the names.
+func (c *Collection) compositeLabel(key string) string {
+	if spec := c.spec.Load(); spec != nil {
+		if cs, ok := spec.compositeFor(key); ok {
+			return cs.label()
+		}
+	}
+	return "a composite index"
 }
 
 // explainIndexSegmentsGroups is explainIndexSegments for a disjunctive plan: each segment's verdict
@@ -869,10 +894,22 @@ func (c *Collection) explainIndexSegmentsGroups(q *vm.Query, plan []vm.ProbeGrou
 			default:
 				ex.IndexSegments++
 				var sum float64
+				used := false
 				for _, g := range groups {
-					least := math.Inf(1)
-					for _, up := range g {
-						least = math.Min(least, si.estCandidates(up))
+					least, tuple, composite := si.compositeCandidates(g)
+					if composite {
+						if !used {
+							ex.CompositeSegments++
+							used = true
+						}
+						if ex.CompositeIndex == "" {
+							ex.CompositeIndex = c.compositeLabel(tuple)
+						}
+					} else {
+						least = math.Inf(1)
+						for _, up := range g {
+							least = math.Min(least, si.estCandidates(up))
+						}
 					}
 					sum += least
 				}
@@ -929,9 +966,20 @@ func (c *Collection) explainIndexSegments(q *vm.Query, usable []usableProbe, ex 
 				ex.IndexSkippedSegments++
 			default:
 				ex.IndexSegments++
-				least := math.Inf(1)
-				for _, up := range usable {
-					least = math.Min(least, si.estCandidates(up))
+				// A composite over the tuple this conjunction pins knows the JOINT count
+				// exactly, where the per-attribute minimum below is the best of several
+				// independent estimates of correlated columns.
+				least, tuple, composite := si.compositeCandidates(usable)
+				if composite {
+					ex.CompositeSegments++
+					if ex.CompositeIndex == "" {
+						ex.CompositeIndex = c.compositeLabel(tuple)
+					}
+				} else {
+					least = math.Inf(1)
+					for _, up := range usable {
+						least = math.Min(least, si.estCandidates(up))
+					}
 				}
 				cand += least * live[i]
 			}
@@ -1377,6 +1425,17 @@ func (si *segIndex) bloomAbsent(up usableProbe) bool {
 		}
 	}
 	return true
+}
+
+// compositeMatch finds the composite index covering a conjunction's equality probes among
+// those this segment holds (see composite.go).
+func (si *segIndex) compositeMatch(usable []usableProbe) (compositeMatch, bool) {
+	return compositeMatchIn(si.comp, usable)
+}
+
+// compositeCandidates reports the exact candidates a composite would hand the scan here.
+func (si *segIndex) compositeCandidates(usable []usableProbe) (float64, string, bool) {
+	return indexCompositeCandidates(si, usable)
 }
 
 // estCandidates estimates how many records in the indexed prefix this probe would

@@ -107,6 +107,9 @@ type ArchiveOptions struct {
 	// CategoricalAttrs / ValueAttrs configure the per-segment indexes (see Collection).
 	CategoricalAttrs []string
 	ValueAttrs       []string
+	// CompositeAttrs configures composite (multi-column) indexes over attribute tuples
+	// (see Collection). Each tuple's attributes must also be in CategoricalAttrs/ValueAttrs.
+	CompositeAttrs [][]string
 	// ZoneAttrs names numeric attributes to keep per-segment min/max on, so a query with
 	// a range/equality constraint on one can skip whole segments. ValueAttrs are
 	// automatically included.
@@ -192,6 +195,7 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		HotAttrs:            opts.HotAttrs,
 		CategoricalAttrs:    opts.CategoricalAttrs,
 		ValueAttrs:          opts.ValueAttrs, // numeric ValueAttrs are auto-added to the zone maps
+		CompositeAttrs:      opts.CompositeAttrs,
 		ZoneAttrs:           opts.ZoneAttrs,
 		Retention:           opts.Retention,
 		InternAtSeal:        opts.InternAtSeal, // intern each segment eagerly at seal
