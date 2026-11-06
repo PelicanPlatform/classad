@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"unsafe"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/parser"
@@ -34,21 +35,105 @@ const (
 // Value represents the result of evaluating a ClassAd expression.
 //
 // A Value is copied by value constantly -- on every bytecode stack push/pop and
-// every operator call -- so it is kept small: the list payload (which is four
-// words and only used by list values) lives out-of-line behind the list pointer,
-// leaving a Value that is a scalar/string/classad in one compact struct.
+// every operator call -- so it is kept small: the list payload (which is nine
+// words and only used by list values) lives out-of-line behind the payload
+// pointer, leaving a Value that is a scalar/string/classad in one compact struct.
+//
+// The struct is four words laid out as a tagged union. Every payload a Value can
+// carry is squeezed into two slots, and the slots are shared only ever
+// pointer-with-pointer or scalar-with-scalar, never across the two:
+//
+//   - intVal is the non-pointer slot, shared by every scalar payload.
+//   - strVal's DATA POINTER is the pointer slot, shared by the string's bytes,
+//     the *ClassAd of a ClassAdValue and the *listData of a ListValue.
+//
+// Never crossing is not stylistic: Go's garbage collector decides which words of
+// a value to scan from the STATIC type of the field, so a word that is sometimes
+// a pointer and sometimes an integer is unrepresentable -- scanned, an integer is
+// followed as a pointer; unscanned, a live object is freed. No amount of unsafe
+// changes this, because the pointer map is baked into the type descriptor at
+// compile time. strVal's data word is a pointer word in every layout it takes
+// here, so the collector's view of a Value is correct whatever the tag says.
+//
+// Four words is the floor for a Value that keeps strVal a real Go string, which
+// is what preserves the property a core value type should not give up: two
+// separately built "alice" values still compare equal, and a Value still works as
+// a map key. The alternative -- splitting the string into a raw {data pointer,
+// length} pair across the two slots -- reaches three words and is equally
+// GC-legal, but it makes string values compare by ADDRESS instead of by
+// characters, a silent change that the whole test suite passes straight through.
+// Eight more bytes are not worth that. See payload for how the aliasing keeps
+// ad and list equality working anyway.
 type Value struct {
 	valueType ValueType
 	// intVal holds an integer value, a boolean (0 or 1), and -- for a RealValue --
 	// the IEEE-754 bits of the float64 (see real()/NewRealValue). Folding all three
 	// scalar payloads here keeps Value one word smaller than a separate bool/real
 	// field would, and the bits round-trip exactly (NaN/Inf/-0 included).
-	intVal     int64
-	strVal     string
-	classAdVal *ClassAd
-	// list holds a list value's payload out-of-line; it is non-nil exactly when
-	// valueType == ListValue. See listData.
-	list *listData
+	//
+	// For a ClassAdValue or a ListValue it holds the payload's ADDRESS as a plain
+	// integer, which is what keeps those two comparing by pointer identity; see
+	// payload. It is zero for every other type. A string value leaves it zero too;
+	// see the prefix discussion on NewStringValue for what was measured for that
+	// slot.
+	intVal int64
+	// strVal is a string value's characters, and for a ClassAdValue or a ListValue
+	// it is a ZERO-LENGTH string whose data pointer is the *ClassAd or *listData
+	// (see payload, classAd() and list()). Those three are mutually exclusive
+	// -- a Value is one type, and valueType says which -- so a separate payload
+	// pointer field was a word that every Value paid for and no Value used twice,
+	// plus a third pointer word for the GC to scan on every Value it walked.
+	strVal string
+}
+
+// payload packs an out-of-line payload pointer into the two fields a ClassAdValue
+// or a ListValue carries it in, so that neither needs a field of its own. It is
+// the only place that builds one, and both halves are required.
+//
+// strVal IS THE POINTER. It is the reference the garbage collector traces and the
+// one classAd() and list() read back, and its length MUST be zero. That is not a
+// free choice: any nonzero length makes Go's string equality run memequal over the
+// pointed-at object's raw memory, so two unrelated ads would compare by their
+// bytes, and a length exceeding the object reads out of bounds outright.
+//
+// INTVAL IS THE SAME ADDRESS AGAIN, as an integer, and it is there for `==`. A
+// zero-length string compares equal to every other zero-length string on the
+// length alone, Go never looking at the data pointers, so strVal on its own would
+// make ALL ad values equal to each other and all list values equal to each other.
+// Comparing the integer copy instead is what restores the pointer identity the
+// pre-shrink layout had, where the payload was a *ClassAd field compared
+// bitwise: two Values hold one ad exactly when they were built from one pointer.
+//
+// Holding an address as an integer is safe HERE because of two things, and only
+// because of both. It is never converted back to a pointer or dereferenced --
+// classAd() and list() read strVal, never this -- so it is not a pointer by any
+// definition the runtime enforces, and it keeps nothing alive that strVal does
+// not already keep alive. And it cannot go stale, because the only Go object that
+// ever moves is one on a stack, and neither payload is ever on a stack: a
+// &listData literal escapes outright, and a ClassAd whose address reaches
+// NewClassAdValue is moved to the heap by the same analysis, which
+// TestPayloadEscapesToTheHeap holds to. A heap object's address is fixed for its
+// lifetime, so the integer and the pointer can never disagree.
+//
+// unsafe.String with a zero length keeps the pointer rather than canonicalizing
+// to "" -- the standard library documents the data pointer of an empty string as
+// unspecified, so TestZeroLengthAliasRoundTrip asserts the round trip and will
+// fail loudly on a Go release that changes it, rather than silently handing back
+// a nil ad.
+func payload(p unsafe.Pointer) (int64, string) {
+	return int64(uintptr(p)), unsafe.String((*byte)(p), 0)
+}
+
+// classAd reinterprets strVal's data pointer as the *ClassAd it holds. Valid only
+// when valueType == ClassAdValue.
+func (v Value) classAd() *ClassAd {
+	return (*ClassAd)(unsafe.Pointer(unsafe.StringData(v.strVal)))
+}
+
+// list reinterprets strVal's data pointer as the *listData it holds. Valid only
+// when valueType == ListValue, where it is always non-nil.
+func (v Value) list() *listData {
+	return (*listData)(unsafe.Pointer(unsafe.StringData(v.strVal)))
 }
 
 // listData is a list value's payload, stored out-of-line to keep Value small. It
@@ -132,13 +217,15 @@ func NewStringValue(s string) Value {
 // NewListValue creates a list value.
 func NewListValue(list []Value) Value {
 	countValue()
-	return Value{valueType: ListValue, list: &listData{vals: list}}
+	n, sp := payload(unsafe.Pointer(&listData{vals: list}))
+	return Value{valueType: ListValue, intVal: n, strVal: sp}
 }
 
 // NewClassAdValue creates a ClassAd value.
 func NewClassAdValue(ad *ClassAd) Value {
 	countValue()
-	return Value{valueType: ClassAdValue, classAdVal: ad}
+	n, sp := payload(unsafe.Pointer(ad))
+	return Value{valueType: ClassAdValue, intVal: n, strVal: sp}
 }
 
 // Type returns the type of the value.
@@ -247,16 +334,17 @@ func (v Value) listValueIn(parent *Evaluator) ([]Value, error) {
 	if v.valueType != ListValue {
 		return nil, fmt.Errorf("value is not a list")
 	}
-	if v.list.exprs != nil {
+	ld := v.list()
+	if ld.exprs != nil {
 		// Lazy list: evaluate each element expression in its stored scope now.
-		vals := make([]Value, len(v.list.exprs))
+		vals := make([]Value, len(ld.exprs))
 		ev := v.lazyEvaluator(parent)
-		for i, e := range v.list.exprs {
+		for i, e := range ld.exprs {
 			vals[i] = evalRecoveringCyclic(ev, e)
 		}
 		return vals, nil
 	}
-	return v.list.vals, nil
+	return ld.vals, nil
 }
 
 // evalRecoveringCyclic evaluates a lazy list element, turning a cyclic-reference
@@ -283,10 +371,11 @@ func evalRecoveringCyclic(ev *Evaluator, e ast.Expr) (result Value) {
 // listLen returns the number of elements in a list value without evaluating
 // them (for a lazy list). The caller must ensure v is a list.
 func (v Value) listLen() int {
-	if v.list.exprs != nil {
-		return len(v.list.exprs)
+	ld := v.list()
+	if ld.exprs != nil {
+		return len(ld.exprs)
 	}
-	return len(v.list.vals)
+	return len(ld.vals)
 }
 
 // listElementAt evaluates and returns the i-th element of a list value,
@@ -294,10 +383,11 @@ func (v Value) listLen() int {
 // evaluates x without touching the self-referential element 0). The caller must
 // ensure v is a list and 0 <= i < listLen().
 func (v Value) listElementAt(i int, parent *Evaluator) Value {
-	if v.list.exprs != nil {
-		return evalRecoveringCyclic(v.lazyEvaluator(parent), v.list.exprs[i])
+	ld := v.list()
+	if ld.exprs != nil {
+		return evalRecoveringCyclic(v.lazyEvaluator(parent), ld.exprs[i])
 	}
-	return v.list.vals[i]
+	return ld.vals[i]
 }
 
 // lazyEvaluator builds the evaluator for materializing a lazy list's elements in
@@ -311,15 +401,16 @@ func (v Value) listElementAt(i int, parent *Evaluator) Value {
 // element that refers back to an attribute being evaluated is a cycle. Without one
 // (materialization after the evaluation returned) they start afresh.
 func (v Value) lazyEvaluator(parent *Evaluator) *Evaluator {
+	ld := v.list()
 	if parent == nil {
-		return &Evaluator{classad: v.list.scope, depth: v.list.depth, bind: v.list.bind}
+		return &Evaluator{classad: ld.scope, depth: ld.depth, bind: ld.bind}
 	}
-	ev := parent.child(v.list.scope)
-	if v.list.depth > ev.depth {
-		ev.depth = v.list.depth
+	ev := parent.child(ld.scope)
+	if ld.depth > ev.depth {
+		ev.depth = ld.depth
 	}
 	if ev.bind == nil {
-		ev.bind = v.list.bind
+		ev.bind = ld.bind
 	}
 	return ev
 }
@@ -329,7 +420,7 @@ func (v Value) ClassAdValue() (*ClassAd, error) {
 	if v.valueType != ClassAdValue {
 		return nil, fmt.Errorf("value is not a ClassAd")
 	}
-	return v.classAdVal, nil
+	return v.classAd(), nil
 }
 
 // String returns a string representation of the value.
@@ -354,8 +445,8 @@ func (v Value) String() string {
 		elems, _ := v.ListValue()
 		return fmt.Sprintf("%v", elems)
 	case ClassAdValue:
-		if v.classAdVal != nil {
-			return v.classAdVal.String()
+		if ad := v.classAd(); ad != nil {
+			return ad.String()
 		}
 		return "[]"
 	default:
@@ -1020,7 +1111,8 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 		exprs = []ast.Expr{}
 	}
 	countValue()
-	return Value{valueType: ListValue, list: &listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind}}
+	n, sp := payload(unsafe.Pointer(&listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind}))
+	return Value{valueType: ListValue, intVal: n, strVal: sp}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
@@ -1060,15 +1152,16 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 // the nearest recover (the enclosing attribute evaluation, or the outermost
 // ListValue if projection happens during a later materialization).
 func (v Value) listElementsPropagating(parent *Evaluator) []Value {
-	if v.list.exprs != nil {
-		vals := make([]Value, len(v.list.exprs))
+	ld := v.list()
+	if ld.exprs != nil {
+		vals := make([]Value, len(ld.exprs))
 		ev := v.lazyEvaluator(parent)
-		for i, e := range v.list.exprs {
+		for i, e := range ld.exprs {
 			vals[i] = ev.Evaluate(e)
 		}
 		return vals
 	}
-	return v.list.vals
+	return ld.vals
 }
 
 // selectAttr resolves record.attr for an already-evaluated record value (a
