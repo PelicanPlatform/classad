@@ -521,11 +521,11 @@ func (sp *ScriptProgram) RunWithFault(scope *classad.ClassAd) (result classad.Va
 
 // VecEval runs the script over a batch of n records, returning one result element per record.
 //
-// ok=false when the script uses something the vector executor does not implement, which today means
-// anything with control flow: a branch picks per record, and until the masked store is built the
-// executor has no way to run a statement for some records and not others. A script of bindings and a
-// result expression is exactly the part that needs none of that, and it is the part a constraint is
-// made of.
+// ok=false when the script uses something the vector executor does not implement. Control flow is
+// not in that set: an If runs both arms under a live mask and a While runs its iterations in
+// lockstep, letting the live set shrink as records finish. What declines is a delegated subtree,
+// which needs a real per-record scope, and a `break` or `continue`, which leaves a loop from a point
+// the lockstep walk has no region for.
 //
 // A DECLINE IS NOT A WRONG ANSWER. The caller falls back to running the script per record, which is
 // the same arrangement the expression executor has had since it was written.
