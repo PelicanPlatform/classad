@@ -163,6 +163,19 @@ func KnownFunctionName(name string) bool {
 	return isUDF
 }
 
+// BuiltinFunctionName reports whether name is one of this language's built-in functions. The
+// comparison is case-insensitive, as a call is.
+//
+// It answers the half of KnownFunctionName that CANNOT CHANGE while the process runs. The registry
+// is append-only and filled at start-up, so "is this name taken" has a different answer before and
+// after a loader runs, while "is this name a built-in" has one answer for the life of the binary. A
+// caller deciding something it must not revisit later -- whether a name may be defined at all, as
+// opposed to whether it may be registered right now -- wants this one.
+func BuiltinFunctionName(name string) bool {
+	_, isBuiltin := functionArity[strings.ToLower(name)]
+	return isBuiltin
+}
+
 // RegisteredFunctions returns the registered names, as registered, for diagnostics. The order is
 // unspecified.
 func RegisteredFunctions() []string {

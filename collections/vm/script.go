@@ -331,6 +331,18 @@ type ScriptProgram struct {
 
 // Compile lowers the script to a single register program.
 func (s *Script) Compile() (*ScriptProgram, error) {
+	return s.compile(nil)
+}
+
+// compile is Compile, with the locals whose registers must be left alone named by the caller.
+//
+// preset names locals that are filled from OUTSIDE the program, before it runs: the parameters of a
+// function compiled on its own (see scriptmodule.go). Nothing in the program stores to one, so the
+// dominance analysis would correctly conclude that its reads are not dominated by a store and emit
+// an UNDEFINED initializer -- which would overwrite the value the caller just put there. Suppressing
+// the initializer for exactly those locals is what makes the register a parameter rather than a
+// local that happens never to be bound.
+func (s *Script) compile(preset []int32) (*ScriptProgram, error) {
 	s.flush()
 	if s.err != nil {
 		return nil, s.err
@@ -344,7 +356,11 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 	s.c.p.readAttrs = s.scriptReads()
 	s.c.p.vops = vopPrefix(s.c.p.code)
 	s.c.p.refSlots, s.c.p.nColSlots = colSlots(s.c.p.refs)
-	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
+	needInit := localsNeedingInit(s.c.p)
+	for _, l := range preset {
+		needInit[l] = false
+	}
+	return &ScriptProgram{rp: lowerWithInit(s.c.p, needInit), p: s.c.p}, nil
 }
 
 // scriptReads is the set of attribute names the compiled script may read, in first-seen order.

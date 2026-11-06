@@ -15,25 +15,27 @@ Every sample is an excerpt from a file `go test` runs; section 9 lists them.
 |---|---|---|
 | **Go** | `classad.RegisterFunction` | `db.RegisterAggregate` |
 | **WebAssembly** | `wasmudf.Register` | `wasmudf.RegisterAggregate` |
+| **ClassAd Script** | `scriptudf.Register` | — |
 
 A **scalar function** is called once per value, anywhere a built-in like `pow()`
 can appear. An **aggregate** reduces a group of rows to one answer, named in an
 `AggSpec` as `AggUser`, and reduced by the same `GROUP BY` core as `SUM`.
 
-The WebAssembly rows are not a separate mechanism. `wasmudf` loads a guest
-module, wraps it in the Go signature the registry above it takes, and registers
-it there. Sections 2 and 3 apply to a wasm extension too.
+The second and third rows are not separate mechanisms. `wasmudf` loads a guest
+module; `scriptudf` compiles a module written in **ClassAd Script**, the statement
+language of section 7. Each picks one of the module's exports by name, wraps it in
+the Go signature the registry above it takes, and registers it there. Sections 2
+and 3 apply to all three.
 
-(There is also **ClassAd Script**, a statement language — locals, `if`, `while` —
-over the same engine. It is partly built and cannot yet be used from a query. See
-section 7.)
-
-## 2. Go or WebAssembly
+## 2. Go, WebAssembly or ClassAd Script
 
 Pick by **whose code it is**. Write it in Go when it is part of the system you
 are building. Use WebAssembly when the function comes from outside your trust
 boundary — a site admin, a user — because then the isolation is the reason you
-are here.
+are here. Use ClassAd Script when the rule is policy someone writes and reads
+rather than code someone builds: it needs no toolchain, it is the language your
+policy expressions are already written in, and a function that would reach beyond
+its arguments is refused at registration rather than trusted.
 
 A wasm guest can reach nothing: no I/O, no clock, no randomness, no WASI. That is
 not a policy, it is the absence of anything to call. The host offers exactly one
@@ -464,15 +466,64 @@ Three things a script function will not do:
   cannot be written out. The error names the cycle.
 - **Shadowing.** A `def` may not take the name of a built-in or of a registered
   function, for the same reason a registration may not: `strcat` has to mean the
-  same thing inside the script as outside it.
+  same thing inside the script as outside it. In a *module* only the built-in
+  half of that applies, because a module's own functions are the ones being
+  registered; whether the name is free is answered by the registry, as
+  `ErrFunctionExists`.
 - **Being called from a ternary, a list or ad literal, a subscript or a
   selection.** Those are the same constructs that cannot see a local, for the
   same reason, and the refusal carries a line and column. Call the function from
   a statement and use the local.
 
-So a script function is not a fifth way to write a UDF: it belongs to the script
-that defines it and nothing outside can call it. A script can also *call* a UDF,
-which is how one rule gets shared between scripts.
+A function defined inside a script belongs to that script, and nothing outside it
+can call one. A script can also *call* a UDF, which is how one rule is shared
+between scripts.
+
+### Registering a script function
+
+A **script module** is source that defines functions and produces no value —
+`def` at the left margin and nothing else, no `result`. Register one of its
+functions and every expression in the process can call it, exactly as it calls a
+built-in:
+
+```go
+mod, err := vm.ParseScriptModule(`
+def examplePct(used, total):
+    if used is undefined:
+        return undefined
+    if total is undefined:
+        return undefined
+    if total <= 0:
+        return error
+    return used * 100.0 / total
+`)
+
+f, err := scriptudf.Register(mod, scriptudf.ClassAdRegistry(), "examplePct")
+```
+
+```
+examplePct(Used, Total)     37.5
+EXAMPLEPCT(Used, Total)     37.5
+examplePct(Used, Absent)    undefined
+examplePct(Used, Label)     error
+```
+
+`mod.Functions()` lists what a module exports. There is no arity to supply: the
+`def` states how many arguments it takes, and that is the minimum and the maximum.
+
+**A registered script function cannot read the ad.** Inside a script, a bare name
+the body does not bind is an attribute of the subject ad, and that is most of what
+makes a script function useful there. A registration has no subject ad, so
+`def fits(requested, cap): return Optimistic` is refused rather than registered —
+along with `MY.RequestMemory`, a call to `random()`, a ternary and a subscript.
+Pass what the function needs as a parameter. The error says which rule refused it
+and what to write instead, and `errors.Is(err, vm.ErrReadsAd)` tells that refusal
+apart from a function that simply does not compile.
+
+Everything else in section 3 holds. Compilation happens before registration, so a
+name is only ever registered against a function that compiled; registration is
+append-only; names fold case; and a call that runs too long gives ERROR rather
+than hanging the scan, because a script may loop.
 
 The language's design, and what remains to build, are in
 [docs/SCRIPTING_LANGUAGE_DESIGN.md](SCRIPTING_LANGUAGE_DESIGN.md).
@@ -494,6 +545,7 @@ The samples above, all run by `go test`:
 | `collections/vm/example_scriptparse_test.go` | the ClassAd Script above |
 | `collections/vm/example_script_test.go` | the same script through the builder API |
 | `collections/vm/example_scriptfunc_test.go` | the script function above |
+| `collections/scriptudf/example_test.go` | registering a script module's function |
 | `db/example_udaf_test.go` | the Go aggregate and `CheckAggregateEqual` |
 | `wasmudf/example_test.go` | loading and registering both kinds of wasm module |
 | `wasmudf/testdata/examplepct.wat` | the wasm function |

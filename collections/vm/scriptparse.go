@@ -227,6 +227,50 @@ func (p *scriptParser) parseTop() ([]stmt, error) {
 	return stmts, p.checkResult(stmts)
 }
 
+// parseModuleTop parses a MODULE: top-level `def` statements and nothing else.
+//
+// It is parseTop's sibling rather than a mode of it, because the two differ in exactly one place --
+// what a top-level statement may be -- and a flag threaded through parseTop would put that question
+// somewhere a reader of either language has to answer it.
+//
+// Everything below the top level is identical: a `def` body is parsed by the same code whichever
+// entry point reached it, so there is no possibility of a statement meaning one thing in a script
+// and another in a module.
+func (p *scriptParser) parseModuleTop() ([]stmt, error) {
+	if len(p.lines) == 0 {
+		return nil, fmt.Errorf("%w: the source is empty", ErrNoFunctions)
+	}
+	if p.lines[0].indent != 0 {
+		return nil, p.at(p.lines[0], "unexpected indent: the first statement must start at column 1")
+	}
+	p.levels = []int{0}
+	stmts, err := p.statements(0)
+	if err != nil {
+		return nil, err
+	}
+	for _, st := range stmts {
+		if _, isDef := st.(*defStmt); isDef {
+			continue
+		}
+		// A `result` gets its own message because it is the mistake an author of scripts makes
+		// first, and because "this is not a def" does not say what to do about it.
+		if _, isResult := st.(*resultStmt); isResult {
+			return nil, p.pos.errorAt(st.at(), "a module has no 'result': it defines functions "+
+				"rather than computing a value, and each function's value is its 'return'")
+		}
+		// Everything else, a binding included. A top-level binding has no moment at which it would
+		// be computed: a module is never run, only the functions it exports are, each with its own
+		// registers. Bind inside the function that needs the value.
+		return nil, p.pos.errorAt(st.at(), "a module holds only 'def' statements at the top level: "+
+			"a module is not run, so there is no point at which a statement outside a function "+
+			"would execute")
+	}
+	if len(stmts) == 0 {
+		return nil, fmt.Errorf("%w: the source holds no statements", ErrNoFunctions)
+	}
+	return stmts, nil
+}
+
 // checkResult enforces that `result` is present, top level, and last.
 //
 // Compile would reject a missing result on its own, but with no position and no hint. The ordering
