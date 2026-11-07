@@ -380,8 +380,9 @@ func TestParseScriptErrors(t *testing.T) {
 		{"block comment spans lines", "x = 1 /* two\nlines */ + 1\nresult = x\n", 1, 7, "may not span a line break"},
 		{"expression error carries the script position", "x = 1\ny = 2\nresult = y +\n", 3, 12, "syntax error"},
 		{"quoted name hint", "x = 'alice' +\nresult = x\n", 1, 13, "quoted attribute name"},
-		{"local in a conditional", "x = MY.Cpus\nresult = x ? 1 : 2\n", 2, 1, `reads the local "x"`},
 		{"local in a list literal", "x = MY.Cpus\nresult = {x, 1}\n", 2, 1, `reads the local "x"`},
+		{"local in an ad literal", "x = MY.Cpus\nresult = [a = x].a\n", 2, 1, `reads the local "x"`},
+		{"local in a per-ad context", "x = MY.Cpus\nresult = countMatches(x, MY.GPUs)\n", 2, 1, `reads the local "x"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -484,14 +485,14 @@ func TestParseScriptAssignmentTargets(t *testing.T) {
 }
 
 // TestScriptLocalCaptureIsTyped checks the refusal a caller might want to recognize rather than
-// print: a local read from inside a construct that is evaluated against the ad.
+// print: a local read from a position no overlay can reach.
 func TestScriptLocalCaptureIsTyped(t *testing.T) {
 	// Through the builder, where there is no position to attach and the error arrives bare.
 	x, err := parser.ParseExpr("MY.Cpus")
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := parser.ParseExpr("x ? 1 : 2")
+	res, err := parser.ParseExpr("{x, 1}")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,8 +506,18 @@ func TestScriptLocalCaptureIsTyped(t *testing.T) {
 	}
 	// Printed bare it names the package, the local and the subtree, because a builder caller has no
 	// line to be told about and the subtree is the only handle they have on it.
-	if msg := lc.Error(); !strings.HasPrefix(msg, "vm: script: ") || !strings.Contains(msg, "x ? 1 : 2") {
+	if msg := lc.Error(); !strings.HasPrefix(msg, "vm: script: ") || !strings.Contains(msg, "{x, 1}") {
 		t.Errorf("Error() = %q", msg)
+	}
+
+	// A conditional over the same local compiles: a ternary is evaluated by the tree-walker in the
+	// evaluator the overlay is installed on, so the local is readable there.
+	resT, err := parser.ParseExpr("x ? 1 : 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, cerr := NewScript().Let("x", x).Result(resT).Compile(); cerr != nil {
+		t.Errorf("a conditional over a local should compile: %v", cerr)
 	}
 
 	// The same expression with no local in it compiles, because nothing is captured: the delegated

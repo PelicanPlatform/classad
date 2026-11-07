@@ -40,6 +40,7 @@ func (c *Collection) Truncate() {
 		sh.dirtySup = nil
 		sh.dropDeferredLocked()
 		sh.count = 0
+		sh.sysCount = 0
 		// Bump the commit sequence and floor so an older transaction snapshot cannot be
 		// applied over the truncated state (it conflicts), and new scans see the reset.
 		sh.commitSeq++

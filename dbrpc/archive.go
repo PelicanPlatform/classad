@@ -68,20 +68,20 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 // engine so the result is identical to the same aggregate over a mutable table. Private
 // attributes are refused for an unprivileged reader, as with the mutable aggregate.
 func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, aggSpecBase, false)
+	sc.archiveAggregate(reqID, r, aggSpecBase, false, false)
 }
 
 // streamArchiveAggregateFiltered is streamArchiveAggregate's extended form: each group
 // column carries a bucket width and each spec a filter (opArchiveAggregateFiltered).
 func (sc *serverConn) streamArchiveAggregateFiltered(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, aggSpecFiltered, false)
+	sc.archiveAggregate(reqID, r, aggSpecFiltered, false, false)
 }
 
 // streamArchiveAggregateStats is streamArchiveAggregate that also streams the scan's ScanStats
 // trailer for EXPLAIN ANALYZE. It carries the extended frame (a superset), so it serves any
 // aggregate shape.
 func (sc *serverConn) streamArchiveAggregateStats(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, aggSpecFiltered, true)
+	sc.archiveAggregate(reqID, r, aggSpecFiltered, true, false)
 }
 
 // streamArchiveAggregateNamed is streamArchiveAggregateFiltered whose specs also carry the
@@ -89,7 +89,13 @@ func (sc *serverConn) streamArchiveAggregateStats(reqID uint64, r *reader) {
 // the client wants the ScanStats trailer, so one opcode serves the EXPLAIN ANALYZE variant too
 // rather than spending a second on the same frame.
 func (sc *serverConn) streamArchiveAggregateNamed(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, aggSpecNamed, false)
+	sc.archiveAggregate(reqID, r, aggSpecNamed, false, false)
+}
+
+// streamArchiveAggregateTyped is streamArchiveAggregateNamed whose reply carries the group
+// cells as values (opArchiveAggregateTyped). The request frame is the Named one.
+func (sc *serverConn) streamArchiveAggregateTyped(reqID uint64, r *reader) {
+	sc.archiveAggregate(reqID, r, aggSpecNamed, false, true)
 }
 
 // archiveAggregate is the body shared by the archive aggregate opcodes. form says how wide the
@@ -97,7 +103,7 @@ func (sc *serverConn) streamArchiveAggregateNamed(reqID uint64, r *reader) {
 // by a filter expression and an aggregate name -- rather than the base opcode's narrow one.
 // wantStats asks for the ScanStats trailer; the named frame carries that request itself, in a
 // trailing byte read below.
-func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, form aggSpecForm, wantStats bool) {
+func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, form aggSpecForm, wantStats, typed bool) {
 	start := time.Now()
 	name := r.str()
 	constraint := r.str()
@@ -191,17 +197,14 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, form aggSpecForm
 		return
 	}
 	obs.Rows = len(rows)
+	// One buffer across rows; see writeAggRows for why that is safe here.
+	frame := respHead(reqID, stStream)
+	head := len(frame)
 	for _, row := range rows {
 		if cancelled(sc.ctx) {
 			return // client gone
 		}
-		frame := respHead(reqID, stStream)
-		for _, gv := range row.Group {
-			frame = putStr(frame, gv)
-		}
-		for _, v := range row.Values {
-			frame = putStr(frame, v)
-		}
+		frame = appendAggRow(frame[:head], row, typed)
 		sc.write(frame)
 	}
 	if wantStats {
@@ -313,9 +316,18 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 	if extended && wire < aggSpecFiltered {
 		wire = aggSpecFiltered
 	}
+	// A server that can type the group cells is asked to. The typed opcode carries the named
+	// frame, so the request widens to it: widths on every group column and the trailing stats
+	// byte below.
+	typed := c.SupportsNewer(FeatTypedGroups)
+	if typed {
+		wire, extended = aggSpecNamed, true
+	}
 	build := func(id uint64) []byte {
 		o := opArchiveAggregate
 		switch {
+		case typed:
+			o = opArchiveAggregateTyped
 		case wire >= aggSpecNamed:
 			o = opArchiveAggregateNamed
 		case extended:
@@ -335,7 +347,7 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 		}
 		return b
 	}
-	return c.archiveAggregate(ctx, build, len(groups), len(aggs), form, nil)
+	return c.archiveAggregate(ctx, build, len(groups), len(aggs), form, typed, nil)
 }
 
 // ArchiveAggregateStats is ArchiveAggregateBucketed that also fills stats (may be nil) with the
@@ -358,6 +370,12 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 	if wire < aggSpecFiltered {
 		wire = aggSpecFiltered
 	}
+	// As in ArchiveAggregateBucketed. This path already sends the extended frame, so asking
+	// for typed cells only widens it to the named one.
+	typed := c.SupportsNewer(FeatTypedGroups)
+	if typed {
+		wire = aggSpecNamed
+	}
 	build := func(id uint64) []byte {
 		// A named aggregate asks for the trailer on the named opcode's own byte, because
 		// opArchiveAggregateStats has nowhere to put the name. The two answer the same way,
@@ -365,6 +383,9 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 		o := opArchiveAggregateStats
 		if wire >= aggSpecNamed {
 			o = opArchiveAggregateNamed
+		}
+		if typed {
+			o = opArchiveAggregateTyped
 		}
 		b := putStr(putStr(req(id, o), name), constraint)
 		b = putI32(b, int32(len(groups)))
@@ -378,14 +399,14 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 		}
 		return b
 	}
-	return c.archiveAggregate(ctx, build, len(groups), len(aggs), form, stats)
+	return c.archiveAggregate(ctx, build, len(groups), len(aggs), form, typed, stats)
 }
 
 // archiveAggregate runs a built archive-aggregate request and collects its streamed rows. form
 // selects which "unsupported" error an old server's refusal maps to; stats (may be nil) receives a
 // ScanStats trailer if the server sends one (opArchiveAggregateStats, or opArchiveAggregateNamed
 // asked for one).
-func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, form aggSpecForm, stats *collections.ScanStats) ([]AggRow, error) {
+func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, form aggSpecForm, typed bool, stats *collections.ScanStats) ([]AggRow, error) {
 	_, frames, strm, err := c.callStream(build)
 	if err != nil {
 		return nil, err
@@ -406,14 +427,7 @@ func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte
 			}
 			switch status {
 			case stStream:
-				row := AggRow{Group: make([]string, nGroup), Values: make([]string, nAgg)}
-				for i := range row.Group {
-					row.Group[i] = body.str()
-				}
-				for i := range row.Values {
-					row.Values[i] = body.str()
-				}
-				out = append(out, row)
+				out = append(out, readAggRow(body, nGroup, nAgg, typed))
 			case stStreamStats:
 				if stats != nil {
 					*stats = readScanStats(body)

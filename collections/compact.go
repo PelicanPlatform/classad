@@ -1179,7 +1179,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// Rebuild the directory from every current record: destination live copies still
 	// current, plus current records in post-barrier segments (written during the copy).
 	newDir := make(map[uint64]loc, sh.count)
-	count := 0
+	count, sysCount := 0, 0
 	for i := range moved {
 		m := &moved[i]
 		if recSuperseded(m.dstSeg.data, m.dstOff) != seqMax {
@@ -1188,6 +1188,9 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		setRecNext(m.dstSeg.data, m.dstOff, dirGetOr(newDir, m.hash))
 		newDir[m.hash] = loc{seg: m.dstSeg.id, off: m.dstOff}
 		count++
+		if isSystemKeyBytes(recKey(m.dstSeg.data, m.dstOff)) {
+			sysCount++
+		}
 	}
 	for id := origLen; id < int(baseID); id++ { // post-barrier segments
 		seg := sh.segs[id]
@@ -1205,10 +1208,14 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 				break
 			}
 			if !recIsMarker(seg.data, o) && recSuperseded(seg.data, o) == seqMax {
-				h := c.h.Hash(recKey(seg.data, o))
+				key := recKey(seg.data, o)
+				h := c.h.Hash(key)
 				setRecNext(seg.data, o, dirGetOr(newDir, h))
 				newDir[h] = loc{seg: seg.id, off: o}
 				count++
+				if isSystemKeyBytes(key) {
+					sysCount++
+				}
 			}
 			off += int(total)
 		}
@@ -1258,6 +1265,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	}
 	sh.dir = newDir
 	sh.count = count
+	sh.sysCount = sysCount
 	// Reuse the last live destination as the new append target -- but NOT when interning: an
 	// interned destination is sealed with a dictionary and cannot take new inline writes.
 	// Leaving sh.act nil makes the next write allocate a fresh inline active segment.

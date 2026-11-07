@@ -27,6 +27,9 @@ func readDirSnapEntries(t *testing.T, path string) (entryStart int, body []byte,
 	version := r.u32()
 	r.u64() // commit sequence
 	r.u64() // live count
+	if version >= 3 {
+		r.u64() // system-keyed live count
+	}
 	nSegs := int(r.u32())
 	for j := 0; j < nSegs; j++ {
 		r.u64()   // durable length

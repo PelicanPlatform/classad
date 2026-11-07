@@ -15,8 +15,10 @@ import (
 // projection's reference closure recycles dst across nodes and passes.
 //
 // The collection is a superset: references inside nested record literals are
-// included even though record-member resolution could shadow them, and duplicate
-// ids are appended as-is (the caller's wanted-set absorbs both). An encrypted
+// included even though record-member resolution could shadow them, a `.`-path
+// select contributes its member name (which chains out to the enclosing ad when
+// the record does not define it), and duplicate ids are appended as-is (the
+// caller's wanted-set absorbs both). An encrypted
 // node is opaque and contributes nothing. Returns dst unchanged (beyond any
 // partial appends) with no error indication on a malformed node -- the caller's
 // subsequent render of the same bytes surfaces the corruption.
@@ -38,9 +40,9 @@ func AppendNodeRefIDs(node []byte, dst []uint32) []uint32 {
 // node, valid for as long as node is, and are NOT copied -- a caller that retains them
 // past the record's buffer must copy.
 //
-// Same superset semantics as AppendNodeRefIDs: nested record members are included even
-// though member resolution could shadow them, duplicates are appended as-is, and an
-// encrypted node contributes nothing.
+// Same superset semantics as AppendNodeRefIDs: nested record members and a select's
+// member name are included even though member resolution could shadow them, duplicates
+// are appended as-is, and an encrypted node contributes nothing.
 //
 // A nested record literal's members are keyed the way the enclosing ad's attributes are,
 // so they are inline names here. Walking them as ids misreads the first member's name as
@@ -122,10 +124,17 @@ func refNode(c *cursor, depth int, dst []uint32) []uint32 {
 		dst = refNode(c, depth+1, dst)
 	case nSelect:
 		dst = refNode(c, depth+1, dst)
-		c.uvarint() // selected member id: resolves inside the record, not the ad
+		// The selected member is a reference TO THE ENCLOSING AD as well. A member the
+		// record does not define chains out to the scope the select was written in, so
+		// `Res.Mem` reads this ad's Mem whenever Res has none -- and a closure that
+		// stopped at the record would ship Res without Mem and leave the expression
+		// undefined at the far end.
+		if id := c.id32(); c.ok {
+			dst = append(dst, id)
+		}
 	case nSelectStr:
 		dst = refNode(c, depth+1, dst)
-		c.skip(int(c.uvarint()))
+		c.skip(int(c.uvarint())) // an inline name is not an interned id (see nAttrRefStr)
 	case nParen:
 		dst = refNode(c, depth+1, dst)
 	case nEncrypted:
@@ -230,10 +239,17 @@ func refNodeNames(c *cursor, depth int, dst [][]byte) [][]byte {
 		dst = refNodeNames(c, depth+1, dst)
 	case nSelect:
 		dst = refNodeNames(c, depth+1, dst)
-		c.uvarint() // selected member id: resolves inside the record, not the ad
+		c.uvarint() // an interned id is not an inline name (see nAttrRef)
 	case nSelectStr:
 		dst = refNodeNames(c, depth+1, dst)
-		c.skip(int(c.uvarint()))
+		// The selected member chains to the enclosing ad when the record lacks it, so
+		// it is a reference to this ad. See refNode's nSelect.
+		n := int(c.uvarint())
+		start := c.pos
+		c.skip(n)
+		if c.ok {
+			dst = append(dst, c.b[start:start+n])
+		}
 	case nParen:
 		dst = refNodeNames(c, depth+1, dst)
 	case nEncrypted:
@@ -395,12 +411,21 @@ func refsExact(c *cursor, depth int, r *NodeRefs, isEval func(uint32) bool) bool
 		if !refsExact(c, depth+1, r, isEval) {
 			return false
 		}
-		c.uvarint()
+		// The selected member is part of the set: it chains to the enclosing ad when the
+		// record does not define it. See refNode's nSelect.
+		if id := c.id32(); c.ok {
+			r.IDs = append(r.IDs, id)
+		}
 	case nSelectStr:
 		if !refsExact(c, depth+1, r, isEval) {
 			return false
 		}
-		c.skip(int(c.uvarint()))
+		n := int(c.uvarint())
+		start := c.pos
+		c.skip(n)
+		if c.ok {
+			r.Names = append(r.Names, c.b[start:start+n])
+		}
 	case nParen:
 		return refsExact(c, depth+1, r, isEval)
 	case nEncrypted:
