@@ -175,13 +175,18 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 
 	for i := range steps {
 		sp := p.steps[i]
-		attrs, rows, _, why := cat.probeGateAll(sp, sides[sp.side])
+		attrs, all, rows, _, why := cat.probeGateAll(sp, sides[sp.side])
 		// Every attribute the probe would narrow on, not one: a composite key is narrowed
 		// on all of its equalities, and a report naming one of them would describe a
 		// narrower plan than the join runs.
-		names := make([]string, 0, len(attrs))
-		for _, pa := range attrs {
-			names = append(names, pa.attr)
+		//
+		// Resolved through the same tuple selection the planner uses, so that a step whose
+		// key a composite answers as a whole reports that whole key -- including any
+		// component-only attribute, which carries no index of its own and so is absent
+		// from the per-attribute candidates.
+		names := attrNames(attrs)
+		if set, ok := cat.tupleSetFor(sides[sp.side].Table, all, attrs); ok {
+			names = set.attrs
 		}
 		attr := strings.Join(names, ", ")
 		out.Steps = append(out.Steps, JoinStepExplain{

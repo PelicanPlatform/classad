@@ -158,42 +158,115 @@ func (tp *tupleProbe) constraint() (cons, why string) {
 // cover the tuple it must cover it EXACTLY, as a set -- a composite answers the full tuple
 // only, and one covering a strict subset would leave an in-chain the constraint cannot carry
 // alongside the spine.
-func (cat *Catalog) planTupleProbes(cands []*probeCandidate, sides []JoinSide,
-	steps []*joinStepPlan) map[int]*tupleProbe {
+func (cat *Catalog) planTupleProbes(stepKeys map[int]*stepKey, cands []*probeCandidate,
+	sides []JoinSide, steps []*joinStepPlan) map[int]*tupleProbe {
 	out := map[int]*tupleProbe{}
 	if !tupleProbes {
 		return out
 	}
+	// Two sets per step, tried in this order: the step's WHOLE probeable key, and the
+	// subset of it that carries single-attribute indexes.
+	//
+	// The whole key first, because that is the set a composite is most likely to cover and
+	// the only one that can include a component-only attribute -- an attribute with no
+	// index of its own, answerable only as part of a tuple. The indexed subset second,
+	// because a step can hold an equality on an attribute that is neither indexed nor a
+	// component: the per-attribute form already ignores it, so a spine over the rest is
+	// still exactly the set the step would otherwise have narrowed on.
+	indexed := map[int][]probeAttr{}
 	for _, g := range groupByStep(cands) {
-		if len(g) < 2 {
+		for _, c := range g {
+			indexed[c.step] = append(indexed[c.step], probeAttr{equi: c.equi, attr: c.attr})
+		}
+	}
+	for i := range steps {
+		sk := stepKeys[i]
+		if sk == nil {
+			continue
+		}
+		set, ok := cat.tupleSetFor(sides[steps[i].side].Table, sk.attrs, indexed[i])
+		if !ok {
+			continue
+		}
+		out[i] = &tupleProbe{
+			step: i, attrs: set.attrs, equis: set.equis, composite: set.composite,
+			perTuple: set.perTuple, rows: sk.rows, segments: sk.segments,
+			seen: map[string]bool{},
+		}
+	}
+	return out
+}
+
+// tupleSet is the attribute tuple a step would narrow on as a whole, resolved against the
+// table's composites: the attributes in the order they will be rendered, the step equality
+// each one comes from, the composite answering them if there is one, and what one disjunct
+// costs in lookups.
+type tupleSet struct {
+	attrs     []string
+	equis     []int
+	composite []string
+	perTuple  int
+}
+
+// tupleSetFor picks the tuple a step narrows on, preferring the widest set a composite
+// answers.
+//
+// all is every probeable equality of the step; indexed is the subset whose attributes carry
+// an index of their own. Three outcomes, in order:
+//
+//   - a composite over the WHOLE key. The only case that can include a component-only
+//     attribute, and the one this function exists for: one lookup per disjunct, and an
+//     attribute that no single-attribute constraint could have narrowed on at all.
+//   - a composite over the indexed subset. A step can hold an equality on an attribute that
+//     is neither indexed nor a component; the per-attribute form already ignores it, so a
+//     spine over the rest is still exactly the set the step would otherwise narrow on.
+//   - no composite, but two or more indexed attributes: the spine still admits only the
+//     tuples held where the in-chains admit their cross product, at one lookup per
+//     component per disjunct.
+//
+// A spine over a component-only attribute WITHOUT a composite is never built. That attribute
+// has no postings of its own, so the disjunct would be answered by its siblings alone --
+// sound, but wider than the per-attribute form it replaced and paying more lookups for the
+// privilege.
+func (cat *Catalog) tupleSetFor(table string, all, indexed []probeAttr) (tupleSet, bool) {
+	for _, cand := range [][]probeAttr{all, indexed} {
+		if len(cand) < 2 {
 			continue // one attribute is not a tuple
 		}
-		attrs := make([]string, len(g))
-		equis := make([]int, len(g))
-		for i, c := range g {
-			attrs[i], equis[i] = c.attr, c.equi
+		comp, ok := cat.joinSideComposite(table, attrNames(cand))
+		if !ok {
+			continue
 		}
-		table := sides[steps[g[0].step].side].Table
-		tp := &tupleProbe{
-			step: g[0].step, attrs: attrs, equis: equis, perTuple: len(g),
-			rows: g[0].rows, segments: g[0].segments, seen: map[string]bool{},
-		}
-		if comp, ok := cat.joinSideComposite(table, attrs); ok {
-			// The composite's order, not the step's: a step pinning the same attributes
-			// in either order matches the same index, and the tuple is the composite's
-			// to name once one answers it.
-			reordered := make([]int, len(comp))
-			for i, name := range comp {
-				for _, c := range g {
-					if strings.EqualFold(c.attr, name) {
-						reordered[i] = c.equi
-						break
-					}
+		// The composite's order, not the step's: a step pinning the same attributes in
+		// either order matches the same index, and the tuple is the composite's to name
+		// once one answers it.
+		equis := make([]int, len(comp))
+		for i, name := range comp {
+			for _, pa := range cand {
+				if strings.EqualFold(pa.attr, name) {
+					equis[i] = pa.equi
+					break
 				}
 			}
-			tp.attrs, tp.equis, tp.composite, tp.perTuple = comp, reordered, comp, 1
 		}
-		out[g[0].step] = tp
+		return tupleSet{attrs: comp, equis: equis, composite: comp, perTuple: 1}, true
+	}
+	if len(indexed) < 2 {
+		return tupleSet{}, false
+	}
+	attrs := make([]string, len(indexed))
+	equis := make([]int, len(indexed))
+	for i, pa := range indexed {
+		attrs[i], equis[i] = pa.attr, pa.equi
+	}
+	return tupleSet{attrs: attrs, equis: equis, perTuple: len(indexed)}, true
+}
+
+// attrNames is the attribute names of a probeable set, in order.
+func attrNames(pas []probeAttr) []string {
+	out := make([]string, len(pas))
+	for i, pa := range pas {
+		out[i] = pa.attr
 	}
 	return out
 }
@@ -257,20 +330,35 @@ func sameAttrSet(a, b []string) bool {
 // component's distinct key count. It is what the tuple form has to beat to be worth its
 // extra lookups.
 //
+// Zero means there is no finite product to compare against and the caller skips the test;
+// see the component-only case below.
+//
 // Capped rather than allowed to overflow. The ceiling is only ever compared against a term count
 // bounded by maxProbeKeys, so any value past it is "larger than the tuple form" whatever its
 // true size, and saturating says that without a wider integer.
-func crossProduct(g []*probeCandidate) int {
+func crossProduct(g []*probeCandidate, attrs []string) int {
 	const ceiling = 1 << 30
 	n := 1
-	for _, c := range g {
-		if len(c.lits) == 0 {
-			return 0 // no constraint on this component: the product is not meaningful
+	for _, a := range attrs {
+		var lits int
+		for _, c := range g {
+			if strings.EqualFold(c.attr, a) {
+				lits = len(c.lits)
+				break
+			}
 		}
-		if n > ceiling/len(c.lits) {
+		if lits == 0 {
+			// Unconstrained by the per-attribute form -- a component-only attribute has
+			// no index and so no in-chain, and the conjunction of in-chains therefore
+			// admits every value of it. There is no finite product to compare against,
+			// and one computed over the siblings alone would understate the comparison
+			// badly enough to decline the spine outright.
+			return 0
+		}
+		if n > ceiling/lits {
 			return ceiling
 		}
-		n *= len(c.lits)
+		n *= lits
 	}
 	return n
 }
