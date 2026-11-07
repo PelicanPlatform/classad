@@ -339,8 +339,8 @@ func TestComponentOnlyDeclarationSurvivesReopen(t *testing.T) {
 	if got := tbl.CompositeAttrs(); len(got) != 1 {
 		t.Fatalf("before reopen the composite is already missing: %v", got)
 	}
-	if err := tbl.Close(); err != nil {
-		t.Fatal(err)
+	if cerr := tbl.Close(); cerr != nil {
+		t.Fatal(cerr)
 	}
 
 	// Reopen with an EMPTY config, the way a restart does: the file is authoritative.
