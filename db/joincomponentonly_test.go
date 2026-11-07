@@ -312,3 +312,88 @@ func TestJoinPrefersTheWidestTupleAComposite(t *testing.T) {
 		t.Errorf("hashed %d rows, want 32 (the triples held)", st.HashRows)
 	}
 }
+
+// A component-only declaration must survive a reopen. If it does not, newCompositeSpecs
+// refuses the tuple whose component it declared, the composite silently vanishes, and every
+// query that relied on it gets slower with no error anywhere.
+func TestComponentOnlyDeclarationSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	cfg := ArchiveConfig{
+		SegmentSize:         4096,
+		ValueAttrs:          []string{"ClusterId"},
+		ValueComponentAttrs: []string{"ProcId"},
+		CompositeAttrs:      [][]string{{"ClusterId", "ProcId"}},
+	}
+	tbl, err := openArchiveTable(dir, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8192; i++ {
+		ad := classad.New()
+		ad.InsertAttr("ClusterId", int64(i/4))
+		ad.InsertAttr("ProcId", int64(i%4))
+		if aerr := tbl.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	if got := tbl.CompositeAttrs(); len(got) != 1 {
+		t.Fatalf("before reopen the composite is already missing: %v", got)
+	}
+	if err := tbl.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen with an EMPTY config, the way a restart does: the file is authoritative.
+	re, err := openArchiveTable(dir, ArchiveConfig{}, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer re.Close()
+	if got := re.CompositeAttrs(); len(got) != 1 {
+		t.Fatalf("the composite did not survive the reopen: %v", got)
+	}
+	_, vals := re.IndexedAttrs()
+	for _, v := range vals {
+		if v == "ProcId" || v == "procid" {
+			t.Fatalf("ProcId came back as a full index, not a component: %v", vals)
+		}
+	}
+	t.Logf("composites=%v value indexes=%v", re.CompositeAttrs(), vals)
+}
+
+// A composite whose component cannot be resolved is refused SILENTLY -- newCompositeSpecs
+// skips the tuple and nothing returns an error. That is the failure mode a reopen that lost
+// the component declarations would have produced, so it is worth pinning on its own: the
+// symptom is not a broken table, it is a table that quietly stopped having the index.
+func TestCompositeWithAnUnresolvableComponentIsSilentlyDropped(t *testing.T) {
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	tbl, cerr := cat.CreateArchiveTable("hist", ArchiveConfig{
+		SegmentSize:    4096,
+		ValueAttrs:     []string{"ClusterId"},
+		CompositeAttrs: [][]string{{"ClusterId", "ProcId"}}, // ProcId neither indexed nor declared
+	})
+	if cerr != nil {
+		t.Fatalf("creating the table reported an error: %v", cerr)
+	}
+	if got := tbl.CompositeAttrs(); len(got) != 0 {
+		t.Fatalf("the composite was kept despite an unresolvable component: %v", got)
+	}
+	// And the same configuration WITH the declaration keeps it, so the refusal above is
+	// about the component rather than about composites in general.
+	ok, oerr := cat.CreateArchiveTable("hist2", ArchiveConfig{
+		SegmentSize:         4096,
+		ValueAttrs:          []string{"ClusterId"},
+		ValueComponentAttrs: []string{"ProcId"},
+		CompositeAttrs:      [][]string{{"ClusterId", "ProcId"}},
+	})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if got := ok.CompositeAttrs(); len(got) != 1 {
+		t.Fatalf("the declared configuration lost its composite too: %v", got)
+	}
+}
