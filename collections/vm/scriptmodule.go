@@ -136,6 +136,11 @@ func (m *ScriptModule) Compile(name string) (*ScriptFunc, error) {
 	}
 
 	s := NewScript()
+	// A module function has no subject ad: its inputs are its parameters and nothing else, which
+	// checkPure then enforces. Saying so before anything is emitted is what lets a list literal be
+	// built on the spot instead of being handed to an evaluator that would have no scope to run it
+	// in. See compiler.noAd.
+	s.c.noAd = true
 	e := &emitter{pos: m.pos}
 	for _, def := range m.defs {
 		before := s.err

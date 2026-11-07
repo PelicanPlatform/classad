@@ -222,6 +222,25 @@ const (
 	// of ternaries is how ClassAd spells a lookup table. Here the undefined outcome walks the same
 	// two blocks the true and false outcomes walk, and the construct's size is the sum of its parts.
 	OpTernFalse
+
+	// OpMakeList pops A values (element 0 deepest) and pushes the list holding them.
+	//
+	// IT IS EAGER, AND EVERY OTHER LIST IN THIS LANGUAGE IS LAZY. A list literal evaluated against an
+	// ad keeps its element EXPRESSIONS and the scope to evaluate them in, which is observable in
+	// exactly one place: string coercion unparses the source, so `string({1, 2+3})` is "{ 1,2 + 3 }"
+	// and not "{ 1,5 }". Every other built-in that consumes a list -- size, sum, avg, min, max, join,
+	// member, a subscript, a select -- materializes the elements first and cannot tell the two apart.
+	//
+	// So this opcode is emitted ONLY where there is no ad: a module function compiled for
+	// registration (see compiler.noAd). There the lazy form is not merely equivalent, it is
+	// unreachable -- a list literal in such a function is a delegated subtree, which checkPure
+	// refuses outright, and its elements could not read a parameter even if it did not. Emitting it
+	// in a script would change what `string({1, 2+3})` means, which is why the gate is not a
+	// preference.
+	//
+	// The element count is the instruction's argument rather than a pool index, which is the one
+	// place in this instruction set where A is a literal number.
+	OpMakeList
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

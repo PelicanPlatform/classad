@@ -38,10 +38,11 @@ import (
 //	[a = x]           an ad literal is a separate ad whose attributes resolve against itself
 //	countMatches(x,L) arg0 is evaluated once per nested ad, in a child evaluator (evalInNested)
 //
-// A local read in one of those positions is refused at compile time, as every local read inside a
-// delegated subtree used to be: LocalCaptureError. Computing it is not an option, because there is
-// no moment at which the read could be answered -- a list element may be materialized after the
-// script has finished and its registers are gone.
+// A local read in one of those positions is refused at compile time: LocalCaptureError. Computing
+// it is not an option, because there is no moment at which the read could be answered -- a list
+// element may be materialized after the script has finished and its registers are gone. Binding the
+// construct to a local does not move the read anywhere the overlay reaches, so `x = {a, b}` is
+// refused exactly as `{a, b}` is.
 
 // localBind binds a name a delegated subtree reads to the register that holds it.
 //
