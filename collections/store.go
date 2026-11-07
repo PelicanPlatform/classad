@@ -536,6 +536,10 @@ type Collection struct {
 
 	demand     *demandTracker // per-attribute query demand, for SuggestIndexes
 	demandHalf time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
+	// ndvCache memoizes AttrNDV per attribute id against the exact segment indexes the
+	// answer was derived from (see ndv.go). It is a pure memo: a miss recomputes, and a
+	// shape it does not recognize is never served.
+	ndvCache sync.Map // attr id (uint32) -> *ndvCacheEntry
 	// require is the attribute set that enters the derived schema whatever its presence rate,
 	// guarded by requireMu because the admin surface changes it on a live table; requireReport
 	// holds the last derivation's refusals. See schemarequire.go.

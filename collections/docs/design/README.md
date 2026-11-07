@@ -1586,8 +1586,17 @@ The summary earns its keep twice:
    skipped. This holds only *provided* no exceptional (present but wrong-type or
    non-literal) record could still match; those are always re-verified.
 2. **Probe ordering.** The planner estimates each probe's cardinality, using the
-   histogram for ranges and the top-N and HLL for equality, and intersects the most
-   selective first.
+   histogram for ranges and the top-N and the exact distinct count for equality, and
+   intersects the most selective first.
+3. **Distinct-value counts.** `AttrNDV` merges the segments' HyperLogLog sketches into
+   one attribute's distinct count across the whole table, which is what a join's cost
+   model divides by and what the exact per-segment counts cannot give on their own (two
+   segments holding the same value must not count it twice). It reads only these
+   summaries, so it costs no record read, and it is memoized against the segment indexes
+   it was derived from. Every answer carries an accuracy class -- a count, a bound in a
+   named direction, or an estimate with its standard error -- because understating a
+   distinct count overstates a join's output without bound, and an attribute no segment
+   indexes yields no answer at all rather than a number a planner would act on.
 
 The sketches are bounded (≤8 KiB Bloom and 1 KiB HLL per attribute per segment). A
 Bloom hit may be a false positive, which only forgoes a skip, so soundness is preserved
