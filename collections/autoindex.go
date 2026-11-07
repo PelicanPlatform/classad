@@ -57,6 +57,13 @@ type demandTracker struct {
 	// lastDecayUnix is when the counters were last scaled down, so decay is charged for
 	// elapsed time rather than per call.
 	lastDecayUnix atomic.Int64
+
+	// tuples counts the attribute TUPLES whose equalities arrive in ONE conjunction, which
+	// is the demand a composite index answers and the thing the per-attribute counters
+	// above cannot distinguish from two unrelated queries. tupleN bounds the map, which
+	// unlike the per-attribute one is not bounded by the schema. See compositedemand.go.
+	tuples sync.Map // tuple key (folded names, sorted, NUL-joined) -> *tupleCounts
+	tupleN atomic.Int64
 }
 
 // hasDropEvidence reports whether the tracker has watched long enough, and seen enough
@@ -90,6 +97,9 @@ func (d *demandTracker) record(probes []vm.Probe) {
 			c.eq.Add(1)
 		}
 	}
+	// The same probes, read as a conjunction rather than one at a time: which attributes
+	// this query pinned TOGETHER. Every caller hands record one conjunction's probes.
+	d.recordTuple(probes)
 }
 
 // recordReads tallies one access to each named attribute, for hot-set and hot-tier
@@ -475,11 +485,13 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		minDemand = 1
 	}
 	adds := c.SuggestIndexes(opts.SampleMax)
+	compAdds := c.SuggestComposites()
 	// Unused-drops are the churn-prone path: they run on demand counters alone, with no
 	// hysteresis. Gate them on evidence, and stand down entirely when a memory budget is
 	// configured -- the budget trim below reclaims the same indexes when space is actually
 	// short, and only then.
 	var drops []DropSuggestion
+	var compDrops []CompositeDropSuggestion
 	if opts.DropUnused && opts.BudgetHighFrac <= 0 {
 		window := opts.DropUnusedMinWindow
 		if window == 0 {
@@ -495,6 +507,7 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		}
 		if c.demand.hasDropEvidence(minQ, window) {
 			drops = c.SuggestDrops(opts.SampleMax)
+			compDrops = c.SuggestCompositeDrops()
 		}
 	}
 
@@ -530,6 +543,21 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		if len(cat) > 0 || len(val) > 0 {
 			res.Changed = c.addIndexAuto(cat, val) || res.Changed
 		}
+		// Composites are suggested only over components that were ALREADY indexed before
+		// this pass (SuggestComposites), so a tuple whose components were just added above
+		// lands on the next pass, not this one. The suggestions were computed from the
+		// pre-change snapshot, so that is automatic rather than something to arrange.
+		var tuples [][]string
+		for _, s := range compAdds {
+			if s.Queries < minDemand {
+				continue
+			}
+			tuples = append(tuples, s.Attrs)
+		}
+		for _, t := range c.addCompositesAuto(tuples) {
+			res.Changes = append(res.Changes, AutoTuneChange{strings.Join(t, "+"), "composite", "add", "demand"})
+			res.Changed = true
+		}
 	}
 
 	var dropNames []string
@@ -547,6 +575,18 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		res.Changed = c.DropIndex(dropNames...) || res.Changed
 	}
 
+	var dropLabels []string
+	for _, d := range compDrops {
+		if d.Reason != "unused" || !d.Auto {
+			continue // never auto-drop a human-configured composite
+		}
+		dropLabels = append(dropLabels, d.Label)
+		res.Changes = append(res.Changes, AutoTuneChange{d.Label, "composite", "drop", d.Reason})
+	}
+	if len(dropLabels) > 0 {
+		res.Changed = c.dropComposites(dropLabels...) || res.Changed
+	}
+
 	// Budget trim: if over the high watermark (plus slack), drop the least-valuable AUTO
 	// indexes (fewest queries, then largest bytes) until under the low watermark.
 	if opts.BudgetHighFrac > 0 {
@@ -556,6 +596,15 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		}
 		for _, d := range c.budgetTrim(opts.BudgetHighFrac, lowFrac, slack) {
 			res.Changes = append(res.Changes, AutoTuneChange{d.Attr, d.Kind, "drop", "over-budget"})
+			if d.Kind == "composite" {
+				// A composite is named by its tuple, not an attribute, so DropIndex would
+				// find nothing and silently leave the bytes the trim has already counted as
+				// freed. It may also be gone already, dropped along with a component index
+				// earlier in this loop (pruneComposites), which dropComposites reports as
+				// no change.
+				res.Changed = c.dropComposites(d.Attr) || res.Changed
+				continue
+			}
 			res.Changed = c.DropIndex(d.Attr) || res.Changed
 		}
 	}
@@ -587,15 +636,21 @@ func (c *Collection) budgetTrim(highFrac, lowFrac float64, slackBytes int64) []I
 			cand = append(cand, s)
 		}
 	}
-	demandOf := func(attr string) int64 {
-		if v, ok := c.demand.m.Load(strings.ToLower(attr)); ok {
+	demandOf := func(s IndexSize) int64 {
+		if s.Kind == "composite" {
+			// A composite is keyed on a tuple, so its demand is the tuple counters' and not
+			// any attribute's -- looking it up by name would find nothing and rank every
+			// composite as the least-valuable index in the collection.
+			return c.compositeDemandByLabel(s.Attr)
+		}
+		if v, ok := c.demand.m.Load(strings.ToLower(s.Attr)); ok {
 			d := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 			return d.eq.Load() + d.rng.Load()
 		}
 		return 0
 	}
 	sort.Slice(cand, func(i, j int) bool {
-		di, dj := demandOf(cand[i].Attr), demandOf(cand[j].Attr)
+		di, dj := demandOf(cand[i]), demandOf(cand[j])
 		if di != dj {
 			return di < dj // fewest queries first
 		}

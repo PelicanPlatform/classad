@@ -60,6 +60,12 @@ type persistedDemand struct {
 	Observed  int64                      `json:"observed_nanos"`
 	Total     float64                    `json:"total"`
 	Attrs     map[string]persistedCounts `json:"attrs"` // folded attribute name -> counts
+	// Tuples is the composite-index demand: which attributes arrive pinned together in one
+	// conjunction (see compositedemand.go). It is an added OPTIONAL field rather than a new
+	// version: a checkpoint written before it parses with no tuples, which is the truth
+	// about it, and bumping demandVer would instead discard every deployed checkpoint --
+	// throwing away weeks of per-attribute demand to learn nothing.
+	Tuples []persistedTuple `json:"tuples,omitempty"`
 }
 
 type persistedCounts struct {
@@ -103,6 +109,7 @@ func (d *demandTracker) decay(f float64) {
 	for _, k := range dead {
 		d.m.Delete(k)
 	}
+	d.decayTuples(f) // the tuple counters fade with their components, on the same clock
 }
 
 // scaleCount applies a decay factor to an integer counter, rounding rather than truncating.
@@ -143,6 +150,7 @@ func (d *demandTracker) snapshot(now time.Time) persistedDemand {
 		}
 		return true
 	})
+	p.Tuples = d.snapshotTuples()
 	return p
 }
 
@@ -166,6 +174,7 @@ func (d *demandTracker) restore(p persistedDemand, halfLife time.Duration, now t
 		c.rng.Add(int64(math.Round(rng)))
 		c.reads.Add(int64(math.Round(reads)))
 	}
+	d.restoreTuples(p.Tuples, f)
 }
 
 // demandHalfLife is the configured half-life, or the default.
