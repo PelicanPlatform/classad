@@ -982,13 +982,21 @@ func appendComputedTrailer(dst []byte, blocks []*columnarBlock) []byte {
 // that does not parse, or describes a different block list, is dropped whole: the cells read as held
 // cells with no computed value, which is correct, only slower.
 func readComputedTrailer(rest []byte, cs *colSegment) bool {
+	n, ok := readComputedTrailerPrefix(rest, cs, true)
+	return ok && n == len(rest)
+}
+
+// readComputedTrailerPrefix decodes a computed trailer at the start of rest onto cs's base blocks and
+// returns its length; what follows it is an extension trailer (colExtTrailer). With exact set it attaches
+// only a trailer that occupies all of rest.
+func readComputedTrailerPrefix(rest []byte, cs *colSegment, exact bool) (int, bool) {
 	c := &cursor{b: rest}
 	if len(rest) < 8 || c.u32() != colComputedTrailer {
-		return false
+		return 0, false
 	}
 	nb := int(c.u32())
 	if c.err != nil || nb != len(cs.blocks) {
-		return false
+		return 0, false
 	}
 	comps := make([][]byte, nb)
 	entries := make([][]computedEntry, nb)
@@ -997,31 +1005,31 @@ func readComputedTrailer(rest []byte, cs *colSegment) bool {
 		comps[i] = c.bytes()
 		ne := int(c.u32())
 		if c.err != nil || ne < 0 || ne > len(cs.blocks[i].schema.fields) {
-			return false
+			return 0, false
 		}
 		prev := -1
 		for j := 0; j < ne; j++ {
 			idx := int(c.u32())
 			start := c.u32()
 			if c.err != nil || idx <= prev || idx >= len(cs.blocks[i].schema.fields) {
-				return false
+				return 0, false
 			}
 			prev = idx
 			entries[i] = append(entries[i], computedEntry{idx: idx, start: start})
 		}
 		if ne > 0 && len(comps[i]) == 0 {
-			return false
+			return 0, false
 		}
 		if ne == 0 && len(comps[i]) > 0 {
 			cc, ok := parseComputedCols(comps[i], cs.blocks[i])
 			if !ok {
-				return false
+				return 0, false
 			}
 			cols[i] = cc
 		}
 	}
-	if c.err != nil || c.i != len(rest) {
-		return false
+	if c.err != nil || (exact && c.i != len(rest)) {
+		return 0, false
 	}
 	for i, b := range cs.blocks {
 		if cols[i] != nil {
@@ -1030,7 +1038,7 @@ func readComputedTrailer(rest []byte, cs *colSegment) bool {
 		}
 		b.computedComp, b.computed = comps[i], entries[i]
 	}
-	return true
+	return c.i, true
 }
 
 // PER-RECORD EXCEPTIONS.

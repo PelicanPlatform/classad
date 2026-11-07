@@ -34,6 +34,8 @@ type formFixture struct {
 	ever    map[int64]*classad.ClassAd // every record ever written, for the reads of an earlier time
 	close   func() error
 	reopen  func() *formFixture
+	// extraProj are projections checked beside the default ones.
+	extraProj [][]string
 }
 
 // formAd is computedAd where, beside the uncomputable MemUse, one record in excEvery holds a Label no
@@ -61,15 +63,32 @@ var labelAttr = regexp.MustCompile(`Label = [^;]+;`)
 
 func buildFormFixture(t *testing.T, dir string, n, excEvery int, archive, interned bool) *formFixture {
 	t.Helper()
+	f := buildFormFixtureGen(t, dir, n, excEvery, archive, interned, formAd)
+	if !columnarHoldsComputed(f.c) {
+		t.Fatal("no columnarized segment holds a computed cell")
+	}
+	return f
+}
+
+// buildFormFixtureGen is buildFormFixture over the records gen writes.
+func buildFormFixtureGen(t *testing.T, dir string, n, excEvery int, archive, interned bool, gen func(i, excEvery int) string) *formFixture {
+	t.Helper()
+	return buildFormFixtureOpts(t, dir, n, excEvery, archive, interned, 0, gen)
+}
+
+// buildFormFixtureOpts is buildFormFixtureGen with Options.MoveListColumns set to moves, for this open and
+// every reopen.
+func buildFormFixtureOpts(t *testing.T, dir string, n, excEvery int, archive, interned bool, moves int, gen func(i, excEvery int) string) *formFixture {
+	t.Helper()
 	src := make(map[int64]*classad.ClassAd, n)
 	for i := range n {
-		src[int64(i)] = mustAd(t, formAd(i, excEvery))
+		src[int64(i)] = mustAd(t, gen(i, excEvery))
 	}
 	var open func(fresh bool) *formFixture
 	open = func(fresh bool) *formFixture {
 		f := &formFixture{archive: archive, src: src, ever: maps.Clone(src)}
 		if archive {
-			opts := ArchiveOptions{Dir: dir, SegmentSize: 1 << 16, GroupSchemaCount: -1, InternAtSeal: interned}
+			opts := ArchiveOptions{Dir: dir, SegmentSize: 1 << 16, GroupSchemaCount: -1, InternAtSeal: interned, MoveListColumns: moves}
 			var a *Archive
 			var err error
 			if fresh {
@@ -89,7 +108,7 @@ func buildFormFixture(t *testing.T, dir string, n, excEvery int, archive, intern
 				}
 			}
 		} else {
-			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1, WatchHistory: 64,
+			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1, WatchHistory: 64, MoveListColumns: moves,
 				TimeTravel: &TimeTravelOptions{MaxDistance: time.Hour, CheckpointInterval: time.Millisecond}})
 			if err != nil {
 				t.Fatal(err)
@@ -108,6 +127,7 @@ func buildFormFixture(t *testing.T, dir string, n, excEvery int, archive, intern
 				t.Fatal(err)
 			}
 			g := open(false)
+			g.extraProj = f.extraProj
 			g.c.BuildAndEnableSchemaScan(4096, 8)
 			return g
 		}
@@ -119,9 +139,6 @@ func buildFormFixture(t *testing.T, dir string, n, excEvery int, archive, intern
 	}
 	f = f.reopen()
 	t.Cleanup(func() { f.close() })
-	if !columnarHoldsComputed(f.c) {
-		t.Fatal("no columnarized segment holds a computed cell")
-	}
 	return f
 }
 
@@ -291,6 +308,7 @@ func checkFormReaders(t *testing.T, f *formFixture, label string) {
 		}
 	}
 	projections := [][]string{{"MemUse"}, {"MemUse", "Label", "Owner"}, {"Big", "Ratio", "Flag", "Rss"}, {"Label"}}
+	projections = append(projections, f.extraProj...)
 
 	full := func(path string, seq func(func(*classad.ClassAd) bool), want int) {
 		t.Helper()

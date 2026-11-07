@@ -402,6 +402,15 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 		case OpPushError:
 			fillState(s.push(), VsError)
 		case OpLoadRef:
+			// A list attribute consumed at once by a list built-in is served from a list column; see
+			// veclist.go. Tried before the shared-column cache, which would load it as a vector.
+			if t, handled, ok := s.tryListFused(p, ip, src); handled {
+				if !ok {
+					return nil, false
+				}
+				next = t
+				break
+			}
 			r := p.refs[in.A]
 			// A column reads an absent CurrentTime as undefined, where the evaluator reads
 			// the time; per-record evaluation gets that right.

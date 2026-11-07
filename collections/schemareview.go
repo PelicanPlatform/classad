@@ -273,6 +273,12 @@ func (k *staleCheck) payloadStale(cs *colSegment) bool {
 	if !sameSchemaLayout(sch, k.st.schema) || !sameHotSet(sch, cs.hotNum(), k.st.schema, k.st.hot) {
 		return true
 	}
+	if cs.hasMovedLists() && !k.c.writeListMoves() {
+		// Lists stored only in their columns while moving is off: the way back for a rollback to a build
+		// that cannot read them. Rewriting puts every list back in its record and writes a payload such a
+		// build reads.
+		return true
+	}
 	if cs.schemaOnly && cs.remnants == nil {
 		// A columnarized segment written before payloads listed their remnant names: readable, but a
 		// column reader cannot tell absence there without reading every record. Rewriting it adds the

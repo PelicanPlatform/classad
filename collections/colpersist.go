@@ -91,14 +91,19 @@ const (
 	// a block, the group section -- bumps the version and teaches unmarshalColPayload the new layout,
 	// keeping the old ones readable.
 	//
+	// 3 (colPayloadVersionLists): version 2's body, its dictionary section always present (possibly every
+	// block empty), then the list section (collistmove.go), whose columns hold lists no record does.
+	//
 	// colPayloadVersion is what a payload WITHOUT a remnant dictionary is still written as, so that a
 	// segment that needs nothing newer stays readable by a build that predates version 2. Version 2 is
 	// written only when some block carries a dictionary: its records then hold references an older
-	// build would otherwise read as values, so it has to refuse the payload instead.
+	// build would otherwise read as values, so it has to refuse the payload instead. Version 3 likewise
+	// only when some block holds a moved list, whose records hold placeholders.
 	colPayloadVersion        = 1
 	colPayloadVersionRemDict = 2
-	colPayloadMaxVersion     = colPayloadVersionRemDict // the newest version this build reads
-	colPayloadHdr            = 4 + 4                    // magic u32 | version u32
+	colPayloadVersionLists   = 3
+	colPayloadMaxVersion     = colPayloadVersionLists // the newest version this build reads
+	colPayloadHdr            = 4 + 4                  // magic u32 | version u32
 )
 
 // adSchemaMaxFields bounds a stored schema's field count. readAdSchema rejects anything larger, which
@@ -122,12 +127,21 @@ var errColPayloadMalformed = errors.New("collections: columnar payload is malfor
 func marshalColPayload(cs *colSegment, nameOf func(uint32) (string, bool)) []byte {
 	hdr := make([]byte, 0, colPayloadHdr)
 	hdr = appendU32(hdr, colPayloadMagic)
-	if cs.hasRemnantDict() {
-		hdr = appendU32(hdr, colPayloadVersionRemDict)
-		return appendColSegmentAs(hdr, cs, nameOf, true)
+	v := payloadVersionFor(cs)
+	hdr = appendU32(hdr, v)
+	return appendColSegmentAs(hdr, cs, nameOf, v)
+}
+
+// payloadVersionFor is the oldest payload version that can hold cs: 3 when a block holds a moved list, 2
+// when one carries a remnant dictionary, 1 otherwise.
+func payloadVersionFor(cs *colSegment) uint32 {
+	switch {
+	case cs.hasMovedLists():
+		return colPayloadVersionLists
+	case cs.hasRemnantDict():
+		return colPayloadVersionRemDict
 	}
-	hdr = appendU32(hdr, colPayloadVersion)
-	return appendColSegmentAs(hdr, cs, nameOf, false)
+	return colPayloadVersion
 }
 
 // splitColPayload reads a payload's header, returning its body and version. A payload without the
@@ -162,8 +176,8 @@ func unmarshalColPayload(blob []byte, codec Codec, internName func(string) uint3
 		return nil, err
 	}
 	// Versions 0 and 1 share one body layout; version 2 adds the remnant-dictionary section, which it
-	// must then carry.
-	cs := unmarshalColSegmentAs(body, codec, internName, version >= colPayloadVersionRemDict)
+	// must then carry, and version 3 the list section after it.
+	cs := unmarshalColSegmentAs(body, codec, internName, version)
 	if cs == nil {
 		return nil, errColPayloadMalformed
 	}
@@ -323,13 +337,14 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 // appendColSegment is marshalColSegment appending to dst. Returns nil (not dst) for a colSegment
 // carrying no schema.
 func appendColSegment(dst []byte, cs *colSegment, nameOf func(uint32) (string, bool)) []byte {
-	return appendColSegmentAs(dst, cs, nameOf, false)
+	return appendColSegmentAs(dst, cs, nameOf, colPayloadVersion)
 }
 
-// appendColSegmentAs is appendColSegment, writing the remnant-dictionary section after the group
-// section when remDict is set (a version 2 payload). Only marshalColPayload sets it: the sidecar
-// section never describes a columnarized segment's records, so it never carries one.
-func appendColSegmentAs(dst []byte, cs *colSegment, nameOf func(uint32) (string, bool), remDict bool) []byte {
+// appendColSegmentAs is appendColSegment laying out a body of payload version v: from version 2 the
+// remnant-dictionary section follows the group section, and from version 3 the list section follows it.
+// Only marshalColPayload passes more than 1: the sidecar section never describes a columnarized segment's
+// records, so it never carries either.
+func appendColSegmentAs(dst []byte, cs *colSegment, nameOf func(uint32) (string, bool), v uint32) []byte {
 	sch := cs.schema()
 	if sch == nil {
 		return nil
@@ -419,8 +434,11 @@ func appendColSegmentAs(dst []byte, cs *colSegment, nameOf func(uint32) (string,
 			dst = appendColBlock(dst, gb.blk)
 		}
 	}
-	if remDict {
+	if v >= colPayloadVersionRemDict {
 		dst = appendRemDictSection(dst, cs.blocks)
+	}
+	if v >= colPayloadVersionLists {
+		dst = appendListBodySection(dst, cs.blocks)
 	}
 	// The remnant-name trailer goes last, after everything an older build parses (see
 	// colRemnantTrailer). Only a columnarized segment's payload carries one.
@@ -430,6 +448,11 @@ func appendColSegmentAs(dst []byte, cs *colSegment, nameOf func(uint32) (string,
 	// The computed values come after it, for the same reason (see colComputedTrailer).
 	if cs.hasComputed() {
 		dst = appendComputedTrailer(dst, cs.blocks)
+	}
+	// Then the extension trailer, which a reader skips section by section (see colExtTrailer). Its list
+	// section is the copy an older body carries; a version 3 body already holds the lists.
+	if v < colPayloadVersionLists && cs.hasLists() {
+		dst = appendExtTrailer(dst, cs)
 	}
 	return dst
 }
@@ -610,12 +633,11 @@ func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *colum
 // reap and re-published together when reindex swaps the sidecar. Callers must therefore keep data
 // (the mapping, or a heap buffer in tests) alive for the block's lifetime.
 func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint32) *colSegment {
-	return unmarshalColSegmentAs(data, codec, internName, false)
+	return unmarshalColSegmentAs(data, codec, internName, colPayloadVersion)
 }
 
-// unmarshalColSegmentAs is unmarshalColSegment for a body that carries a remnant-dictionary section
-// after its group section when remDict is set (a version 2 payload).
-func unmarshalColSegmentAs(data []byte, codec Codec, internName func(string) uint32, remDict bool) *colSegment {
+// unmarshalColSegmentAs is unmarshalColSegment for a body of payload version v (see appendColSegmentAs).
+func unmarshalColSegmentAs(data []byte, codec Codec, internName func(string) uint32, v uint32) *colSegment {
 	c := &cursor{b: data}
 	s := readAdSchema(c, internName)
 	if s == nil {
@@ -748,7 +770,11 @@ func unmarshalColSegmentAs(data []byte, codec Codec, internName func(string) uin
 	}
 	// A version 2 payload's dictionary section. Required, not optional like the trailers below: the
 	// records hold references only it resolves, so without it the payload cannot be read at all.
-	if remDict && !readRemDictSection(c, cs) {
+	if v >= colPayloadVersionRemDict && !readRemDictSection(c, cs) {
+		return nil
+	}
+	// A version 3 payload's list section, required for the same reason.
+	if v >= colPayloadVersionLists && !readListBodySection(c, cs, internName) {
 		return nil
 	}
 	// Anything after the group section is the remnant-name trailer or nothing: an older payload ends
@@ -759,12 +785,22 @@ func unmarshalColSegmentAs(data []byte, codec Codec, internName func(string) uin
 }
 
 // readPayloadTrailers decodes what follows the group section: an optional remnant-name trailer, then an
-// optional computed-value trailer (colComputedTrailer), together occupying exactly rest. It attaches the
+// optional computed-value trailer (colComputedTrailer), then an optional extension trailer
+// (colExtTrailer), together occupying exactly rest. It attaches the
 // computed values to cs and returns the remnant set. Anything that does not parse drops both, so the
 // segment reads as one that predates them -- correct, only slower.
 func readPayloadTrailers(rest []byte, cs *colSegment, internName func(string) uint32) *remnantSet {
 	names, tail, hasNames := splitRemnantTrailer(rest)
-	if len(tail) > 0 && !readComputedTrailer(tail, cs) {
+	if len(tail) >= 4 && binary.LittleEndian.Uint32(tail) == colComputedTrailer {
+		n, ok := readComputedTrailerPrefix(tail, cs, false)
+		if !ok {
+			return nil
+		}
+		tail = tail[n:]
+	}
+	// The extension trailer, last. Bytes here that are not one are damage, and drop every trailer.
+	if len(tail) > 0 && !readExtTrailer(tail, cs, internName) {
+		cs.dropTrailerState()
 		return nil
 	}
 	if !hasNames {

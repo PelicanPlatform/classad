@@ -144,6 +144,10 @@ type ArchiveOptions struct {
 	// Options.RemnantDictionary). On by default; negative turns it off.
 	RemnantDictionary int
 
+	// MoveListColumns stores qualifying list-valued attributes only in their typed list columns (see
+	// Options.MoveListColumns). On by default; negative turns it off.
+	MoveListColumns int
+
 	// InternAtSeal interns each segment as soon as it seals (see Options.InternAtSeal), so an
 	// archive gets the interning density/decode win immediately instead of only after a later
 	// RetrainDict/Rewrite. Optional; default off. Trades a per-seal transcode (off the write
@@ -208,6 +212,7 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		GroupMergeJaccard:   opts.GroupMergeJaccard,
 		GroupMaxPartialFrac: opts.GroupMaxPartialFrac,
 		RemnantDictionary:   opts.RemnantDictionary,
+		MoveListColumns:     opts.MoveListColumns,
 		WatchHistory:        archiveWatchCap, // enable the append-stream watch
 		// Global shared ARCHIVE block-cache budget (0 keeps the current/default).
 		ArchiveBlockCacheBytes: opts.BlockCacheBytes,

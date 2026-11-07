@@ -23,6 +23,8 @@ type decodedStreams struct {
 //	kindStrCode  per-field string code columns -- a string predicate or read
 //	kindComputed computed values of expression cells -- an escaped cell's value
 //	kindRemDict  the remnant dictionary              -- reading a columnarized record
+//	kindList     list-valued attributes' columns      -- a list built-in over a list attribute
+//	kindListNode the list cells as nodes (derived)    -- reading a record whose list was moved out
 //
 // Decompressing all three together meant reading one escaped integer also inflated the string
 // region, which on wide ads (a history record carries dozens of string attributes) is the largest
@@ -38,6 +40,8 @@ const (
 	kindStrCode
 	kindComputed
 	kindRemDict
+	kindList
+	kindListNode
 	numStreamKinds
 )
 
@@ -214,6 +218,8 @@ func (bc *blockCache) stream(b *columnarBlock, k streamKind) ([]byte, error) {
 		comp = b.computedComp
 	case kindRemDict:
 		comp = b.remDictComp
+	case kindList:
+		comp = b.listComp
 	}
 	raw, err := b.codec.Decompress(nil, comp)
 	if err != nil {

@@ -116,6 +116,11 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		cc = newCellComputer(c)
 	}
 	cellRows := make([][]computedCell, 0, 512)
+	// Each record's list values and attribute ids, captured the same way, for the block's list columns
+	// (collist.go). Released as each block seals.
+	var listRows []listRow
+	captureLists := colListColumns
+	idHint := 64 // the previous record's attribute count, to size the next one's id list
 
 	// The block sees only what the schema carries, and the remnant only what it does not. Without
 	// that split the block's COLD TAIL would hold the non-schema attributes -- which is precisely
@@ -130,6 +135,11 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		skip := groupSkipSet(groups, iw)
 		skips = append(skips, skip)
 		cellRows = append(cellRows, cc.cells(iw, s))
+		if captureLists {
+			r := captureListRow(iw, idHint)
+			idHint = len(r.ids)
+			listRows = append(listRows, r)
+		}
 		// EVERYTHING the block can store, not just the schema's fields. An attribute the schema does
 		// not carry lands in the block's COLD TAIL, which is one compressed region per ROW GROUP -- and
 		// that is the whole point of moving it: those attributes are the majority of a segment, and a
@@ -160,12 +170,36 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		}
 		return cellRows[lo:hi]
 	}
+	// A block's list columns are built as it seals, from the rows captured for its records, which are then
+	// dropped. A field the sealing policy names is never copied (see SEALED VALUES in collist.go).
+	listName := func(id uint32) (string, bool) {
+		nm, ok := c.intern.Name(id)
+		if !ok || c.shouldEncrypt(nm) {
+			return "", false
+		}
+		return nm, true
+	}
+	var listsFor func(b *columnarBlock, lo, hi int)
+	if captureLists {
+		known := c.knownListFields()
+		listsFor = func(b *columnarBlock, lo, hi int) {
+			if lo < 0 || hi > len(listRows) || lo > hi {
+				return
+			}
+			attachBlockLists(b, listRows[lo:hi], c.regionCodec(), listName, known)
+			clear(listRows[lo:hi])
+			for _, id := range b.listIDs {
+				known[id] = struct{}{}
+				c.listHint.Store(id, struct{}{})
+			}
+		}
+	}
 	if fromWires {
 		blocks, gblocks, offs = buildColumnarFromWires(recolOffs, recolFulls,
-			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), cellsFor)
+			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), cellsFor, listsFor)
 	} else {
 		blocks, gblocks, offs = buildColumnarFromSegmentComputed(src.data, src.used, src.damaged(), src.codec,
-			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), skipDelta, cellsFor)
+			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), skipDelta, cellsFor, listsFor)
 	}
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
@@ -182,7 +216,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	if len(offs) != fed {
 		return nil, nil, nil
 	}
-	if len(skips) != len(offs) || len(cellRows) != len(offs) {
+	if len(skips) != len(offs) || len(cellRows) != len(offs) || (captureLists && len(listRows) != len(offs)) {
 		// The remnant pass indexes skips by record position, so the two passes must have seen the
 		// same records in the same order. Refuse rather than strip by a misaligned index, which
 		// would remove one record's attributes on the strength of another's membership. The computed
@@ -286,6 +320,21 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		}
 		rems = append(rems, remnant{off: o, body: body})
 	}
+	// The list cells the list columns hold, moved out of the records (collistmove.go). After the name list
+	// read the bodies -- a moved list keeps its key, so its name is listed either way -- and before the
+	// remnant dictionary, which then sees each moved cell as the placeholder it now is.
+	listsMoved := false
+	if captureLists && c.writeListMoves() {
+		bodies := make([][]byte, len(rems))
+		for i := range rems {
+			bodies[i] = rems[i].body
+		}
+		c.moveBlockLists(blocks, bodies, d, c.regionCodec())
+		for i := range rems {
+			rems[i].body = bodies[i]
+		}
+		listsMoved = cs.hasMovedLists()
+	}
 	// The repeated non-literal values, stored once per block and referenced in place (colremdict.go).
 	// Built over the bodies exactly as they will be stored, after the name list read them, and before
 	// they are compressed -- the references are what makes each one smaller.
@@ -306,8 +355,9 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		rems[i].body = enc
 		total += recordLen(len(recKey(src.data, rems[i].off)), len(enc))
 	}
-	if remDict && !remNamed {
-		// Re-marshaled so the payload carries the dictionaries and the size below includes them.
+	if (remDict || listsMoved) && !remNamed {
+		// Re-marshaled so the payload carries the dictionaries and moved lists, and the size below
+		// includes them.
 		if blob = marshalColPayload(cs, func(id uint32) (string, bool) { return c.intern.Name(id) }); blob == nil {
 			return nil, nil, nil
 		}

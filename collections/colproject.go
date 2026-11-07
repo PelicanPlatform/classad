@@ -277,7 +277,7 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	sc.remnant = raw
 	// Expanded before anything looks inside it: a dictionary reference is not a value (colremdict.go).
 	// One that does not resolve sends the record to the full read, which refuses it.
-	if exp, expanded, eerr := blk.expandRemnant(raw, cs.bc, sc.expanded[:0]); eerr != nil {
+	if exp, expanded, eerr := blk.expandRemnant(raw, local, cs.bc, sc.expanded[:0]); eerr != nil {
 		return nil, false
 	} else if expanded {
 		sc.expanded = exp

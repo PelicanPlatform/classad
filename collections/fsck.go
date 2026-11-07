@@ -103,6 +103,10 @@ type FsckSegment struct {
 	// ColumnarMismatchRows counts the rows naming no keyed record plus the keyed records
 	// no row names.
 	ColumnarMismatchRows int
+	// ListSectionDamage says which list column of a version 3 payload does not decompress or parse. Those
+	// columns hold lists their records no longer do, so the records reading them fail; repair leaves the
+	// segment alone, and the lists are not dropped.
+	ListSectionDamage string
 	// DictDamaged is true when the segment's attribute dictionary record failed its
 	// checksum. Every record of an interned segment is keyed by it, so none can be read:
 	// Open refuses the dictionary (SegDictCRCFailures), and Repair leaves the segment
@@ -217,7 +221,7 @@ func (r *FsckReport) String() string {
 	}
 	for i := range r.Segments {
 		s := &r.Segments[i]
-		if len(s.Damage) == 0 && s.Sidecar == "ok" && !s.ColumnarUnsupported && s.ColumnarMismatch == "" {
+		if len(s.Damage) == 0 && s.Sidecar == "ok" && !s.ColumnarUnsupported && s.ColumnarMismatch == "" && s.ListSectionDamage == "" {
 			continue
 		}
 		fmt.Fprintf(&b, "  %s: %d records, sidecar %s\n", filepath.Base(s.Path), s.Records, s.Sidecar)
@@ -242,6 +246,10 @@ func (r *FsckReport) String() string {
 			fmt.Fprintf(&b, "    COLUMNAR PAYLOAD DOES NOT MATCH ITS RECORDS (%d row(s) or record(s)): %s; "+
 				"read through it, records would return other records' values; if a repair rewrote "+
 				"this segment, the original is in %s/\n", s.ColumnarMismatchRows, s.ColumnarMismatch, quarantineDir)
+		}
+		if s.ListSectionDamage != "" {
+			fmt.Fprintf(&b, "    LIST COLUMNS DAMAGED: %s; the records of that block hold placeholders for "+
+				"lists stored only there, so reading them fails; repair leaves this segment alone\n", s.ListSectionDamage)
 		}
 		if s.DictDamaged {
 			b.WriteString("    DICTIONARY DAMAGED: every record of this segment is keyed by its attribute " +
@@ -611,6 +619,7 @@ func fsckColOffsets(s *FsckSegment, data []byte, payloadAt int, starts map[int]b
 		s.ColumnarMismatchRows = 1
 		return
 	}
+	fsckListSection(s, cs)
 	inLostFraming := func(o int) bool {
 		for _, d := range s.Damage {
 			if d.Reason == "framing" && o >= d.Offset && o < d.Offset+d.Length {
@@ -655,6 +664,33 @@ func fsckColOffsets(s *FsckSegment, data []byte, payloadAt int, starts map[int]b
 	if bad > 0 {
 		s.ColumnarMismatch = first
 		s.ColumnarMismatchRows = bad
+	}
+}
+
+// fsckListSection checks that every list column of a version 3 payload decompresses and parses into a
+// cell per record. Version 1 and 2 payloads carry list columns only as copies in a trailer, which a reader
+// drops on its own, so only the body's are checked.
+func fsckListSection(s *FsckSegment, cs *colSegment) {
+	if !cs.listsInBody {
+		return
+	}
+	codec, err := NewZSTDCodec(nil) // the region codec (see Collection.regionCodec)
+	if err != nil {
+		return
+	}
+	for i, b := range cs.blocks {
+		if len(b.listIDs) == 0 {
+			continue
+		}
+		raw, err := codec.Decompress(nil, b.listComp)
+		if err != nil {
+			s.ListSectionDamage = fmt.Sprintf("block %d's list columns do not decompress: %v", i, err)
+			return
+		}
+		if _, ok := renderListNodes(b, raw); !ok {
+			s.ListSectionDamage = fmt.Sprintf("block %d's list columns (%s) do not parse", i, strings.Join(b.listNames, ", "))
+			return
+		}
 	}
 }
 

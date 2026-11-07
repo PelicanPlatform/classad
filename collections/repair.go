@@ -182,7 +182,7 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 // already handles it exactly right by stopping there. Rewriting would churn the file
 // for no gain.
 func segmentNeedsRepair(s *FsckSegment) bool {
-	if s.ColumnarMismatch != "" {
+	if s.ColumnarMismatch != "" || s.ListSectionDamage != "" {
 		return true // not rewritable (it is columnarized), but listed so the report names it
 	}
 	for _, d := range s.Damage {
