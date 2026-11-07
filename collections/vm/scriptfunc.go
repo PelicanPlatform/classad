@@ -263,9 +263,23 @@ func (s *Script) inlineCheck(fd *funcDef, v *ast.FunctionCall) error {
 			fd.name, len(fd.params), len(v.Args))
 	}
 	if fd.active {
+		cycle := strings.Join(append(append([]string(nil), s.inlining...), fd.name), " -> ")
+		// A SELF-CALL GETS THE WAY OUT, and a longer cycle does not, because only a self-call has
+		// one. `return f(...)` inside f is compiled as a back edge, so an author whose call is a
+		// step away from that position needs to be told which step. Saying only that recursion has
+		// no end would describe a language this one is not: the same function with the same call
+		// moved into tail position compiles and runs.
+		if s.fn != nil && s.fn.fd == fd {
+			return fmt.Errorf("vm: script: %s is recursive (%s); a call to itself is compiled only "+
+				"in TAIL POSITION, where `return %s(...)` is the whole of what the function returns "+
+				"and becomes a jump back to its own entry. This call's value is needed where it "+
+				"stands, and the only way to have one is an expansion that contains itself",
+				fd.name, cycle, fd.name)
+		}
 		return fmt.Errorf("vm: script: %s is recursive (%s); ClassAd Script expands a call where it "+
-			"is written, and an expansion that contains itself has no end, so recursion cannot be "+
-			"compiled at any depth", fd.name, strings.Join(append(append([]string(nil), s.inlining...), fd.name), " -> "))
+			"is written, and an expansion that contains itself has no end. Only a function's call to "+
+			"ITSELF, in tail position, is compiled as a jump rather than an expansion; a cycle "+
+			"through another function has no such form", fd.name, cycle)
 	}
 	if s.expansions >= maxInlineExpansions {
 		return fmt.Errorf("vm: script: more than %d function calls expanded; every call is expanded "+
