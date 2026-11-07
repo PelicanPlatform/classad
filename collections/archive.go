@@ -876,6 +876,19 @@ func (a *Archive) MarkAutoIndexes(names []string) { a.c.MarkAutoIndexes(names) }
 // provenance alongside the index set itself.
 func (a *Archive) AutoIndexNames() []string { return a.c.AutoIndexNames() }
 
+// CompositeAttrs returns the attribute tuples the archive indexes together. An archive's
+// saved config is authoritative on reopen and rebuilds the whole index set from it, so the
+// composites have to be in it or a tuple the tuner created is gone at the next start.
+func (a *Archive) CompositeAttrs() [][]string { return a.c.CompositeAttrs() }
+
+// AutoCompositeNames returns the tuples of the archive's auto-created composites, the
+// composite half of what AutoIndexNames persists.
+func (a *Archive) AutoCompositeNames() [][]string { return a.c.AutoCompositeNames() }
+
+// MarkAutoComposites records existing composites as auto-created, restoring the provenance a
+// saved config carries without rebuilding anything. See Collection.MarkAutoComposites.
+func (a *Archive) MarkAutoComposites(tuples [][]string) { a.c.MarkAutoComposites(tuples) }
+
 // SetRetention updates the retention bounds at runtime; the next Rotate enforces them.
 func (a *Archive) SetRetention(r Retention) { a.c.SetRetention(r) }
 

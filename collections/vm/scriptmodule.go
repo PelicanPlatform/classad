@@ -38,7 +38,7 @@ import (
 // writes a `def`.
 //
 // A FUNCTION IS COMPILED ON ITS OWN, not as part of a run of something larger. The body is expanded
-// exactly as a call inside a script expands it -- same inliner, same scope rules, same refusal of
+// exactly as a call inside a script expands it -- same inliner, same scope rules, same rule on
 // recursion -- but the parameters are filled from argument VALUES handed in by the caller instead of
 // from argument expressions emitted by a caller's code. That difference is three lines in the
 // inliner and nothing else: everything a script function means is already settled in scriptfunc.go
@@ -121,7 +121,8 @@ func (m *ScriptModule) Functions() []string {
 // values. The name folds case, as a call does.
 //
 // The function may call the module's other functions; the inliner expands those exactly as it does
-// inside a script, so recursion is refused here for the reason it is refused there.
+// inside a script, so recursion is treated here exactly as it is treated there: a call to itself in
+// tail position is a jump back to the entry, and every other cycle is refused by naming it.
 //
 // It also applies the purity gate. A function that reaches the ad is refused HERE rather than at
 // registration because the compiled form has no ad to reach: there is no subject, so an attribute

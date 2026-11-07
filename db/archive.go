@@ -77,7 +77,6 @@ type ArchiveConfig struct {
 	// whole-segment query pruning (value-indexed attributes are included automatically).
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
-
 	// Unordered drops this archive's newest-first read order (collections.ArchiveOptions.
 	// Unordered). An archive that is a history file must leave it alone: condor_history's
 	// order is this table's whole contract. An archive whose rows are only aggregated or
@@ -93,6 +92,20 @@ type ArchiveConfig struct {
 	// from a restart indistinguishable from one someone asked for -- exempt from trimming
 	// and from any future auto-drop, permanently, on the strength of nothing.
 	AutoAttrs []string
+	// CompositeAttrs configures composite (multi-column) indexes over attribute TUPLES (see
+	// collections.ArchiveOptions.CompositeAttrs). Each tuple's attributes must also be indexed
+	// in their own right, or the tuple is refused at open.
+	//
+	// It is persisted with the rest of the index set, and for the same reason: this file is
+	// authoritative on reopen and rebuilds the whole set from it, so a composite missing from
+	// it is a composite that does not come back -- along with the sidecar rebuild that creating
+	// it paid for.
+	CompositeAttrs [][]string `json:",omitempty"`
+	// AutoComposites names the subset of CompositeAttrs the auto-tuner created, as AutoAttrs
+	// does for the single-attribute indexes. Without it a composite the tuner created returns
+	// from a restart indistinguishable from a configured one: no longer trimmable by the
+	// memory budget, no longer droppable when nothing demands its tuple, permanently.
+	AutoComposites [][]string `json:",omitempty"`
 	// AutoHotAttrs names the hot attributes the demand-driven refresh (RefreshHotSet)
 	// installed on top of HotAttrs, and is the hot-set counterpart of AutoAttrs: on reopen
 	// the live set is HotAttrs plus these.
@@ -293,6 +306,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*Arc
 		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
 		CategoricalAttrs:    categorical,
 		ValueAttrs:          value,
+		CompositeAttrs:      cfg.CompositeAttrs,
 		ZoneAttrs:           cfg.ZoneAttrs,
 		SchemaRequireAttrs:  cfg.SchemaRequireAttrs,
 		IndexBackfillBytes:  cfg.backfillHorizon(),
@@ -311,6 +325,14 @@ func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*Arc
 	// provenance.
 	if len(cfg.AutoAttrs) > 0 {
 		a.MarkAutoIndexes(cfg.AutoAttrs)
+	}
+	// The composites came back from CompositeAttrs above, configured and so human; re-mark
+	// the tuner's. Marking rather than adding, for the reason the indexes above are marked:
+	// they already exist by now, and an auto add would be refused as a tuple already covered.
+	// A tuple whose composite was refused at open (a component sealed since, or dropped) marks
+	// nothing, which is correct -- there is no composite to attribute.
+	if len(cfg.AutoComposites) > 0 {
+		a.MarkAutoComposites(cfg.AutoComposites)
 	}
 	// Restore the demand-refreshed hot attributes on top of the human-configured ones, so a
 	// refresh does not silently reset to the creation-time set on every restart. Merged, not
@@ -1242,10 +1264,16 @@ func (t *ArchiveTable) DropIndex(names ...string) bool {
 // because AddIndex normalizes them (a name given as both kinds, or already indexed as the
 // other kind, lands as categorical). Mirrors DB.saveIndexConfig, including its best-effort
 // contract: a write failure is ignored, leaving the change live for this run but unpersisted.
+//
+// The composites go with them, set and provenance both. A composite is refused at open
+// unless its components are indexed, so the two have to be written by the same call or a
+// save that caught one and missed the other would reopen into a tuple with nothing to
+// resolve against.
 func (t *ArchiveTable) saveIndexConfig() {
 	_ = t.cfg.update(func(cfg *ArchiveConfig) { //nolint:errcheck // best-effort by contract, as the comment above says
 		cfg.CategoricalAttrs, cfg.ValueAttrs = t.a.IndexedAttrs()
 		cfg.AutoAttrs = t.a.AutoIndexNames()
+		cfg.CompositeAttrs, cfg.AutoComposites = t.a.CompositeAttrs(), t.a.AutoCompositeNames()
 	})
 }
 
@@ -1400,6 +1428,11 @@ func (t *ArchiveTable) HasSealedSidecar() bool { return t.a.HasSealedSidecar() }
 
 // IndexedAttrs returns the archive's categorical and value index attributes.
 func (t *ArchiveTable) IndexedAttrs() (categorical, value []string) { return t.a.IndexedAttrs() }
+
+// CompositeAttrs returns the archive's composite index tuples, each in its configured order.
+// As with a single-attribute index, these are built only in a sealed segment's sidecar, so
+// HasSealedSidecar is what says whether any of them can answer a probe yet.
+func (t *ArchiveTable) CompositeAttrs() [][]string { return t.a.CompositeAttrs() }
 
 // ZoneAttrs returns the attributes carrying per-segment [min,max] zone maps, on which a
 // range query prunes whole segments rather than only postings.
