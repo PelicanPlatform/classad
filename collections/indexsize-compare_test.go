@@ -33,13 +33,23 @@ type idxFixture struct {
 	tailProcs  int      // procs per ordinary (tail) cluster
 	hosts      []string // submit hosts, assigned per cluster
 	domCluster int
+	// mixedHosts capitalizes the first mixedHosts entries of hosts, which leaves every key
+	// length, every posting and every sketch alone and changes only whether a key is
+	// spelled as its folded form. It is the fallback arm for the exact-case measurement:
+	// capitalizing one host of eight is the shape where only part of an attribute's keys
+	// are their own folded spelling.
+	mixedHosts int
 }
 
 // globalJobID renders an HTCondor GlobalJobId: "<schedd>#<cluster>.<proc>#<QDate>".
 // QDate is the cluster's submit time advanced in materialization waves of 1000 procs,
 // so a big cluster's ids share a long prefix but not a single timestamp.
 func (f idxFixture) globalJobID(cluster, proc int) string {
-	host := f.hosts[cluster%len(f.hosts)]
+	h := cluster % len(f.hosts)
+	host := f.hosts[h]
+	if h < f.mixedHosts {
+		host = strings.ToUpper(host[:1]) + host[1:]
+	}
 	qdate := 1699000000 + cluster%100000 + (proc/1000)*37
 	return fmt.Sprintf("%s#%d.%d#%d", host, cluster, proc, qdate)
 }
@@ -184,10 +194,14 @@ func sidecarBreakdown(t *testing.T, c *Collection) idxBreakdown {
 				}
 				blobLen := binary.LittleEndian.Uint32(data[off+12+4*n:]) // keyOffs[n]
 				exAt := bmBase + 4*n + blobLen
-				exN := binary.LittleEndian.Uint32(data[exAt:])
-				exBase := exAt + 4 + 4*(exN+1)
-				for j := uint32(0); j < exN; j++ {
-					add(binary.LittleEndian.Uint32(data[exBase+4*j:]))
+				// A block whose exact-case run mirrors the folded run carries the marker
+				// instead of the arrays, and its exact postings are the folded ones already
+				// counted.
+				if exN := binary.LittleEndian.Uint32(data[exAt:]); exN != exactRunMirrorsFolded {
+					exBase := exAt + 4 + 4*(exN+1)
+					for j := uint32(0); j < exN; j++ {
+						add(binary.LittleEndian.Uint32(data[exBase+4*j:]))
+					}
 				}
 			}
 			for _, id := range valIDs {
@@ -433,11 +447,12 @@ func reportIdxRoutes(t *testing.T, label string, f idxFixture) {
 	for _, r := range results {
 		t.Logf("%-10s %9d %7d %14d %14d %14d %14d %10d %10d", r.name, r.records, r.segments, r.sealedIdx, r.liveIdx, r.dir, r.dataBytes, r.mph, r.bloom)
 	}
-	// The categorical key blob is raw, uncompressed, sorted text, and the exact-case run
-	// holds a SECOND full copy of every key (it reuses the folded bitmap, not the folded
-	// text). So Route B's block is predicted by arithmetic on the raw strings alone -- no
-	// prefix sharing enters it. Predicting it to within the per-segment sketches is what
-	// says the "these strings compress hard" premise does not hold here.
+	// The categorical key blob is raw, uncompressed, sorted text. These keys are all
+	// lower-case, so the exact-case run mirrors the folded run and costs a marker rather
+	// than a second copy; what is left is one copy of every key plus its two offsets. So
+	// Route B's block is predicted by arithmetic on the raw strings alone -- no prefix
+	// sharing enters it. Predicting it to within the per-segment sketches is what says the
+	// "these strings compress hard" premise does not hold here.
 	var wantKeyText int64
 	for i := 0; i < f.n; i++ {
 		var cluster, proc int
@@ -447,13 +462,13 @@ func reportIdxRoutes(t *testing.T, label string, f idxFixture) {
 		} else {
 			cluster, proc = f.domCluster, i-i/f.domFrac
 		}
-		wantKeyText += int64(2*len(f.globalJobID(cluster, proc))) + 16
+		wantKeyText += int64(len(f.globalJobID(cluster, proc))) + 8
 	}
 	gotMeta := results[3].bd.parts["GlobalJobId"].meta
-	t.Logf("RouteB GlobalJobId block meta=%d; 2*rawKeyText+16B/key predicts %d (%.1f%%); residual %d = bloom+MPH+segStats",
+	t.Logf("RouteB GlobalJobId block meta=%d; rawKeyText+8B/key predicts %d (%.1f%%); residual %d = bloom+MPH+segStats",
 		gotMeta, wantKeyText, 100*float64(wantKeyText)/float64(gotMeta), gotMeta-wantKeyText)
 	if gotMeta < wantKeyText {
-		t.Fatalf("GlobalJobId block (%d) is SMALLER than the raw key text it should hold twice (%d): the layout assumption is wrong", gotMeta, wantKeyText)
+		t.Fatalf("GlobalJobId block (%d) is SMALLER than the raw key text it should hold once (%d): the layout assumption is wrong", gotMeta, wantKeyText)
 	}
 	t.Logf("")
 	t.Logf("%-10s %16s %16s %16s", "config", "marg sealedIdx", "marg dirBytes", "B/record(sealed)")
