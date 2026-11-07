@@ -451,9 +451,9 @@ func (si *mmapSegIndex) prefixKeyCount(up usableProbe) (int, bool) {
 // walks the same three arrays without caring which layout it got. end is the first byte past
 // the run, where the bloom begins.
 //
-// Deliberately the only place that knows the marker. The walk to the bloom, the =?= search
-// and the canonical-value iteration each used to re-derive these bases from the block header,
-// and three copies of a layout rule is three places for a format addition to be missed.
+// Deliberately the only place that knows the marker: the walk to the bloom, the =?= search
+// and the canonical-value iteration all reach the run through here, because three copies of
+// a layout rule are three places for the next format addition to be missed.
 func (si *mmapSegIndex) catExactRun(attrOff uint32) (n, keyOffBase, bmOffBase, blobBase, end uint32) {
 	d := si.data
 	fn, fKeyOffBase, fBmOffBase, fBlobBase := si.catKeyBases(attrOff)

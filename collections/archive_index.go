@@ -305,8 +305,10 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 	b = appendU32(b, uint32(len(catBlks)))
 	catSlot := make([]int, len(catBlks))
 	catStatsSlot := make([]int, len(catBlks))
-	for i, cb := range catBlks {
-		b = appendU32(b, cb.id)
+	// By index: catBlk is wide enough that copying one per iteration is worth avoiding, and
+	// these loops only read a few fields of it.
+	for i := range catBlks {
+		b = appendU32(b, catBlks[i].id)
 		catSlot[i] = len(b)
 		b = appendU32(b, 0)
 		catStatsSlot[i] = len(b)
@@ -342,7 +344,8 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		compSlot[i] = len(b)
 		b = appendU32(b, 0)
 	}
-	for i, cb := range catBlks {
+	for i := range catBlks {
+		cb := &catBlks[i]
 		binary.LittleEndian.PutUint32(b[catSlot[i]:], uint32(len(b)))
 		b = appendU32(b, cb.excOff)
 		b = appendU32(b, cb.postedOff) // presence: is/isnt undefined
