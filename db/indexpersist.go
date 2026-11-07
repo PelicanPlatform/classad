@@ -42,6 +42,17 @@ type persistedIndexConfig struct {
 	// for. The first is visible and reversible, the second is neither.
 	Hot     []string `json:"hot,omitempty"`
 	AutoHot []string `json:"autoHot,omitempty"`
+	// AutoComposites lists the composite (multi-column) indexes the auto-tuner created, as
+	// attribute tuples. It is the composite half of Auto above, and it is needed for the same
+	// reason: a composite that comes back unmarked is exempt from the memory-budget trim and
+	// from the unused-drop for the rest of its life, having been created by a guess.
+	//
+	// Only the auto tier, where Categorical/Value carry the whole index set. Nothing
+	// configures a composite on a mutable table -- Config names none and there is no runtime
+	// add for one -- so every composite here is the tuner's and listing the set twice would
+	// say nothing. If a configured tier is added later it comes back from Config on the next
+	// open, as HotAttrs does, and this field still means what it says.
+	AutoComposites [][]string `json:"autoComposites,omitempty"`
 	// Encrypted lists the explicitly encrypted attributes (the human-toggled set, not
 	// the always-on private attributes). Restoring it keeps a runtime encryption-policy
 	// change consistent across restarts -- and, in HA, lets a follower converge on the
@@ -118,7 +129,8 @@ func (db *DB) deriveIndexConfig(humanHot []string) persistedIndexConfig {
 	cat, val := db.c.IndexedAttrs()
 	cfg := persistedIndexConfig{
 		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(),
-		Hot: humanHot, AutoHot: autoHotNames(humanHot, db.c.HotAttrNames()),
+		AutoComposites: db.c.AutoCompositeNames(),
+		Hot:            humanHot, AutoHot: autoHotNames(humanHot, db.c.HotAttrNames()),
 		Encrypted: db.c.EncryptedAttrNames(), SchemaRequire: db.c.SchemaRequireRuntimeAttrs(),
 	}
 	if o, on := db.c.TimeTravelConfig(); on {
@@ -203,6 +215,14 @@ func (db *DB) loadIndexConfig() {
 	}
 	if len(addCatA) > 0 || len(addValA) > 0 {
 		db.c.AddAutoIndex(addCatA, addValA)
+		changed = true
+	}
+	// After the single-attribute adds and before the rebuild: a composite is refused unless
+	// every component is already indexed, and adding it here rather than afterwards folds its
+	// generation bump into the one Reindex below rather than leaving every segment stale until
+	// the next pass. A tuple whose component did not come back is dropped, which is what the
+	// refusal is for; the next AutoTune pass re-derives it from demand if it is still wanted.
+	if len(cfg.AutoComposites) > 0 && db.c.AddAutoComposites(cfg.AutoComposites) {
 		changed = true
 	}
 	if changed {
