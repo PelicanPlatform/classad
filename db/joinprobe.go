@@ -154,6 +154,12 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 		stats.syncFirstProbe()
 		return out
 	}
+	// A step narrowing on several attributes may be able to narrow on the whole key at once,
+	// through a composite index over exactly those attributes. Decided here, before the scan,
+	// because it changes what the scan has to COLLECT: the per-attribute form wants each
+	// attribute's distinct values, the tuple form wants the distinct tuples, and the second
+	// cannot be recovered from the first.
+	tprobes := cat.planTupleProbes(cands, sides, p.steps)
 
 	// Now the part that costs a scan. The FROM side is held either way from here: if every
 	// probe is declined below, it is handed back to be streamed from memory, so the scan is
@@ -199,6 +205,27 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 				c.lits = append(c.lits, lit)
 			}
 		}
+		for _, tp := range tprobes {
+			if len(tp.terms) > maxProbeKeys {
+				continue // already past the cap; keep reading so the held side stays complete
+			}
+			sp := p.steps[tp.step]
+			lits := make([]string, 0, len(tp.equis))
+			for _, k := range tp.equis {
+				v, ok := p.rowHalfValueAt(sp, rows, k)
+				if !ok {
+					break
+				}
+				lit, ok := joinKeyLiteral(v)
+				if !ok {
+					break
+				}
+				lits = append(lits, lit)
+			}
+			if len(lits) == len(tp.equis) {
+				tp.add(lits)
+			}
+		}
 	}
 	out.held = held
 
@@ -217,6 +244,27 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	// conjunction is as sound a superset filter as any one of them, and strictly narrower.
 	for _, g := range groupByStep(cands) {
 		st := &stats.ProbeSteps[g[0].step]
+		// The whole key as one spine of tuples, where that pays. Preferred over the
+		// per-attribute form rather than compared with it: the spine admits exactly the
+		// tuples the FROM side holds where the conjunction of in-chains admits their cross
+		// product, so when both are affordable the spine is the narrower of the two by
+		// construction -- and when it would admit the cross product anyway, its own gate
+		// declines it.
+		if tp := tprobes[g[0].step]; tp != nil {
+			tp.cross = crossProduct(g)
+			cons, why := tp.constraint()
+			if why == "" {
+				out.cons[tp.step] = cons
+				st.Attr = strings.Join(tp.attrs, ", ")
+				st.Tuple = tp.label()
+				st.TupleComposite = len(tp.composite) > 0
+				st.Keys = len(tp.terms)
+				continue
+			}
+			// Declined, but the per-attribute form is priced separately and may still pay,
+			// so this is recorded beside that decision rather than instead of it.
+			st.TupleWhy = why
+		}
 		keys, lookups := 0, 0
 		for _, c := range g {
 			keys += len(c.lits)
