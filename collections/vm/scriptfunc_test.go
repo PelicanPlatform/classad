@@ -263,8 +263,12 @@ func TestScriptFuncMayNotShadowAUDF(t *testing.T) {
 }
 
 // TestScriptFuncRefusesRecursion pins guard two, and that the message names the cycle.
+//
+// The self-call here has work left after it, which is what makes it an expansion that has no end. A
+// self-call in TAIL position is a back edge to the function's own entry and compiles; see
+// scripttail_test.go, which pins every other position against this refusal one at a time.
 func TestScriptFuncRefusesRecursion(t *testing.T) {
-	msg := refuses(t, "def f(v):\n    return f(v)\n\nresult = f(1)\n")
+	msg := refuses(t, "def f(v):\n    return f(v) + 1\n\nresult = f(1)\n")
 	for _, want := range []string{"recursive", "f -> f"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("direct recursion refusal %q lacks %q", msg, want)

@@ -108,6 +108,15 @@ type Program struct {
 	// path rather than running a shape it would read as some other construct.
 	hasLoopJump bool
 
+	// hasTailCall marks a program holding a self-tail-call, whose back edge goes to the first
+	// instruction of a function body. It is set by the script builder for the vector executor, which
+	// reads control flow by REGION: a While is recognised by the conditional at its header, and that
+	// conditional is what drops the records it has become false for from the live set. A function
+	// entry has no conditional on it, so there is nothing for the lockstep walk to shrink the batch
+	// by, and a tail call written in one arm of an If would take the whole batch backwards with the
+	// other arm unrun. See execVec, which declines such a program to the per-record path.
+	hasTailCall bool
+
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick
 	// the hot-header fast path; nil-safe to ignore.

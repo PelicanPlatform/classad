@@ -46,6 +46,31 @@ import (
 // is not known then. A call that reaches itself, directly or through other functions, is a compile
 // error naming the cycle.
 //
+// ONE RECURSIVE CALL NEEDS NO EXPANSION: `return f(...)` inside f, where the call's value IS the
+// function's value and nothing is left to do with it. Such a call needs no second copy of the body
+// and no frame to come back to, because a local here is a PLACE -- one register for the life of the
+// program -- so the next activation wants the registers this one is using:
+//
+//	<the new arguments, each into a temporary>
+//	store  f#1.tail1.n            ; all of them, BEFORE any parameter is written
+//	...
+//	load   f#1.tail1.n            ; then copy the temporaries into the parameters
+//	store  f#1.n
+//	jmp    f#1.reentry            ; clear the activation and go back to the body's first instruction
+//
+// That is the back edge a `while` already emits, pointed at a function's entry rather than a loop's
+// header, which is why it costs the rest of the compiler nothing: no frame-relative addressing on
+// the interpreter's hot path, no second call mechanism, and no barrier that liveness and CSE have to
+// stop at. The temporaries are not an optimization to remove -- see tailCall. What bounds a
+// tail-recursive function is what bounds a `while`: the step budget, with no compile-time depth to
+// know and nothing else to check.
+//
+// NOTHING ELSE BECOMES LEGAL. Mutual recursion still has nowhere to jump to, since the jump goes to
+// an entry this expansion owns and f's expansion is not g's. A self-call whose value feeds anything
+// -- `return f(x) + 1`, `return g(f(x))`, a call in a binding or a condition -- still has to produce
+// a value where it stands, and the only way to produce one is the expansion that has no end. Both
+// keep the refusal above.
+//
 // REGISTERS ARE ALLOCATED ONCE FOR THE WHOLE PROGRAM, so each expansion gets its own: two calls to
 // the same function are two independent sets of parameter, body-local and result registers. They
 // are named for the call -- `over_cap#2.cap` -- so a register dump says which call a value belongs
@@ -66,6 +91,30 @@ type inlineFrame struct {
 	retReg   int32
 	retJumps []int   // the `return` jumps waiting for the epilogue's address
 	bodyRegs []int32 // registers the body bound, for the per-instance reset inside a loop
+
+	// fd is the definition being expanded. A `return` compares its call's name against it, and
+	// against nothing else: that comparison is the whole of what makes a tail call findable.
+	fd *funcDef
+
+	// paramRegs are the parameter registers in declaration order, which is where a tail call puts
+	// the next activation's arguments.
+	paramRegs []int32
+
+	// entry is the body's first instruction, where a tail call resumes.
+	entry int32
+
+	// firstLocal is the first program local allocated while this body was being emitted. Everything
+	// from there to the end of the body belongs to this activation -- the body's own locals, the
+	// registers of calls nested inside it, a `for`'s counters -- which is what the re-entry block
+	// clears. It is a RANGE rather than a list because the list would have to be collected by every
+	// construct that allocates a register, and one that forgot would leak a value into the next
+	// activation silently.
+	firstLocal int32
+
+	// tailJumps are the self-tail-calls' jumps, waiting for the re-entry block's address, and tails
+	// counts them so each one's argument temporaries have a name of their own.
+	tailJumps []int
+	tails     int
 }
 
 // maxInlineExpansions bounds how many calls one script may expand.
@@ -145,6 +194,11 @@ func (s *Script) defineFunc(name string, params []string, body func(*Script), re
 
 // Return ends the enclosing function body with expr's value. A nil expr returns UNDEFINED, which is
 // also what falling off the end of a body does.
+//
+// A return of a call to the function being expanded is a TAIL CALL: the next activation's arguments
+// are computed, the parameters are overwritten and control goes back to the body's first
+// instruction. It is the only recursive call a script may make, and the only one that needs neither
+// a second expansion nor a frame. See tailSelfCall for exactly which returns qualify.
 func (s *Script) Return(expr ast.Expr) *Script {
 	s.stage(func() { s.returnNow(expr) })
 	return s
@@ -156,6 +210,12 @@ func (s *Script) returnNow(expr ast.Expr) {
 	}
 	if s.fn == nil {
 		s.err = errors.New("vm: script: 'return' outside a function body")
+		return
+	}
+	// Recognised before anything is emitted, because a tail call emits something else entirely: it
+	// leaves no value for the store below and jumps backwards rather than forwards.
+	if call := s.tailSelfCall(expr); call != nil {
+		s.tailCall(call)
 		return
 	}
 	// A BARE RETURN STORES NOTHING ON PURPOSE. The result register is read once, at the epilogue,
@@ -226,6 +286,7 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 	frame := &inlineFrame{
 		prefix: fmt.Sprintf("%s#%d.", fd.name, s.expansions),
 		retReg: s.newFuncReg(fmt.Sprintf("%s#%d.return", fd.name, s.expansions)),
+		fd:     fd,
 	}
 
 	// The arguments, in the CALLER's scope: left to right, each evaluated once into its parameter's
@@ -241,6 +302,7 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 		params[foldLocal(p)] = reg
 		paramLocals[i] = reg
 	}
+	frame.paramRegs = paramLocals
 
 	// An expansion inside a loop runs more than once, and its registers are the program's, written
 	// once and never cleared. The result register of a call that returns nothing this time round
@@ -249,11 +311,13 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 	// known until it has been emitted -- hence the jump out and back.
 	reset := s.loopDepth > 0
 	var jToReset int
-	var bodyStart int
 	if reset {
 		jToReset = s.c.ins(OpJmpVoid, -1)
-		bodyStart = len(s.c.p.code)
 	}
+	// The body's first instruction, and the first register it will allocate. A tail call needs both:
+	// one to go back to, the other to say what belongs to the activation it is leaving.
+	frame.entry = int32(len(s.c.p.code))
+	frame.firstLocal = int32(len(s.c.p.locals))
 
 	// The loop stack is cleared for the body, not just the name map: a `break` in the body is bound
 	// by a loop in the BODY, never by the loop this call happens to sit inside. See Script.Break.
@@ -270,6 +334,12 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 	s.byName, s.fn, s.loops = outerByName, outerFrame, outerLoops
 	s.c.locals = s.byName
 
+	// Written after the body for the same reason the per-call reset below is: what it clears is not
+	// known until the body has been emitted.
+	if len(frame.tailJumps) > 0 {
+		s.emitReentry(frame)
+	}
+
 	jumps := frame.retJumps
 	if reset {
 		jEnd := s.c.ins(OpJmpVoid, -1)
@@ -278,7 +348,7 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 			s.c.ins(OpPushUndef, 0)
 			s.c.ins(OpStoreLocal, reg)
 		}
-		s.c.ins(OpJmpVoid, int32(bodyStart))
+		s.c.ins(OpJmpVoid, frame.entry)
 		jumps = append(jumps, jEnd)
 	} else {
 		// A body whose last statement is a return ends in a jump to the instruction that follows
@@ -304,6 +374,114 @@ func (s *Script) inline(fd *funcDef, args []ast.Expr) []int32 {
 func (s *Script) newFuncReg(display string) int32 {
 	s.c.p.locals = append(s.c.p.locals, display)
 	return int32(len(s.c.p.locals) - 1)
+}
+
+// tailSelfCall reports the call a `return` returns when that call is the function currently being
+// expanded and its value is the function's value -- the one recursive position that needs no
+// expansion. It returns nil for every other `return`.
+//
+// THE TEST IS DELIBERATELY NARROW: the WHOLE of the returned expression is a call, and the call
+// resolves to the innermost definition being expanded. Resolution is the same map lookup an ordinary
+// call does, so a tail call folds case exactly as every other call does.
+//
+// `return f(x) + 1`, `return g(f(x))`, `return f(x) ? a : b` and a call in a binding or a condition
+// are not among them, and the line between is not a matter of degree: each of those needs the call's
+// value AS A VALUE in the middle of something else, and the only way to have one is the expansion
+// that has no end. A parenthesised call, `return (f(x))`, is not accepted either. It would be sound
+// to accept, and it is left out so that the rule stays one a reader checks by looking at the line
+// rather than at a parse tree -- the cost of being wrong here is a recursion that quietly computes
+// something other than what it says, and the cost of being too strict is a pair of brackets.
+//
+// AN ARITY MISMATCH IS NOT A TAIL CALL. Letting it fall through to the ordinary expansion is what
+// gets it the arity refusal, which names both counts, rather than one about recursion.
+func (s *Script) tailSelfCall(expr ast.Expr) *ast.FunctionCall {
+	if s.fn == nil || s.fn.fd == nil {
+		return nil
+	}
+	call, ok := expr.(*ast.FunctionCall)
+	if !ok || s.funcs[strings.ToLower(call.Name)] != s.fn.fd {
+		return nil
+	}
+	if len(call.Args) != len(s.fn.fd.params) {
+		return nil
+	}
+	return call
+}
+
+// tailCall compiles `return f(...)` where f is the function being expanded: the next activation's
+// arguments are computed, the parameters are overwritten with them, and control goes back to the
+// body's first instruction by way of the re-entry block.
+//
+// IT PUSHES NOTHING, which is what makes it a tail call rather than a call. An ordinary expansion
+// leaves one value for the `return` to store; here the store and the epilogue are both unreachable
+// from this point, so there is nothing to leave. The statement is still stack-neutral -- each
+// argument is pushed and immediately stored -- so the value stack at the jump is the one the entry
+// was reached with, which is the same invariant the back edge of a `while` rests on.
+//
+// THE ARGUMENTS GO THROUGH TEMPORARIES, and that is the one part of this that is not obvious. An
+// argument expression usually reads a parameter, and the parameters are the registers being written.
+// Writing them one at a time would let an earlier write be read by a later argument: `return f(b, a)`
+// would store the new first argument into b's register and then read THAT register for the second,
+// so a function that swaps its arguments would duplicate one instead. Evaluating every argument
+// before any parameter is written is the only order that is right for every argument list, and it is
+// not worth a special case for the lists where it does not matter -- the lowering's own liveness
+// sees straight through a copy that nothing else reads.
+func (s *Script) tailCall(call *ast.FunctionCall) {
+	frame := s.fn
+	frame.tails++
+	tag := fmt.Sprintf("%stail%d.", frame.prefix, frame.tails)
+
+	tmps := make([]int32, len(call.Args))
+	for i, arg := range call.Args {
+		tmps[i] = s.newFuncReg(tag + frame.fd.params[i])
+		s.emitExpr(arg)
+		s.c.ins(OpStoreLocal, tmps[i])
+	}
+	for i, tmp := range tmps {
+		s.c.ins(OpLoadLocal, tmp)
+		s.c.ins(OpStoreLocal, frame.paramRegs[i])
+	}
+	s.c.p.hasStatements = true
+	s.c.p.hasTailCall = true
+	frame.tailJumps = append(frame.tailJumps, s.c.ins(OpJmpVoid, -1))
+}
+
+// emitReentry lays out the block a self-tail-call jumps to: the activation's registers are cleared
+// and control returns to the body's first instruction.
+//
+// THE PARAMETERS ARE NOT CLEARED. The tail call has just written the next activation's arguments
+// into them, and they are the only thing that crosses the back edge -- which is the whole of what a
+// frame would otherwise have carried.
+//
+// EVERYTHING ELSE IS, because the next trip is a fresh activation of the body rather than another
+// turn of a loop the author wrote. A local the body binds on one path and reads on another has to
+// read UNDEFINED again, as it would in a second call; so does the result register of a call NESTED
+// in the body, which a bare `return` inside that call leaves untouched and which nothing the author
+// can write could put right. The range covers both, and the argument temporaries besides -- cleared
+// after they have been copied into the parameters, which costs an instruction and keeps the rule
+// "everything this activation allocated" true with no exceptions to maintain.
+//
+// THE CLEAR IS ALSO WHAT CHARGES THE BACK EDGE. OpPushUndef is a value operation, so a trip costs at
+// least one charged step even for a function that takes no arguments and computes nothing: that is
+// what makes `def f(): return f()` end at the step budget instead of running forever, and it is the
+// same guarantee a `while` gets from having to evaluate a condition.
+func (s *Script) emitReentry(frame *inlineFrame) {
+	// The body falls through to whatever comes after it, so the block needs jumping over rather
+	// than appending.
+	jOver := s.c.ins(OpJmpVoid, -1)
+	block := len(s.c.p.code)
+	end := int32(len(s.c.p.locals))
+	s.c.ins(OpPushUndef, 0)
+	s.c.ins(OpStoreLocal, frame.retReg)
+	for reg := frame.firstLocal; reg < end; reg++ {
+		s.c.ins(OpPushUndef, 0)
+		s.c.ins(OpStoreLocal, reg)
+	}
+	s.c.ins(OpJmpVoid, frame.entry)
+	s.c.patch(jOver, len(s.c.p.code))
+	for _, j := range frame.tailJumps {
+		s.c.patch(j, block)
+	}
 }
 
 // fail records the first error. Later ones are almost always consequences of it.

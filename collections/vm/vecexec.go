@@ -343,6 +343,14 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 		// case cannot be read as the first.
 		return nil, false
 	}
+	if p.hasTailCall {
+		// A self-tail-call. Its back edge goes to a function body's entry, which is not a loop
+		// header this walk ever opened a region for, and the records going round it are not the
+		// records of any one region: a tail call in an If arm would carry the batch backwards while
+		// the other arm still had records waiting to run. Declining is the whole answer, and it
+		// costs the scalar path nothing, which is where a recursive script is running anyway.
+		return nil, false
+	}
 	if p.hasStatements {
 		s.initPredicates()
 	}

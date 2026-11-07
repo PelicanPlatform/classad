@@ -161,8 +161,11 @@ func TestScriptFuncCallsSibling(t *testing.T) {
 	}
 }
 
+// TestScriptFuncRecursionRefused pins that a module's inliner refuses a cycle exactly as a script's
+// does. The self-call has work left after it; one in tail position is a back edge and compiles, which
+// TestScriptTailCallInAModule covers.
 func TestScriptFuncRecursionRefused(t *testing.T) {
-	m, err := ParseScriptModule("def loop(x):\n    return loop(x)\n")
+	m, err := ParseScriptModule("def loop(x):\n    return loop(x) * 2\n")
 	if err != nil {
 		t.Fatalf("ParseScriptModule: %v", err)
 	}
