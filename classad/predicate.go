@@ -56,6 +56,14 @@ import "github.com/PelicanPlatform/classad/ast"
 //     in Values; it has no expression-level form, and for CurrentTime the evaluator
 //     reads a resolver's undefined as "the ad does not define it". Nothing here can
 //     reproduce that.
+//   - A PARTIAL resolver (SetPartialResolver) ANSWERED the reference. It too speaks in
+//     Values, so an operand it answers has one already. The reference it DECLINES is
+//     not a decline here: the overlay exists to answer the few names a script bound
+//     and to leave the rest to the ad, so those names resolve through this path as
+//     they would with nothing installed. Getting that wrong is silent rather than
+//     loud -- an overlay the fast path forgets to consult reads the ad's value and
+//     the comparison comes out the other way -- which is why the differential below
+//     runs its whole input space under overlays as well as without one.
 //   - The reference names CurrentTime. Whether the ad defines it changes the answer,
 //     not just its value, and an undefined-but-defined CurrentTime is distinguishable
 //     from an absent one. evaluateCurrentTime owns that; this file does not duplicate it.
@@ -487,6 +495,10 @@ func (e *Evaluator) operandLiteral(expr ast.Expr, lit *litOperand, val *Value) b
 // and only then the target ad's chain -- the old-ClassAd matchmaking fallthrough that
 // lets a startd's START expression name job attributes unqualified.
 //
+// An installed overlay (SetPartialResolver) is offered the reference first, exactly
+// where resolveAttributeReference offers it, and only a name it declines is resolved
+// against the scopes below.
+//
 // A reference that resolves to nothing is undefined, which is a literal operand and
 // not a decline: an absent attribute is a large share of real constraints
 // (`TARGET.HasDocker` on a machine that has none) and answering it here is the point.
@@ -498,14 +510,40 @@ func (e *Evaluator) operandLiteral(expr ast.Expr, lit *litOperand, val *Value) b
 // non-literal expression.
 func (e *Evaluator) refOperand(ref *ast.AttributeReference, lit *litOperand, val *Value) bool {
 	norm := ref.NormalizedName()
-	if e.resolver != nil || e.partial != nil || norm == currentTimeAttr {
+	if norm == currentTimeAttr {
+		// Whether the scope DEFINES CurrentTime changes the answer and not merely
+		// the value, which evaluateCurrentTime owns -- including how a partial
+		// resolver and a full one each interact with it. Hand the whole reference
+		// back rather than restate any of that here.
+		*val = e.Evaluate(ref)
+		return false
+	}
+	if e.partial != nil {
+		if v, ok := e.partial(ref.Name, ref.Scope); ok {
+			// Answered: the overlay speaks in Values, so this operand has one and
+			// the comparison takes the ordinary path from here.
+			*val = v
+			return false
+		}
+		// Declined, which is the case worth having: an overlay answers the handful
+		// of names a script bound and leaves every attribute the ad holds to the ad.
+		// Fall through exactly as resolveAttributeReference does -- a full resolver
+		// if one is installed, otherwise the scope resolution below.
+	}
+	if e.resolver != nil {
 		// A custom resolver replaces scope resolution entirely and speaks only in
 		// Values (see SetResolver, whose CurrentTime contract in particular has no
-		// expression-level form). CurrentTime has the separate problem that whether
-		// the scope DEFINES it changes the answer and not merely the value, which
-		// evaluateCurrentTime owns. Neither has had any work done here yet, so both
-		// hand the whole reference back to the ordinary path.
-		*val = e.Evaluate(ref)
+		// expression-level form). Nothing here can reproduce that, so the operand is
+		// whatever the resolver says.
+		//
+		// Called here rather than by handing the reference to Evaluate, which would
+		// re-enter resolveAttributeReference and offer it to a declining overlay a
+		// SECOND time -- fn is the caller's code and nothing in its contract makes
+		// it free of effects or cheap to run twice. The one thing skipped along with
+		// Evaluate is its depth++ for the reference node, which is the same unit the
+		// path already does not charge for the reference and the literal under it,
+		// and so is covered by predicateDepthMargin rather than adding to it.
+		*val = e.resolver(ref.Name, ref.Scope)
 		return false
 	}
 	switch ref.Scope {
