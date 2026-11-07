@@ -282,7 +282,9 @@ func Open(opts Options) (*Collection, error) {
 	// Indexes on a persistent collection are in-memory only (rebuilt on recovery, see
 	// below). Replace the interned spec New built with an inline one that extracts
 	// values by name (records carry no intern ids).
-	c.spec.Store(newInlineIndexSpec(opts.CategoricalAttrs, opts.ValueAttrs))
+	inlineSpec := newInlineIndexSpec(opts.CategoricalAttrs, opts.ValueAttrs)
+	inlineSpec.setComposites(nil, opts.CompositeAttrs, false)
+	c.spec.Store(inlineSpec)
 	// Inline mode keys the hot header by (folded) name; install the configured HotAttrs
 	// plus the always-hot defaults (Requirements, Rank) in inline form.
 	c.installHotNames(opts.HotAttrs)

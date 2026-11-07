@@ -90,6 +90,7 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 			addID(&next.valIDs, next.val, id)
 			mark(id)
 		}
+		next.pruneComposites() // a composite whose component changed kind no longer describes the data
 		if next.equalIDs(cur) && next.equalAuto(cur) {
 			return false
 		}
@@ -153,6 +154,7 @@ func (c *Collection) DropIndex(names ...string) bool {
 			delete(next.paths, id)
 			delete(next.auto, id)
 		}
+		next.pruneComposites() // a composite outlives neither of its components
 		if next.equalIDs(cur) {
 			return false
 		}

@@ -231,6 +231,15 @@ type Options struct {
 	// at configuration, rather than at every query (see indexSpec.paths).
 	CategoricalAttrs []string
 	ValueAttrs       []string
+	// CompositeAttrs names attribute TUPLES to index together, so a conjunction of
+	// equalities on all of them (`ClusterId == 7 && ProcId == 3`) is one index lookup
+	// rather than a probe per attribute whose posting lists are then intersected. Each
+	// tuple's attributes must also appear in CategoricalAttrs or ValueAttrs -- a composite
+	// answers only the full tuple, and everything else (one attribute alone, a range) is
+	// served by the components' own indexes; a tuple naming an unindexed attribute is
+	// ignored. Order matters for identity: {"ClusterId","ProcId"} and {"ProcId","ClusterId"}
+	// are two composites, and either answers the same conjunctions. Optional.
+	CompositeAttrs [][]string
 	// Ordered configures maintained, filtered, ordered indexes -- the schedd
 	// priority-queue pattern (see docs/MATCH.md §3 and Collection.Ordered). Each
 	// spec groups members into partitions and keeps them sorted on the write path,
@@ -881,7 +890,9 @@ func New(opts Options) *Collection {
 	for _, r := range opts.MatchClosureRoots {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
-	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	baseSpec := newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs)
+	baseSpec.setComposites(c.intern, opts.CompositeAttrs, false)
+	c.spec.Store(baseSpec)
 	// Zone maps (append-only only): cover the explicit ZoneAttrs plus every value-indexed
 	// attribute (a range query on an indexed attr should prune whole segments too), matching
 	// the archive. Each attribute carries both its folded name and its interned id so the
