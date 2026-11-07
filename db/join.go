@@ -265,6 +265,22 @@ type JoinProbeStat struct {
 	EstRecords int
 	// Why says why the scan was not narrowed, empty when it was.
 	Why string
+	// Tuple names the attribute tuple the scan was narrowed on as a WHOLE
+	// ("ClusterId+ProcId"), empty when the narrowing was one membership constraint per
+	// attribute, which admits their cross product rather than the tuples actually held.
+	Tuple string
+	// TupleComposite says whether a composite index answers that tuple in one lookup. False
+	// with a non-empty Tuple means the narrowing is the same but each disjunct costs one
+	// lookup per component, whose postings are then intersected.
+	TupleComposite bool
+	// TupleWhy says why the scan was not narrowed on the tuple as a whole, empty when it
+	// was or when the step narrows on one attribute.
+	//
+	// Reported separately from Why because the two decisions are separate: a step can
+	// decline the tuple form on cost and still narrow per attribute, in which case Why is
+	// empty and this is not. Without it that step is indistinguishable from one that was
+	// never a candidate.
+	TupleWhy string
 }
 
 // syncFirstProbe copies the first step's decision into the single-step fields, so a two-table

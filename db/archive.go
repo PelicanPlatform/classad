@@ -77,6 +77,14 @@ type ArchiveConfig struct {
 	// whole-segment query pruning (value-indexed attributes are included automatically).
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
+	// CompositeAttrs names attribute TUPLES to index together, so a conjunction pinning
+	// every component of one is answered by a single lookup rather than by intersecting
+	// each component's postings. Each component must also be indexed in its own right
+	// (categorically or by value); a tuple naming one that is not is dropped.
+	// (`omitempty` so a configuration with no composite writes the bytes it always wrote:
+	// the committed config fixtures are evidence that a deployment predating this code
+	// reopens unchanged, and a field that always appeared would spend that evidence.)
+	CompositeAttrs [][]string `json:",omitempty"`
 
 	// Unordered drops this archive's newest-first read order (collections.ArchiveOptions.
 	// Unordered). An archive that is a history file must leave it alone: condor_history's
@@ -293,6 +301,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*Arc
 		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
 		CategoricalAttrs:    categorical,
 		ValueAttrs:          value,
+		CompositeAttrs:      cfg.CompositeAttrs,
 		ZoneAttrs:           cfg.ZoneAttrs,
 		SchemaRequireAttrs:  cfg.SchemaRequireAttrs,
 		IndexBackfillBytes:  cfg.backfillHorizon(),
@@ -1400,6 +1409,11 @@ func (t *ArchiveTable) HasSealedSidecar() bool { return t.a.HasSealedSidecar() }
 
 // IndexedAttrs returns the archive's categorical and value index attributes.
 func (t *ArchiveTable) IndexedAttrs() (categorical, value []string) { return t.a.IndexedAttrs() }
+
+// CompositeAttrs returns the archive's composite index tuples, each in its configured order.
+// As with a single-attribute index, these are built only in a sealed segment's sidecar, so
+// HasSealedSidecar is what says whether any of them can answer a probe yet.
+func (t *ArchiveTable) CompositeAttrs() [][]string { return t.a.CompositeAttrs() }
 
 // ZoneAttrs returns the attributes carrying per-segment [min,max] zone maps, on which a
 // range query prunes whole segments rather than only postings.

@@ -64,6 +64,53 @@ var (
 	// 4x per doubling, so being wrong on this side is expensive and the gate should err
 	// towards scanning. And an earlier draft used rows-per-key with a guessed threshold of
 	// 8, which would have accepted all five rows of that table -- the 29x case included.
+	//
+	// WHAT THIS CONSTANT ACTUALLY TRACKS, and why it is still 1 after the tuple spine gave
+	// it a second access pattern to price (joinprobecost_bench_test.go; all figures below
+	// are medians of 3 at 8192 records, both arm orders, on a machine at load 4-22).
+	//
+	// The cliff in the table above is not a lookup price becoming unaffordable. It is the
+	// STORE's own gate: past an estimated candidate fraction (collections, maxPushdownFrac
+	// = 0.95) the index union is abandoned and the table is read whole with the membership
+	// constraint as a filter -- which is strictly worse than the scan it replaced, because
+	// it is that scan plus the constraint. Explained plans put the flip for the in-chain
+	// between 32 and 40 keys over 211 segments, which is where the 0.86 ms -> 31.3 ms step
+	// above sits. So this constant is a proxy, from the outside, for a threshold the store
+	// decides on candidate estimates that this layer cannot see.
+	//
+	// That matters because the two shapes do not hit that gate at the same lookup count. A
+	// disjunct pinning BOTH components of a tuple is estimated far more selectively than a
+	// bare `in` term, so about three times as many of them fit under the same ceiling:
+	//
+	//	shape                      segs  flips at   lookups  vs 8192 records
+	//	in-chain (multi-value)      211  ~36 keys     7,600   0.93x
+	//	tuple spine (single-value)  196  ~120 tuples 23,500   2.9x
+	//
+	// Timed, the same ordering: at 196 segments the spine beats the full scan out to about
+	// 140 tuples (64 tuples: 3.74 ms against the scan's 8.53 ms), while the in-chain is
+	// already losing at 64 keys. One single-value lookup is therefore worth about 0.3 of a
+	// scanned record where one multi-value lookup is worth about 1.
+	//
+	// What stops that becoming `probeLookupCost = 1/3 for a spine` is the SEGMENT factor.
+	// Sweeping segments at a fixed 8192 records, the spine's timed crossover moves far less
+	// than s*k says it should:
+	//
+	//	segs  crossover  lookups at it  implied cost per lookup
+	//	 196  ~140 tuples      27,400   0.30
+	//	  49  ~237 tuples      11,600   0.71
+	//	  13  ~334 tuples       4,300   1.89
+	//
+	// Fifteen times the segments costs about 2.4x, not 15x: zone maps rule out every
+	// segment no key falls in before a posting is read, so most of s is never probed. The
+	// implied price therefore spans 6x across one sweep, and 1 sits inside it -- too
+	// conservative at 196 segments (it declines at 42 tuples where the spine is still 2-3x
+	// faster), mildly too permissive at 13 (it accepts to 630 where the crossover is 334).
+	// No single value is right while the term is multiplied by a factor the clock does not
+	// see, so the constant is left alone: moving it fixes one end by worsening the other.
+	//
+	// The gate should still err towards scanning, more so than before. Past the store's
+	// flip the spine is not merely slower, it is 10-20x slower (128 tuples: 88.6 ms against
+	// the scan's 9.0 ms), because every disjunct is then evaluated against every record.
 	probeLookupCost = 1
 
 	// maxProbeKeys caps the distinct key values folded into one constraint. Past it the
@@ -154,6 +201,12 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 		stats.syncFirstProbe()
 		return out
 	}
+	// A step narrowing on several attributes may be able to narrow on the whole key at once,
+	// through a composite index over exactly those attributes. Decided here, before the scan,
+	// because it changes what the scan has to COLLECT: the per-attribute form wants each
+	// attribute's distinct values, the tuple form wants the distinct tuples, and the second
+	// cannot be recovered from the first.
+	tprobes := cat.planTupleProbes(cands, sides, p.steps)
 
 	// Now the part that costs a scan. The FROM side is held either way from here: if every
 	// probe is declined below, it is handed back to be streamed from memory, so the scan is
@@ -199,6 +252,27 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 				c.lits = append(c.lits, lit)
 			}
 		}
+		for _, tp := range tprobes {
+			if len(tp.terms) > maxProbeKeys {
+				continue // already past the cap; keep reading so the held side stays complete
+			}
+			sp := p.steps[tp.step]
+			lits := make([]string, 0, len(tp.equis))
+			for _, k := range tp.equis {
+				v, ok := p.rowHalfValueAt(sp, rows, k)
+				if !ok {
+					break
+				}
+				lit, ok := joinKeyLiteral(v)
+				if !ok {
+					break
+				}
+				lits = append(lits, lit)
+			}
+			if len(lits) == len(tp.equis) {
+				tp.add(lits)
+			}
+		}
 	}
 	out.held = held
 
@@ -217,6 +291,27 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	// conjunction is as sound a superset filter as any one of them, and strictly narrower.
 	for _, g := range groupByStep(cands) {
 		st := &stats.ProbeSteps[g[0].step]
+		// The whole key as one spine of tuples, where that pays. Preferred over the
+		// per-attribute form rather than compared with it: the spine admits exactly the
+		// tuples the FROM side holds where the conjunction of in-chains admits their cross
+		// product, so when both are affordable the spine is the narrower of the two by
+		// construction -- and when it would admit the cross product anyway, its own gate
+		// declines it.
+		if tp := tprobes[g[0].step]; tp != nil {
+			tp.cross = crossProduct(g)
+			cons, why := tp.constraint()
+			if why == "" {
+				out.cons[tp.step] = cons
+				st.Attr = strings.Join(tp.attrs, ", ")
+				st.Tuple = tp.label()
+				st.TupleComposite = len(tp.composite) > 0
+				st.Keys = len(tp.terms)
+				continue
+			}
+			// Declined, but the per-attribute form is priced separately and may still pay,
+			// so this is recorded beside that decision rather than instead of it.
+			st.TupleWhy = why
+		}
 		keys, lookups := 0, 0
 		for _, c := range g {
 			keys += len(c.lits)
