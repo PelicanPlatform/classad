@@ -1420,9 +1420,17 @@ func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd
 		rp := c.planReadQuery(qp)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.
-		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
-			c.runParallelQuery(qp, yield, redact)
-			return
+		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 {
+			if !c.reverseScan {
+				c.runParallelQuery(qp, yield, redact)
+				return
+			}
+			// A newest-first collection takes the ordered fan-out, whose workers decode in
+			// parallel while the consumer drains in segment order. It declines WITHOUT yielding
+			// when it cannot engage, and the serial read below then runs the whole query.
+			if c.runOrderedQuery(qp, yield, redact) {
+				return
+			}
 		}
 		c.runQuery(qp, rp, c.yieldAdAs(yield, redact))
 	}
