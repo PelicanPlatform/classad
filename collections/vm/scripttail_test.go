@@ -333,6 +333,12 @@ func TestScriptTailCallRefusalsStillHold(t *testing.T) {
 		{"a bracketed operator holding the call", "def f(v):\n    return (f(v) + 1)\n\nresult = f(1)\n"},
 		// The call is in tail position of a function that is not the one being expanded.
 		{"mutual recursion, both in tail position", "def a(v):\n    return b(v)\n\ndef b(v):\n    return a(v)\n\nresult = a(1)\n"},
+		// A ternary compiles natively, so a self-call inside one is reached by the recursion rule
+		// itself rather than stopped earlier by anything about the ad. Neither position is a tail
+		// position: the condition is evaluated to choose an arm, and an arm's value is the
+		// ternary's, not the function's.
+		{"the result is a ternary's condition", "def f(v):\n    return f(v) ? 1 : 2\n\nresult = f(1)\n"},
+		{"the result is a ternary's arm", "def f(v):\n    return v > 0 ? f(v) : 2\n\nresult = f(1)\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -344,15 +350,6 @@ func TestScriptTailCallRefusalsStillHold(t *testing.T) {
 				t.Errorf("refusal %q does not name the cycle", msg)
 			}
 		})
-	}
-
-	// A ternary is refused before the recursion is reached, by the rule that a construct evaluated
-	// against the ad cannot call a script function at all. It is listed separately because the
-	// message is the one a NON-recursive call gets there too, and reading it as the cycle refusal
-	// would hide the day that rule stopped firing.
-	msg := refuses(t, "def f(v):\n    return f(v) ? 1 : 2\n\nresult = f(1)\n")
-	if !strings.Contains(msg, "calls f") || !strings.Contains(msg, "evaluated against the ad") {
-		t.Errorf("refusal %q does not explain the delegated call", msg)
 	}
 }
 
