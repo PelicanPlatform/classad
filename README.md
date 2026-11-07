@@ -33,8 +33,9 @@ This project provides a complete parser and evaluation engine for the ClassAds l
   - Scoped attribute references for parent/target relationships
   - Attribute selection and subscripting
   - 25+ built-in functions (string, math, type checking, list operations, conditional)
-- **User-Defined Functions**: Register your own functions and aggregates, in Go or as sandboxed
-  WebAssembly — see [docs/user-defined-functions.md](docs/user-defined-functions.md)
+- **User-Defined Functions**: Register your own functions and aggregates, written in Go, in
+  ClassAd Script, or as sandboxed WebAssembly — see
+  [docs/user-defined-functions.md](docs/user-defined-functions.md)
 - **ClassAd Matching**: MatchClassAd type for symmetric matching (job/machine matching)
 - **Public API**: High-level API mimicking the C++ HTCondor ClassAd library
 - **Go Generate Support**: Easy regeneration of parser from grammar
