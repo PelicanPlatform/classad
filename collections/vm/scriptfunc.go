@@ -384,19 +384,33 @@ func (s *Script) newFuncReg(display string) int32 {
 // resolves to the innermost definition being expanded. Resolution is the same map lookup an ordinary
 // call does, so a tail call folds case exactly as every other call does.
 //
+// BRACKETS ARE NOT PART OF THE EXPRESSION. `return (f(x))` is the same return as `return f(x)`:
+// ParenExpr is kept so that unparsing can echo what the source wrote, and it carries no evaluation
+// of its own, so it is unwrapped here -- repeatedly, since `((f(x)))` is two of them. Treating it as
+// a position of its own would mean refusing a line a reader sees as a tail call, with a message
+// saying recursion cannot be compiled at any depth, about a function whose unbracketed twin
+// compiles and runs. A refusal that misdescribes the language costs more than the narrowness buys.
+//
 // `return f(x) + 1`, `return g(f(x))`, `return f(x) ? a : b` and a call in a binding or a condition
 // are not among them, and the line between is not a matter of degree: each of those needs the call's
 // value AS A VALUE in the middle of something else, and the only way to have one is the expansion
-// that has no end. A parenthesised call, `return (f(x))`, is not accepted either. It would be sound
-// to accept, and it is left out so that the rule stays one a reader checks by looking at the line
-// rather than at a parse tree -- the cost of being wrong here is a recursion that quietly computes
-// something other than what it says, and the cost of being too strict is a pair of brackets.
+// that has no end. That is what the narrowness is protecting against, and brackets feed a value to
+// nothing -- which is why unwrapping them is not the first step down a slope. Nothing else is
+// unwrapped: `(f(x)) + 1` and `(g(f(x)))` keep the refusal, because the brackets there are inside
+// an expression that still has work left after the call.
 //
 // AN ARITY MISMATCH IS NOT A TAIL CALL. Letting it fall through to the ordinary expansion is what
 // gets it the arity refusal, which names both counts, rather than one about recursion.
 func (s *Script) tailSelfCall(expr ast.Expr) *ast.FunctionCall {
 	if s.fn == nil || s.fn.fd == nil {
 		return nil
+	}
+	for {
+		paren, wrapped := expr.(*ast.ParenExpr)
+		if !wrapped {
+			break
+		}
+		expr = paren.Inner
 	}
 	call, ok := expr.(*ast.FunctionCall)
 	if !ok || s.funcs[strings.ToLower(call.Name)] != s.fn.fd {

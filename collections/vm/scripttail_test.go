@@ -162,6 +162,33 @@ result = go(4, 0)
 			ad: `[]`, want: "20",
 		},
 		{
+			// Brackets carry no evaluation of their own -- they are kept so that unparsing can echo
+			// what the source wrote -- so a bracketed return is the same return. The answer is the
+			// unbracketed function's, which is the whole point: the two differ in nothing.
+			name: "a bracketed tail call",
+			src: `def fact(n, acc):
+    if n <= 1:
+        return acc
+    return (fact(n - 1, acc * n))
+
+result = fact(10, 1)
+`,
+			ad: `[]`, want: "3628800",
+		},
+		{
+			// Two of them, because one unwrap would leave the inner ParenExpr where the call should
+			// be and send this back to the refusal.
+			name: "a doubly bracketed tail call",
+			src: `def fact(n, acc):
+    if n <= 1:
+        return acc
+    return ((fact(n - 1, acc * n)))
+
+result = fact(10, 1)
+`,
+			ad: `[]`, want: "3628800",
+		},
+		{
 			// A call folds case, and a tail call is a call: the name is resolved through the same
 			// map, so the spelling at the `return` need not match the spelling at the `def`.
 			name: "the call folds case",
@@ -299,9 +326,11 @@ func TestScriptTailCallRefusalsStillHold(t *testing.T) {
 		{"the result is a condition", "def f(v):\n    if f(v) > 0:\n        return 1\n    return 2\n\nresult = f(1)\n"},
 		{"the result is a loop condition", "def f(v):\n    while f(v) > 0:\n        return 1\n    return 2\n\nresult = f(1)\n"},
 		{"the result is subscripted", "def f(v):\n    return f(v)[0]\n\nresult = f(1)\n"},
-		// Sound to accept and left out on purpose, so that the rule stays one a reader checks by
-		// looking at the line rather than at a parse tree.
-		{"a parenthesised call", "def f(v):\n    return (f(v))\n\nresult = f(1)\n"},
+		// Brackets are unwrapped, so these two pin that the unwrapping stops at the brackets: the
+		// call is still an operand of something, and bracketing an operand does not change that.
+		{"a bracketed call feeding an operator", "def f(v):\n    return (f(v)) + 1\n\nresult = f(1)\n"},
+		{"a bracketed call as another call's argument", "def g(x):\n    return x * 2\n\ndef f(v):\n    return (g(f(v)))\n\nresult = f(1)\n"},
+		{"a bracketed operator holding the call", "def f(v):\n    return (f(v) + 1)\n\nresult = f(1)\n"},
 		// The call is in tail position of a function that is not the one being expanded.
 		{"mutual recursion, both in tail position", "def a(v):\n    return b(v)\n\ndef b(v):\n    return a(v)\n\nresult = a(1)\n"},
 	}

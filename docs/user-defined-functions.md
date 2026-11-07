@@ -537,10 +537,11 @@ The `return` is a jump back to the top of the body with the parameters set to
 the new arguments, so there is no second copy of the body and no stack to run
 out of. It counts as tail position wherever it is written — at the top of the
 body, inside an `if` or `else` arm, inside a `while` or a `for` — as long as the
-whole of what is returned is the call. Each trip starts a fresh body: a name the
-body assigns is `undefined` again until that trip assigns it. Every argument is
-computed before any parameter is written, so a function can swap its own
-arguments.
+whole of what is returned is the call. Brackets round it make no difference:
+`return (fact(n - 1, acc * n))` is the same return. Each trip starts a fresh
+body: a name the body assigns is `undefined` again until that trip assigns it.
+Every argument is computed before any parameter is written, so a function can
+swap its own arguments.
 
 Nothing bounds the number of trips but the step budget, which is what bounds a
 `while` too. A function whose only statement is a call to itself compiles, and
@@ -549,14 +550,13 @@ ends in `error` when the budget runs out.
 Three things a script function will not do:
 
 - **Recursion anywhere but tail position.** `return f(x) + 1`,
-  `return g(f(x))`, `x = f(x)`, a self-call in a condition — each needs the
-  call's value in the middle of something else, and the only way to have one is
-  to write the body out again, which for a call that contains itself has no
-  end. `return (f(x))` is refused too, though the brackets change nothing: the
-  rule is that the whole of what is returned is the call, so that it can be
-  read off the line. Mutual recursion, `f` calling `g` calling `f`, is refused
-  because the jump a tail call makes goes to the top of the body it is written
-  in, and `f`'s body is not `g`'s. The error names the cycle.
+  `return g(f(x))`, `return (f(x)) + 1`, `x = f(x)`, a self-call in a
+  condition — each needs the call's value in the middle of something else, and
+  the only way to have one is to write the body out again, which for a call
+  that contains itself has no end. Mutual recursion, `f` calling `g` calling
+  `f`, is refused because the jump a tail call makes goes to the top of the
+  body it is written in, and `f`'s body is not `g`'s. The error names the
+  cycle.
 - **Shadowing.** A `def` may not take the name of a built-in or of a registered
   function, for the same reason a registration may not: `strcat` has to mean the
   same thing inside the script as outside it. In a *module* only the built-in
