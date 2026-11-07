@@ -4,6 +4,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -623,9 +625,18 @@ type catPostings struct {
 	// the rare buckets that mix case; case-uniform buckets store just a small string.
 	exact     map[string]*roaring.Bitmap
 	exactCase map[string]string
-	exc       *roaring.Bitmap
-	posted    *roaring.Bitmap // records that posted a literal value (for presence probes)
-	stats     segStats        // filled by finishStats after all records are indexed
+	// keys is post's keys in ascending order, for the prefix probes -- the categorical
+	// counterpart of valPostings.sortedKeys, but built ON FIRST USE rather than at finish.
+	// Sorting them eagerly cost 0.8ms -> 3.3ms to summarize one segment's postings for an
+	// attribute with a distinct value per record, on the write path, for a probe shape most
+	// queries never use. post is immutable once the index is finished and published, so the
+	// order can be computed later and shared; keysOnce builds it and the pointer publishes
+	// it to readers that have not gone through the Once (sizeBytes).
+	keys     atomic.Pointer[[]string]
+	keysOnce sync.Once
+	exc      *roaring.Bitmap
+	posted   *roaring.Bitmap // records that posted a literal value (for presence probes)
+	stats    segStats        // filled by finishStats after all records are indexed
 }
 type valPostings struct {
 	// post's keys are the values this attribute takes, and a key must therefore be usable
@@ -947,6 +958,20 @@ func compositeValKey(node []byte) (float64, bool) {
 		return 0, true
 	}
 	return 0, false
+}
+
+// sortedKeys returns post's keys in ascending order, sorting them on first use. Safe to
+// call from several readers at once; see the keys field.
+func (cp *catPostings) sortedKeys() []string {
+	cp.keysOnce.Do(func() {
+		ks := make([]string, 0, len(cp.post))
+		for k := range cp.post {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+		cp.keys.Store(&ks)
+	})
+	return *cp.keys.Load()
 }
 
 // finalizeExact collapses case-uniform buckets: for every folded key whose records

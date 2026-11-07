@@ -1189,9 +1189,17 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 		return usableProbe{attrID: id, cat: true, op: "==", svals: []string{"true"}}, true
 	case "untruthy": // `!attr`: matches boolean false, same superset argument.
 		return usableProbe{attrID: id, cat: true, op: "==", svals: []string{"false"}}, true
+	case "prefix":
+		// The literal folds like any other categorical key, and the folded run it names is
+		// a superset of the case-sensitive matches (see index_prefix.go).
+		s, ok := catFold(p.Vals[0])
+		if !ok || s == "" {
+			return usableProbe{}, false
+		}
+		return usableProbe{attrID: id, cat: true, op: "prefix", svals: []string{s}}, true
 	case "==", "!=", "in":
 	default:
-		return usableProbe{}, false // ranges are not indexed for categoricals
+		return usableProbe{}, false // ordering comparisons are not indexed for categoricals
 	}
 	svals := make([]string, 0, len(p.Vals))
 	for _, v := range p.Vals {
@@ -1571,6 +1579,20 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		case "absent": // attr is undefined: everything but the definitely-posted records
 			bm := si.all.Clone()
 			bm.AndNot(cp.posted)
+			return bm
+		case "prefix":
+			// Boundary-search the folded keys to the run that carries the prefix and union
+			// only those keys' postings, then the exceptions (which no key holds and the
+			// pattern may still match).
+			keys := cp.sortedKeys()
+			from, to := strPrefixSpan(keys, up.svals[0])
+			if to-from == len(keys) {
+				bm := cp.posted.Clone() // every key: see index_prefix.go
+				bm.Or(cp.exc)
+				return bm
+			}
+			bm := unionPostings(to-from, func(i int) *roaring.Bitmap { return cp.post[keys[from+i]] })
+			bm.Or(cp.exc)
 			return bm
 		case "is": // =?= exact (case-sensitive)
 			// The exceptions too: an attribute holding an expression rather than a string literal

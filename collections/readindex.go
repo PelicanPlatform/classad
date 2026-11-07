@@ -66,6 +66,13 @@ type indexPrimitives interface {
 	// in-RAM stats hold the bloom; the mmap tier consults it on disk), which is why it is a
 	// primitive rather than shared logic.
 	bloomAbsent(up usableProbe) bool
+	// prefixKeyCount is how many distinct folded categorical keys begin with a prefix
+	// probe's literal, or ok=false when the attribute is not indexed categorically here.
+	// Two boundary searches over the sorted keys: it answers how much the prefix prunes
+	// without reading a single posting, so a planner that then declines the index has paid
+	// O(log n) to decline it. A zero count with no exceptional records also means the
+	// segment holds nothing the probe can match (indexCanSkip).
+	prefixKeyCount(up usableProbe) (int, bool)
 }
 
 // bulkOrMin is the posting count at which unionPostings switches from a running in-place
@@ -162,6 +169,12 @@ func indexCanSkip(ix indexPrimitives, up usableProbe) bool {
 		return false // presence spans posted + exc + absent; never provably empty here
 	}
 	if up.cat {
+		if up.op == "prefix" {
+			// No key in the segment begins with the literal, and no exceptional record to
+			// re-verify (checked above): nothing here can match the pattern.
+			n, ok := ix.prefixKeyCount(up)
+			return ok && n == 0
+		}
 		if up.op != "==" && up.op != "in" {
 			return false
 		}
@@ -230,6 +243,11 @@ func indexSkipsPrefix(ix indexPrimitives, usable []usableProbe) bool {
 // indexEstCandidates estimates how many records a probe admits, for ordering only (never
 // correctness). estCandidatesFromStats holds the logic so it is testable on a bare segStats.
 func indexEstCandidates(ix indexPrimitives, up usableProbe) float64 {
+	if up.op == "prefix" {
+		// Needs the key run as well as the stats, so it cannot be expressed on a bare
+		// segStats the way the other operators are.
+		return estPrefixCandidates(ix, up)
+	}
 	var total float64
 	// Only the presence probes need the segment's record count, and only they pay for it.
 	if up.op == "present" || up.op == "absent" {

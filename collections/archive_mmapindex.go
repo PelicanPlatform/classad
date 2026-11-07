@@ -294,6 +294,22 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 			bm := si.allBitmap().Clone()
 			bm.AndNot(si.bitmapAt(postedOff))
 			return bm
+		case "prefix":
+			// The sidecar already stores the folded keys sorted, so the prefix run is two
+			// boundary searches over the mmapped blob; only the run's own postings are
+			// paged in. The bloom is no help here -- it answers membership of a whole key,
+			// not of a prefix -- so it is not consulted.
+			from, to := si.catPrefixSpan(attrOff, up.svals[0])
+			if n, _, _, _ := si.catKeyBases(attrOff); to-from == int(n) {
+				bm := si.bitmapAt(postedOff).Clone() // every key: see index_prefix.go
+				bm.Or(si.bitmapAt(excOff))
+				return bm
+			}
+			bm := unionPostings(to-from, func(i int) *roaring.Bitmap {
+				return si.bitmapAt(si.catBmOffAt(attrOff, from+i))
+			})
+			bm.Or(si.bitmapAt(excOff))
+			return bm
 		case "is": // =?= exact (case-sensitive) via the exact-case run, plus the exceptions (see
 			// segIndex.probeOffsets)
 			bm := roaring.New()
@@ -374,6 +390,58 @@ func (si *mmapSegIndex) catFind(attrOff uint32, key string) (bmOff uint32, ok bo
 		}
 	}
 	return 0, false
+}
+
+// catKeyBases returns the three bases of a categorical attr block: the key-offset array,
+// the bitmap-offset array, and the key blob, along with the key count.
+func (si *mmapSegIndex) catKeyBases(attrOff uint32) (n, keyOffBase, bmOffBase, blobBase uint32) {
+	n = le32(si.data, attrOff+8)
+	keyOffBase = attrOff + 12
+	bmOffBase = keyOffBase + (n+1)*4
+	return n, keyOffBase, bmOffBase, bmOffBase + n*4
+}
+
+func (si *mmapSegIndex) catBmOffAt(attrOff uint32, i int) uint32 {
+	_, _, bmOffBase, _ := si.catKeyBases(attrOff)
+	return le32(si.data, bmOffBase+uint32(i)*4)
+}
+
+// catLowerBound returns the index of the first folded key not less than key.
+func (si *mmapSegIndex) catLowerBound(attrOff uint32, key string) int {
+	d := si.data
+	n, keyOffBase, _, blobBase := si.catKeyBases(attrOff)
+	lo, hi := 0, int(n)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		ks := blobBase + le32(d, keyOffBase+uint32(mid)*4)
+		ke := blobBase + le32(d, keyOffBase+uint32(mid+1)*4)
+		if cmpStrBytes(key, d[ks:ke]) <= 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
+// catPrefixSpan is strPrefixSpan over the sidecar's folded key run.
+func (si *mmapSegIndex) catPrefixSpan(attrOff uint32, p string) (from, to int) {
+	from = si.catLowerBound(attrOff, p)
+	hi, ok := prefixUpperKey(p)
+	if !ok {
+		n, _, _, _ := si.catKeyBases(attrOff)
+		return from, int(n)
+	}
+	return from, si.catLowerBound(attrOff, hi)
+}
+
+func (si *mmapSegIndex) prefixKeyCount(up usableProbe) (int, bool) {
+	attrOff, ok := si.catDir[up.attrID]
+	if !ok || !up.cat || len(up.svals) != 1 {
+		return 0, false
+	}
+	from, to := si.catPrefixSpan(attrOff, up.svals[0])
+	return to - from, true
 }
 
 // catFindExact binary-searches the exact-case key run (=?=/=!=) for an exact spelling.

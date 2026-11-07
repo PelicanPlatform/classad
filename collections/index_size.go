@@ -24,6 +24,11 @@ func (cp *catPostings) sizeBytes() int64 {
 	for k, v := range cp.exactCase {
 		n += int64(len(k) + len(v))
 	}
+	// The sorted key order, if a prefix probe has built it. The keys themselves are post's,
+	// counted above; this is the slice's own array of string headers.
+	if ks := cp.keys.Load(); ks != nil {
+		n += int64(len(*ks)) * 16
+	}
 	if cp.exc != nil {
 		n += int64(cp.exc.GetSizeInBytes())
 	}
