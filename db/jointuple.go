@@ -19,8 +19,24 @@ package db
 // on a 32-pair fixture the tuple spine hashes 32 rows against the in-chains' 132 whether or
 // not a composite exists, and the composite's own contribution to the clock was inside the
 // noise. So the tuple form is not gated on having a composite. What the composite changes is
-// the PRICE: one lookup per disjunct instead of one per component, which is what the cost
-// model below multiplies by.
+// the PRICE the cost model below charges: one lookup per disjunct instead of one per
+// component.
+//
+// It changes the CLOCK by far less than that, and the noise above was not the fixture being
+// small. Swept at 8192 records over 196 segments, the same spine with and without a
+// composite runs within 4-16% of itself at every tuple count measured -- 3.74 ms against
+// 4.02 ms at 64 tuples, 6.09 against 7.24 at 96 -- while the model charges the second twice
+// as much (joinprobecost_bench_test.go). Intersecting two single-value postings is nearly as
+// cheap as reading one composite posting, so perTuple is a factor of two the clock cannot
+// find.
+//
+// It is kept anyway, and this is the awkward part. probeLookupCost's own sweep shows the
+// segment factor over-weighting segments by about 6x across a 15x range, which leaves the
+// gate too permissive on an archive of few, large segments -- and on exactly those shapes
+// perTuple=2 is what pulls a composite-less spine back towards its measured crossover.
+// Dropping it on its own would be right about the composite and more wrong about the join.
+// Neither moves until the term is priced on segments the way the clock says, which is more
+// than a constant's worth of change.
 //
 // THREE THINGS MAKE THIS NARROWER THAN IT LOOKS.
 //

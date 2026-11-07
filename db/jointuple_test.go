@@ -202,6 +202,13 @@ func TestTupleProbeHashesOnlyTheTuplesHeld(t *testing.T) {
 // scanned record per lookup, swept for multi-value `in` probes -- prices a single-value
 // lookup too dearly for this access pattern. Retuning it is a change to a constant with its
 // own calibration behind it, and is not made here on the strength of one fixture.
+//
+// It was then swept properly (joinprobecost_bench_test.go) and the reading holds AT THIS
+// SEGMENT COUNT and not in general: over 196 segments one single-value lookup is worth
+// about 0.3 of a scanned record against a multi-value lookup's 1, so the decline below is
+// indeed about 3x too eager. Over 13 segments the same sweep puts it at 1.9, where the gate
+// is if anything too permissive. The spread is the segment factor, not the constant, so the
+// constant is still not retuned -- see probeLookupCost for the tables.
 func TestTupleProbeDeclinesWithoutACompositeOnThisShape(t *testing.T) {
 	_, st := runSparseJoin(t, sparseTupleFixture(t, 8192, 64, false))
 	if st.ProbeSteps[0].Tuple != "" {
