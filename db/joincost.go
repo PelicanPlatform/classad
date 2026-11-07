@@ -21,11 +21,20 @@ import (
 
 // explainSide reports how the store would read one join side, as `.explain` would.
 func (cat *Catalog) explainSide(side JoinSide) (QueryExplain, error) {
+	// A side with no constraint of its own reads the whole table, which is what `true`
+	// plans as. The empty string is not a constraint and does not parse, and the cost
+	// model never asks about one -- it answers the whole-table size without coming here.
+	// The join's EXPLAIN does ask, because "reads everything" is an access path a reader
+	// wants described rather than a hole in the report.
+	constraint := side.Constraint
+	if strings.TrimSpace(constraint) == "" {
+		constraint = "true"
+	}
 	if d, ok := cat.Table(side.Table); ok {
-		return d.Explain(side.Constraint)
+		return d.Explain(constraint)
 	}
 	if a, ok := cat.ArchiveTable(side.Table); ok {
-		return a.Explain(side.Constraint)
+		return a.Explain(constraint)
 	}
 	return QueryExplain{}, fmt.Errorf("no table named %q", side.Table)
 }

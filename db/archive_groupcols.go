@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 )
 
@@ -179,6 +180,7 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 	rowAt := make(map[string]int, len(groups))
 	merged := make([]*collections.GroupStats, 0, len(groups))
 	labels := make([][]string, 0, len(groups))
+	labelValues := make([][]classad.Value, 0, len(groups))
 	scratch := make([]string, len(groupCols))
 	for i := range groups {
 		g := &groups[i]
@@ -223,6 +225,15 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 		rowAt[text] = len(merged)
 		merged = append(merged, g)
 		labels = append(labels, append([]string(nil), scratch...))
+		// The typed key beside the rendered one, canonicalized so it names the same group
+		// the text does. A group that MERGES below keeps the label it was first given, and
+		// keeps this with it: two groups that render alike canonicalize alike, so the
+		// survivor's value describes the merged group as exactly as its text does.
+		gvalues := make([]classad.Value, len(g.Values))
+		for j := range g.Values {
+			gvalues[j] = GroupValue(g.Values[j])
+		}
+		labelValues = append(labelValues, gvalues)
 	}
 	for n, g := range merged {
 		values := make([]string, len(aggs))
@@ -239,7 +250,7 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 				values[i] = numAggValue(a.Func, g.Stats[slot[i]])
 			}
 		}
-		rows = append(rows, AggRow{Group: labels[n], Values: values})
+		rows = append(rows, AggRow{Group: labels[n], GroupValues: labelValues[n], Values: values})
 	}
 	return rows, true
 }

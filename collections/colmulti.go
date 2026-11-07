@@ -133,6 +133,9 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 	tests := make(map[uint32][]zoneTest, len(probes))
 	srcs := make(map[uint32][]vm.Probe, len(probes))
 	for _, p := range probes {
+		if p.Nested() {
+			return nil, false // a columnar field is one top-level attribute (see index_query.go)
+		}
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
 			return nil, false

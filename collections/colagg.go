@@ -246,6 +246,9 @@ func (c *Collection) numPredOnField(q *vm.Query, s *adSchema) (uint32, func(floa
 	var fieldID uint32
 	var cmps []func(float64) bool
 	for _, p := range probes {
+		if p.Nested() {
+			return 0, nil, false // a columnar field is one top-level attribute (see index_query.go)
+		}
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
 			return 0, nil, false

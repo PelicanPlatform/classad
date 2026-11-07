@@ -816,7 +816,10 @@ location := classad.GetOr(ad, "deptLoc", "")          // "Building A"
 ```
 
 **Behavior:**
-- Returns `undefined` if attribute doesn't exist
+- A member the record does not define resolves in the ENCLOSING scope, and so on
+  outward: `Res.Mem` against `[Mem = 4096; Res = [Other = 1]]` is `4096`. A member the
+  record does define shadows the outer one.
+- Returns `undefined` if no scope on that chain defines the attribute
 - Returns `error` if left side is not a ClassAd
 - Can chain multiple selections: `a.b.c.d`
 

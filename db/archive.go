@@ -864,6 +864,13 @@ func categoricalGroup(v string) string {
 	return GroupValueText(classad.NewStringValue(v))
 }
 
+// categoricalGroupValue is categoricalGroup's typed twin, for AggRow.GroupValues. The
+// posting's value is a string, so the group is that string -- stated once here for the same
+// reason categoricalGroup is: this path holds no classad.Value to reach it through.
+func categoricalGroupValue(v string) classad.Value {
+	return GroupValue(classad.NewStringValue(v))
+}
+
 func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
 	if len(aggs) != 1 || aggs[0].Func != AggCount || aggs[0].Arg != "*" {
 		return nil, false
@@ -908,8 +915,9 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 		rows := make([]AggRow, 0, len(vals))
 		for _, v := range vals {
 			rows = append(rows, AggRow{
-				Group:  []string{categoricalGroup(v)},
-				Values: []string{strconv.FormatInt(counts[v], 10)},
+				Group:       []string{categoricalGroup(v)},
+				GroupValues: []classad.Value{categoricalGroupValue(v)},
+				Values:      []string{strconv.FormatInt(counts[v], 10)},
 			})
 		}
 		return rows, true
@@ -953,9 +961,13 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 				group := make([]string, 2)
 				group[cat] = categoricalGroup(v)
 				group[bucket] = strconv.FormatInt(b, 10)
+				gvalues := make([]classad.Value, 2)
+				gvalues[cat] = categoricalGroupValue(v)
+				gvalues[bucket] = classad.NewIntValue(b)
 				rows = append(rows, AggRow{
-					Group:  group,
-					Values: []string{strconv.FormatInt(counts[v], 10)},
+					Group:       group,
+					GroupValues: gvalues,
+					Values:      []string{strconv.FormatInt(counts[v], 10)},
 				})
 			}
 		}

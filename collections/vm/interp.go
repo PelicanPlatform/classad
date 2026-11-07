@@ -43,6 +43,13 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) 
 	stack = stack[:0]
 	code := p.code
 	steps := 0
+	// A script's locals. The zero Value is UNDEFINED, which is what an unwritten local reads as,
+	// so nothing initializes them. Nil -- and so never indexed -- for an expression program, which
+	// has no locals at all.
+	var locals []classad.Value
+	if n := len(p.locals); n > 0 {
+		locals = make([]classad.Value, n)
+	}
 	for ip := 0; ip < len(code); {
 		in := code[ip]
 		if isValueOp(in.Op) {
@@ -142,7 +149,14 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) 
 			stack = append(stack[:base], res)
 			ip++
 		case OpEvalNode:
-			stack = append(stack, ev.Evaluate(p.nodes[in.A]))
+			stack = append(stack, evalDelegated(ev, p.nodes[in.A], p.nodeLocals[in.A], locals))
+			ip++
+		case OpLoadLocal:
+			stack = append(stack, locals[in.A])
+			ip++
+		case OpStoreLocal:
+			locals[in.A] = stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
 			ip++
 		case OpLoadAlias:
 			r := p.aliasRefs[in.A]
@@ -153,6 +167,20 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) 
 				// record, so select out of it exactly as the delegated form did.
 				stack = append(stack, ev.Evaluate(r.node))
 			}
+			ip++
+		case OpShortSubscript:
+			// The container is the result when it is UNDEFINED or ERROR, and it is already on the
+			// stack, so the jump path writes nothing. Falling through evaluates the index.
+			if v := stack[len(stack)-1]; v.IsUndefined() || v.IsError() {
+				ip = int(in.A)
+			} else {
+				ip++
+			}
+		case OpSubscript:
+			n := len(stack)
+			index, container := stack[n-1], stack[n-2]
+			stack = stack[:n-1]
+			stack[n-2] = ev.ApplySubscript(container, index)
 			ip++
 		case OpStrListMember:
 			stack[len(stack)-1] = p.strLists[in.A].eval(stack[len(stack)-1])

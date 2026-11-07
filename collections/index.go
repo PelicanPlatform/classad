@@ -4,6 +4,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -58,6 +60,147 @@ type indexSpec struct {
 	// (Options at New, or an explicit AddIndex). The memory-budget trimmer only ever
 	// drops auto indexes, so a human-created index is never removed automatically.
 	auto map[uint32]struct{}
+
+	// comps are the configured composite (multi-column) indexes, ordered by tuple identity
+	// so a build is deterministic. Every component is also indexed on its own (see
+	// newCompositeSpecs), so a composite only ever makes a conjunction cheaper -- it is
+	// never the sole index on an attribute.
+	comps []compositeSpec
+
+	// paths holds, for the ids that index a NESTED PATH, the components of that path.
+	//
+	// KEY REPRESENTATION. A path index is configured by writing the path as the query writes
+	// it -- ValueAttrs: ["Res.Mem"] -- and is keyed by the id the WHOLE dotted string resolves
+	// to, exactly as a top-level attribute is keyed by the id of its name: interned for an
+	// interned collection, hashed for an inline one. Nothing about the id space, the sidecar
+	// format, the spec signature or the segment index changes; a path is just another key.
+	//
+	// The alternative was a structural key -- hashing the components with a separator no
+	// attribute name can hold -- which would make a path id unmistakable on its own. It is not
+	// available here: in interned mode an id IS an intern-table id, a small sequence number,
+	// and a hashed key would collide with a real attribute's id rather than stand apart from
+	// one. So the id cannot carry the distinction, and this map does.
+	//
+	// What the map buys is a SHAPE CHECK on every resolution. An ad may carry an attribute
+	// literally named "Res.Mem" -- the ClassAd language does not forbid it and the Go API does
+	// not either -- and that attribute's id is this path's id. Answering a path probe from that
+	// attribute's postings, or a probe on that attribute from the path's, would return a
+	// candidate set missing records that match. So an entry here means "this id is the path,
+	// not the attribute": a flat index on a name that already means a path is refused, a path
+	// whose id already means an attribute is refused, and at query time a probe whose shape
+	// disagrees with the spec declines to a scan. A collision costs selectivity, never rows.
+	paths map[uint32]attrPath
+}
+
+// attrPath is a nested attribute path an index is keyed on: `Res.Mem` is {"Res","Mem"}.
+type attrPath struct {
+	// comps are the components as configured. Attribute names are case-insensitive, so they
+	// are compared folded; they are kept as written for the name a lookup by dictionary needs.
+	comps []string
+	// ids are comps interned in the collection's global table, for reading an id-keyed record.
+	// Nil for an inline (persistent) spec, which has no such table and reads records by name.
+	ids []uint32
+}
+
+// splitAttrPath splits a configured index name into path components, or returns nil when the
+// name is a plain top-level attribute. A dot is what makes it a path -- the same thing that
+// makes `Res.Mem` a select in a query -- so an attribute whose NAME contains a dot cannot be
+// indexed as itself. That is the cost of configuring paths in the syntax queries use, and it
+// is paid by a name nothing in HTCondor produces; the alternative, a second option list, puts
+// the same ambiguity in front of every caller instead of behind this one line.
+func splitAttrPath(name string) []string {
+	if !strings.Contains(name, ".") {
+		return nil
+	}
+	comps := strings.Split(name, ".")
+	for _, c := range comps {
+		if c == "" {
+			return nil // ".x", "x.", "a..b": not a path anyone can mean
+		}
+	}
+	return comps
+}
+
+// setShape records what id means in this spec -- a top-level attribute (p nil) or a nested
+// path -- and reports whether that agrees with what it already meant. It is false only when
+// one id would have to mean both, which happens when an ad carries an attribute literally
+// named like a configured path. The caller then leaves that index out, as inlineID does for a
+// hash collision: the attribute reads as unindexed and its queries scan.
+//
+// No configuration reaches the conflict today -- a dotted name always configures a path, so
+// nothing asks for the plain attribute of that name -- but this is where the invariant
+// probeAttrID relies on is established, and it is cheaper to hold here than to re-derive at
+// every resolution.
+func (s *indexSpec) setShape(id uint32, p *attrPath) bool {
+	have, isPath := s.paths[id]
+	if p == nil {
+		return !isPath
+	}
+	if isPath {
+		return samePath(have.comps, p.comps)
+	}
+	if s.catHas(id) || s.valHas(id) {
+		return false // already indexed as a top-level attribute of that name
+	}
+	if s.paths == nil {
+		s.paths = map[uint32]attrPath{}
+	}
+	s.paths[id] = *p
+	return true
+}
+
+// samePath compares two paths component by component, case-insensitively as attribute names
+// compare.
+func samePath(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// indexID resolves a configured index name to its key id, recording its shape. intern is nil
+// for an inline spec, which derives ids from the name itself. ok is false when the name
+// cannot be indexed in this spec -- an id collision, in either of its two forms.
+func (s *indexSpec) indexID(intern *wire.InternTable, name string) (uint32, bool) {
+	var id uint32
+	if intern == nil {
+		var ok bool
+		if id, ok = s.inlineID(name); !ok {
+			return 0, false
+		}
+	} else {
+		id = intern.Intern(name)
+	}
+	comps := splitAttrPath(name)
+	if comps == nil {
+		return id, s.setShape(id, nil)
+	}
+	p := attrPath{comps: comps}
+	if intern != nil {
+		// The components are interned too: inside an id-keyed ad a nested record's members are
+		// keyed the way the enclosing ad's attributes are, so descending the path means looking
+		// up each component's interned id.
+		p.ids = make([]uint32, len(comps))
+		for i, c := range comps {
+			p.ids[i] = intern.Intern(c)
+		}
+	}
+	return id, s.setShape(id, &p)
+}
+
+// compositeFor returns the configured composite with this tuple identity.
+func (s *indexSpec) compositeFor(key string) (compositeSpec, bool) {
+	for _, cs := range s.comps {
+		if cs.key == key {
+			return cs, true
+		}
+	}
+	return compositeSpec{}, false
 }
 
 // isAuto reports whether the index on id was created by the auto-tuner.
@@ -165,20 +308,123 @@ func (s *indexSpec) attrNode(ad wire.Ad, id uint32, dict *segDictHandle) ([]byte
 	return ad.Lookup(id)
 }
 
+// idxNodeState says what an index found where one of its entries points.
+type idxNodeState uint8
+
+const (
+	// idxAbsent: the ad holds nothing there, so the value is UNDEFINED. The record posts
+	// nothing and is not an exception -- which is what lets `attr is undefined` be answered
+	// as "everything but the posted records".
+	idxAbsent idxNodeState = iota
+	// idxValue: node holds what is stored there, to be classified as a literal or not.
+	idxValue
+	// idxUnknown: something is there, but the index cannot say what it evaluates to. The
+	// record goes in the exception set, which every candidate set unions in.
+	idxUnknown
+)
+
+// indexNode resolves what the index entry for id is about in this record: the attribute
+// itself, or the nested path id is keyed on.
+func (s *indexSpec) indexNode(ad wire.Ad, id uint32, dict *segDictHandle) ([]byte, idxNodeState) {
+	if p, ok := s.paths[id]; ok {
+		return s.pathNode(ad, p, dict)
+	}
+	node, ok := s.attrNode(ad, id, dict)
+	if !ok {
+		return nil, idxAbsent
+	}
+	return node, idxValue
+}
+
+// pathNode walks a nested path to the node holding its value, classifying what it finds the
+// way the EVALUATOR would read it -- which for a select is not the way a top-level attribute
+// reads.
+//
+//   - The root attribute absent makes the whole select UNDEFINED (`[Other=1]` has no `Res`, so
+//     `Res.Mem` is undefined), the one case that is a true absence.
+//   - A root that is not a record literal is not absence: selecting a member of an integer, a
+//     string or a list is an ERROR or a list, and `Res.Mem =!= undefined` is TRUE for both. A
+//     record left out of the postings AND out of the exceptions would be dropped from that
+//     query's candidates, so it goes in the exceptions.
+//   - A member MISSING from a record that is there is the subtle one: a select chains to the
+//     enclosing ad, so `[ Mem = 4096; Res = [ Other = 1 ] ]` has `Res.Mem` = 4096, not
+//     undefined. What the path evaluates to is then a question about an attribute the index
+//     entry is not keyed on, so the index declines to answer it and the record becomes an
+//     exception. Reading it as absent would be the one unsound choice available.
+//
+// A root that is an unevaluated expression is an exception for the same reason a top-level
+// one is: it may evaluate to anything, including the probe's value.
+func (s *indexSpec) pathNode(ad wire.Ad, p attrPath, dict *segDictHandle) ([]byte, idxNodeState) {
+	node, ok := s.compNode(ad, p, 0, dict)
+	if !ok {
+		return nil, idxAbsent
+	}
+	for i := 1; i < len(p.comps); i++ {
+		if wire.ClassifyNode(node) != wire.ClassRecord {
+			return nil, idxUnknown
+		}
+		m, ok := s.recordMember(node, p, i, dict)
+		if !ok {
+			return nil, idxUnknown // missing from the record: the select chains out of it
+		}
+		node = m
+	}
+	return node, idxValue
+}
+
+// compNode reads the path's root attribute, in whichever encoding this record carries (see
+// attrNode, which does the same for a top-level index entry).
+func (s *indexSpec) compNode(ad wire.Ad, p attrPath, i int, dict *segDictHandle) ([]byte, bool) {
+	if dict != nil {
+		localid, ok := dict.segIDOf(p.comps[i])
+		if !ok {
+			return nil, false // the segment's dictionary never saw the name: no record has it
+		}
+		return ad.Lookup(uint32(localid)) //idspace:translate a dictionary-keyed record is keyed by the segID
+	}
+	if s.inline {
+		return ad.LookupByName(p.comps[i])
+	}
+	return ad.Lookup(p.ids[i])
+}
+
+// recordMember reads component i out of a nested record node, whose members are keyed the way
+// the enclosing record's attributes are.
+func (s *indexSpec) recordMember(node []byte, p attrPath, i int, dict *segDictHandle) ([]byte, bool) {
+	if dict != nil {
+		localid, ok := dict.segIDOf(p.comps[i])
+		if !ok {
+			return nil, false
+		}
+		return wire.RecordMemberID(node, uint32(localid)) //idspace:translate a dictionary-keyed record is keyed by the segID
+	}
+	if s.inline {
+		return wire.RecordMemberName(node, p.comps[i])
+	}
+	return wire.RecordMemberID(node, p.ids[i])
+}
+
 func (s *indexSpec) any() bool { return s != nil && (len(s.catIDs) > 0 || len(s.valIDs) > 0) }
 
-// newIndexSpec resolves configured attribute names to interned ids (gen 0).
+// newIndexSpec resolves configured attribute names to interned ids (gen 0). A name holding a
+// dot configures an index on that nested path (see splitAttrPath).
 func newIndexSpec(intern *wire.InternTable, catNames, valNames []string) *indexSpec {
 	s := &indexSpec{cat: map[uint32]struct{}{}, val: map[uint32]struct{}{}}
 	for _, name := range catNames {
-		id := intern.Intern(name)
+		id, ok := s.indexID(intern, name)
+		if !ok {
+			continue
+		}
 		if _, dup := s.cat[id]; !dup {
 			s.cat[id] = struct{}{}
 			s.catIDs = append(s.catIDs, id)
 		}
 	}
 	for _, name := range valNames {
-		id := intern.Intern(name)
+		id, ok := s.indexID(intern, name)
+		if !ok {
+			continue
+		}
 		if _, dup := s.val[id]; !dup {
 			s.val[id] = struct{}{}
 			s.valIDs = append(s.valIDs, id)
@@ -215,6 +461,50 @@ func (s *indexSpec) signature() uint64 {
 	for _, id := range val {
 		mix(uint64(id))
 	}
+	// Composites join the signature so that adding or dropping one marks every segment's
+	// index stale, exactly as adding an attribute does -- a sealed sidecar carries its
+	// composites (v11), so it has to be rebuilt when the tuple set moves on.
+	//
+	// A spec with NO composite contributes nothing here, so the composite set cannot move
+	// the signature of a configuration that has none. That is deliberate: mixing an empty
+	// tuple set in would give every such configuration a different signature from the one
+	// its sidecars were written under, and every sidecar on disk would read as stale --
+	// re-indexing a whole archive for a feature it does not use.
+	if len(s.comps) > 0 {
+		keys := make([]string, 0, len(s.comps))
+		for _, cs := range s.comps {
+			keys = append(keys, cs.key)
+		}
+		sort.Strings(keys)
+		mix(^uint64(0))
+		for _, k := range keys {
+			for i := 0; i < len(k); i++ {
+				h ^= uint64(k[i])
+				h *= prime64
+			}
+			mix(^uint64(0))
+		}
+	}
+	if len(s.paths) > 0 {
+		// The path ids again, under their own separator: the same id means a different index
+		// depending on whether it is keyed on an attribute or on a path, and a sidecar built
+		// under one must not read as current under the other.
+		//
+		// Only when there ARE paths, so a configuration without them signs exactly as it did
+		// before path indexes existed. Mixing the separator unconditionally would change every
+		// gen in the world, and every sidecar on disk would read as stale and be rebuilt on
+		// the first Reindex after an upgrade -- correct, but a whole-store reindex nobody
+		// asked for.
+		mix(^uint64(1))
+		paths := make([]uint32, 0, len(s.paths))
+		for id := range s.paths {
+			paths = append(paths, id)
+		}
+		sort.Slice(paths, func(i, j int) bool { return paths[i] < paths[j] })
+		for _, id := range paths {
+			mix(uint64(id))
+		}
+	}
 	return h
 }
 
@@ -237,6 +527,13 @@ func (s *indexSpec) clone() *indexSpec {
 		n.auto = make(map[uint32]struct{}, len(s.auto))
 		for id := range s.auto {
 			n.auto[id] = struct{}{}
+		}
+	}
+	n.comps = append([]compositeSpec(nil), s.comps...)
+	if s.paths != nil {
+		n.paths = make(map[uint32]attrPath, len(s.paths))
+		for id, p := range s.paths {
+			n.paths[id] = p
 		}
 	}
 	if s.inline {
@@ -264,7 +561,7 @@ func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
 		nameToID: map[string]uint32{},
 	}
 	for _, name := range catNames {
-		id, ok := s.inlineID(name)
+		id, ok := s.indexID(nil, name)
 		if !ok {
 			continue
 		}
@@ -274,7 +571,7 @@ func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
 		}
 	}
 	for _, name := range valNames {
-		id, ok := s.inlineID(name)
+		id, ok := s.indexID(nil, name)
 		if !ok {
 			continue
 		}
@@ -293,8 +590,13 @@ func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
 // equalIDs reports whether two specs index exactly the same attribute ids in the
 // same buckets (order-insensitive), i.e. an add/drop would be a no-op.
 func (s *indexSpec) equalIDs(o *indexSpec) bool {
-	if len(s.cat) != len(o.cat) || len(s.val) != len(o.val) {
+	if len(s.cat) != len(o.cat) || len(s.val) != len(o.val) || len(s.comps) != len(o.comps) {
 		return false
+	}
+	for i, cs := range s.comps {
+		if cs.key != o.comps[i].key {
+			return false
+		}
 	}
 	for id := range s.cat {
 		if _, ok := o.cat[id]; !ok {
@@ -323,9 +625,18 @@ type catPostings struct {
 	// the rare buckets that mix case; case-uniform buckets store just a small string.
 	exact     map[string]*roaring.Bitmap
 	exactCase map[string]string
-	exc       *roaring.Bitmap
-	posted    *roaring.Bitmap // records that posted a literal value (for presence probes)
-	stats     segStats        // filled by finishStats after all records are indexed
+	// keys is post's keys in ascending order, for the prefix probes -- the categorical
+	// counterpart of valPostings.sortedKeys, but built ON FIRST USE rather than at finish.
+	// Sorting them eagerly cost 0.8ms -> 3.3ms to summarize one segment's postings for an
+	// attribute with a distinct value per record, on the write path, for a probe shape most
+	// queries never use. post is immutable once the index is finished and published, so the
+	// order can be computed later and shared; keysOnce builds it and the pointer publishes
+	// it to readers that have not gone through the Once (sizeBytes).
+	keys     atomic.Pointer[[]string]
+	keysOnce sync.Once
+	exc      *roaring.Bitmap
+	posted   *roaring.Bitmap // records that posted a literal value (for presence probes)
+	stats    segStats        // filled by finishStats after all records are indexed
 }
 type valPostings struct {
 	// post's keys are the values this attribute takes, and a key must therefore be usable
@@ -352,6 +663,7 @@ type segIndex struct {
 	all     *roaring.Bitmap         // offsets of all covered records (for `!=` = all minus value)
 	cat     map[uint32]*catPostings // interned attr id -> postings
 	val     map[uint32]*valPostings
+	comp    map[string]*compPostings // composite tuple identity -> postings (see composite.go)
 }
 
 // buildSegIndex scans a segment's records in [0, upto) and returns its index for
@@ -382,6 +694,9 @@ func (si *segIndex) finish() {
 	for _, vp := range si.val {
 		vp.finishStats()
 	}
+	for _, cp := range si.comp {
+		cp.finishStats()
+	}
 }
 
 // indexSegRange posts seg's records in [from, upto) into a new, UNFINISHED segIndex whose upto is
@@ -396,6 +711,7 @@ func indexSegRange(c *Collection, seg *segment, from, upto int, spec *indexSpec)
 		all:     roaring.New(),
 		cat:     make(map[uint32]*catPostings, len(spec.catIDs)),
 		val:     make(map[uint32]*valPostings, len(spec.valIDs)),
+		comp:    make(map[string]*compPostings, len(spec.comps)),
 	}
 	for _, id := range spec.catIDs {
 		si.cat[id] = &catPostings{
@@ -407,6 +723,9 @@ func indexSegRange(c *Collection, seg *segment, from, upto int, spec *indexSpec)
 	}
 	for _, id := range spec.valIDs {
 		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New(), posted: roaring.New()}
+	}
+	for _, cs := range spec.comps {
+		si.comp[cs.key] = &compPostings{spec: cs, post: map[string]*roaring.Bitmap{}, exc: roaring.New()}
 	}
 	var buf []byte
 	dm := seg.damaged()
@@ -455,9 +774,13 @@ func indexSegRange(c *Collection, seg *segment, from, upto int, spec *indexSpec)
 func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *segDictHandle) {
 	for _, id := range spec.catIDs {
 		cp := si.cat[id]
-		node, ok := spec.attrNode(ad, id, dict)
-		if !ok {
-			continue // absent
+		node, st := spec.indexNode(ad, id, dict)
+		if st == idxAbsent {
+			continue
+		}
+		if st == idxUnknown {
+			cp.exc.Add(o)
+			continue
 		}
 		if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitString {
 			// ClassAd string == is case-insensitive; index under a folded key for
@@ -484,8 +807,12 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *seg
 	}
 	for _, id := range spec.valIDs {
 		vp := si.val[id]
-		node, ok := spec.attrNode(ad, id, dict)
-		if !ok {
+		node, st := spec.indexNode(ad, id, dict)
+		if st == idxAbsent {
+			continue
+		}
+		if st == idxUnknown {
+			vp.exc.Add(o)
 			continue
 		}
 		// scalarValue, not LiteralValue: a negative number written before the encoder folded it
@@ -536,6 +863,115 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *seg
 			vp.exc.Add(o) // list / record / computed expression
 		}
 	}
+	for _, cs := range spec.comps {
+		si.indexCompositeRecord(o, ad, spec, dict, cs)
+	}
+}
+
+// indexCompositeRecord posts record o under one composite's tuple key, classifying the
+// record exactly as the components' own indexes classify it (see composite.go):
+//
+//   - every component a key the component's index could post -> the tuple posting;
+//   - some component the index cannot classify (idxUnknown, or a value its own index would
+//     make an exception: an expression, a NaN, a string where a number was expected) -> the
+//     composite's exception set, because the index cannot tell whether the record matches;
+//   - some component ABSENT -> neither. An equality on an attribute the ad does not carry
+//     is UNDEFINED, so the conjunction cannot be TRUE, and the single-attribute equality
+//     path (post | exc) leaves such a record out for the same reason.
+//
+// It reads each component through indexNode, so a component keyed on a nested path is
+// resolved and classified exactly as its own index resolves and classifies it.
+func (si *segIndex) indexCompositeRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *segDictHandle, cs compositeSpec) {
+	cp := si.comp[cs.key]
+	if cp == nil {
+		return
+	}
+	key := make([]byte, 0, 16*len(cs.ids))
+	for i, id := range cs.ids {
+		node, st := spec.indexNode(ad, id, dict)
+		switch st {
+		case idxAbsent:
+			return // absent component
+		case idxUnknown:
+			cp.exc.Add(o)
+			return
+		}
+		if cs.cats[i] {
+			k, keyable := compositeCatKey(node)
+			if !keyable {
+				cp.exc.Add(o)
+				return
+			}
+			key = appendCompStr(key, k)
+			continue
+		}
+		f, keyable := compositeValKey(node)
+		if !keyable {
+			cp.exc.Add(o)
+			return
+		}
+		key = appendCompFloat(key, f)
+	}
+	addOffset(cp.post, string(key), o)
+}
+
+// compositeCatKey folds a categorical component's value to the key its own catPostings
+// would post it under: a string folded to lower case, a boolean to "true"/"false".
+// Anything else is not keyable (the catPostings path puts it in exc).
+func compositeCatKey(node []byte) (string, bool) {
+	lit, ok := wire.LiteralValue(node)
+	if !ok {
+		return "", false
+	}
+	switch lit.Kind {
+	case wire.LitString:
+		return strings.ToLower(lit.Str), true
+	case wire.LitBool:
+		if lit.Bool {
+			return "true", true
+		}
+		return "false", true
+	}
+	return "", false
+}
+
+// compositeValKey folds a value component to the float64 its own valPostings would post it
+// under. A NaN is not keyable, for the reason valPostings refuses it: it is equal to
+// nothing, so no lookup could find it again.
+func compositeValKey(node []byte) (float64, bool) {
+	lit, ok := scalarValue(node)
+	if !ok {
+		return 0, false
+	}
+	switch lit.Kind {
+	case wire.LitInt:
+		return float64(lit.Int), true
+	case wire.LitReal:
+		if math.IsNaN(lit.Real) {
+			return 0, false
+		}
+		return lit.Real, true
+	case wire.LitBool:
+		if lit.Bool {
+			return 1, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// sortedKeys returns post's keys in ascending order, sorting them on first use. Safe to
+// call from several readers at once; see the keys field.
+func (cp *catPostings) sortedKeys() []string {
+	cp.keysOnce.Do(func() {
+		ks := make([]string, 0, len(cp.post))
+		for k := range cp.post {
+			ks = append(ks, k)
+		}
+		sort.Strings(ks)
+		cp.keys.Store(&ks)
+	})
+	return *cp.keys.Load()
 }
 
 // finalizeExact collapses case-uniform buckets: for every folded key whose records

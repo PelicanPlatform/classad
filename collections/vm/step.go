@@ -3,8 +3,9 @@ package vm
 // CHARGED STEPS: what one execution is billed for.
 //
 // A step is a VALUE OPERATION -- an instruction that produces a value: a literal, an attribute load,
-// a binary or unary operator, a logical combine, a member test, a call, a delegated subtree. It is
-// not a jump, a short-circuit test, a move, a local load or store, or a nop.
+// a binary or unary operator, a logical combine, a member test, an element load, a call, a
+// delegated subtree. It is not a jump, a short-circuit test, a move, a local load or store, or a
+// nop.
 //
 // WHY THAT LINE AND NOT "ONE INSTRUCTION". The count has two jobs, and only this definition does
 // both.
@@ -39,21 +40,22 @@ package vm
 // reclassifies every opcode after the one somebody inserts in the middle.
 const valueOps = 1<<OpPushConst | 1<<OpPushTrue | 1<<OpPushFalse | 1<<OpPushUndef | 1<<OpPushError |
 	1<<OpLoadRef | 1<<OpBinop | 1<<OpUnop | 1<<OpCombineAnd | 1<<OpCombineOr |
-	1<<OpMember | 1<<OpStrListMember | 1<<OpCallFunc | 1<<OpEvalNode
+	1<<OpMember | 1<<OpStrListMember | 1<<OpCallFunc | 1<<OpEvalNode | 1<<OpSubscript
 
 const regValueOps = 1<<RConst | 1<<RTrue | 1<<RFalse | 1<<RUndef | 1<<RError |
 	1<<RLoadRef | 1<<RBinop | 1<<RUnop | 1<<RCombineAnd | 1<<RCombineOr |
-	1<<RMember | 1<<RStrListMember | 1<<RCallFunc | 1<<REvalNode
+	1<<RMember | 1<<RStrListMember | 1<<RCallFunc | 1<<REvalNode | 1<<RSubscript
 
 // nonValueOps and regNonValueOps are the complements, written out rather than derived. They exist so
 // that an opcode added later is in NEITHER mask, which TestEveryOpcodeIsClassified turns into a
 // failure -- where a single mask would silently leave it uncharged, and an uncharged instruction in a
 // loop body is an execution that does not terminate.
 const nonValueOps = 1<<OpShortAnd | 1<<OpShortOr | 1<<OpJmpIfNotUndef | 1<<OpJmp | 1<<OpBranchCond |
-	1<<OpLoadLocal | 1<<OpStoreLocal | 1<<OpBranchVoid | 1<<OpJmpVoid | 1<<OpFault
+	1<<OpLoadLocal | 1<<OpStoreLocal | 1<<OpBranchVoid | 1<<OpJmpVoid | 1<<OpFault |
+	1<<OpShortSubscript
 
 const regNonValueOps = 1<<RNop | 1<<RMove | 1<<RShortAnd | 1<<RShortOr | 1<<RJump | 1<<RFault |
-	1<<RBranchCond | 1<<RJmpIfDefined
+	1<<RBranchCond | 1<<RJmpIfDefined | 1<<RShortSubscript
 
 // isValueOp reports whether a stack-form instruction is charged.
 func isValueOp(op Opcode) bool { return op < 64 && uint64(valueOps)>>op&1 != 0 }
