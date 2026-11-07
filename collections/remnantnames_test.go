@@ -153,7 +153,7 @@ func TestRemnantTrailerIsInvisibleToOlderParsers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cs := unmarshalColSegmentAs(body, f.c.regionCodec(), f.c.intern.Intern, version >= colPayloadVersionRemDict)
+			cs := unmarshalColSegmentAs(body, f.c.regionCodec(), f.c.intern.Intern, version)
 			if cs == nil || cs.remnants == nil {
 				t.Fatal("payload without a remnant list")
 			}
@@ -170,7 +170,7 @@ func TestRemnantTrailerIsInvisibleToOlderParsers(t *testing.T) {
 			if !bytes.HasSuffix(body, trailer) {
 				t.Fatal("the remnant list is not the payload's last bytes")
 			}
-			old := unmarshalColSegmentAs(body[:len(body)-len(trailer)], f.c.regionCodec(), f.c.intern.Intern, version >= colPayloadVersionRemDict)
+			old := unmarshalColSegmentAs(body[:len(body)-len(trailer)], f.c.regionCodec(), f.c.intern.Intern, version)
 			if old == nil || old.remnants != nil || len(old.blocks) != len(cs.blocks) || old.offsLen() != cs.offsLen() ||
 				!sameSchemaLayout(old.schema(), cs.schema()) {
 				t.Fatal("the payload without its trailer does not parse to the same segment")

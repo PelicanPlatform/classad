@@ -310,6 +310,10 @@ type columnarBlock struct {
 	listIDs   []uint32
 	listNames []string
 	listComp  []byte
+	// listMoved is how many of this block's records' list cells live ONLY in listComp: their records hold
+	// a placeholder where the list was (collistmove.go), and a read puts the list back. 0 when every list
+	// is still in its record, and then listComp is a copy.
+	listMoved int
 
 	// remDictComp is the block's remnant dictionary, compressed, and remDictN its entry count: the nodes
 	// its records' remnants repeat, each stored once and referenced in place (see colremdict.go). Empty

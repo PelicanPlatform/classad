@@ -39,6 +39,12 @@ func ScalarListElems(node []byte, fn func(elem []byte) bool) (int, bool) {
 	return int(n), true
 }
 
+// AppendListHeader appends the head of a list literal node of n elements: the node's tag and its element
+// count, exactly as the encoder writes them. The n element nodes follow it.
+func AppendListHeader(dst []byte, n int) []byte {
+	return binary.AppendUvarint(append(dst, nList), uint64(n))
+}
+
 // scalarNodeLen is the length of the scalar literal node at the start of b, other than ERROR.
 func scalarNodeLen(b []byte) (int, bool) {
 	switch b[0] {

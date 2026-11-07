@@ -96,6 +96,13 @@ const (
 // read a real node as a reference.
 const TagExternalRef = 0xFF
 
+// TagListRef is a second reserved node tag, with the same contract as TagExternalRef: this package never
+// writes it, and every decoder and skipper here rejects it as malformed. It is the placeholder a storage
+// layer leaves where it took a list literal out of a record into a typed column, so a record that reaches
+// one of this package's readers without the list put back fails to read rather than reading as a record
+// without the attribute.
+const TagListRef = 0xFE
+
 // nameHash32 is a case-insensitive 32-bit hash of an attribute name, used in the
 // hot header of inline-names ads (attribute names are case-insensitive, so the
 // hash folds case). FNV-1a over the lowercased bytes.

@@ -180,6 +180,20 @@ type Options struct {
 	// record. A caller that must stay openable by a build that predates dictionaries sets this negative.
 	// Every build from this one on reads them whatever this is set to.
 	RemnantDictionary int
+	// MoveListColumns decides whether columnarizing a segment stores a list-valued attribute's qualifying
+	// lists ONLY in the block's typed list column, leaving a short placeholder in each record where the
+	// list was (see collistmove.go), rather than keeping the list in the record and a copy in the column.
+	// Measured on pool slot ads, the lists are ~6.6% of the records' stored bytes. A cell moves only when
+	// the column's re-encoding of its values is the record's stored bytes exactly. 0 takes the default,
+	// which is ON; a negative value turns it off, and a positive one on.
+	//
+	// What an older build does with a segment holding a moved list: it refuses to open the collection
+	// (ErrUnsupportedColumnarVersion), and its fsck reports the segment's payload version (3) as
+	// unsupported. Nothing is lost or modified. To roll back to such a build, first run this one with the
+	// option negative: each schema review then re-columnarizes the segments holding moved lists (within
+	// ColumnarSegmentBudget) with the lists back in their records, until fsck reports no version 3
+	// payload. A segment with no qualifying list is written as before whatever this is set to.
+	MoveListColumns int
 	// RowGroupBytes is the uncompressed record-bytes budget for one columnar row group. 0 uses
 	// colGroupTargetBytes (128 KiB).
 	//
@@ -533,6 +547,7 @@ type Collection struct {
 	groupJac         float64 // Options.GroupMergeJaccard
 	colBudget        int     // Options.ColumnarSegmentBudget
 	remDict          int     // Options.RemnantDictionary
+	listMoves        int     // Options.MoveListColumns
 	// rowGroupBytes is Options.RowGroupBytes, settable at runtime (SetRowGroupBytes) because it only
 	// governs row groups sealed from now on -- blocks already written record their own layout. Atomic
 	// because every scan that seals a segment reads it.
@@ -849,6 +864,7 @@ func New(opts Options) *Collection {
 		groupJac:         opts.GroupMergeJaccard,
 		colBudget:        opts.ColumnarSegmentBudget,
 		remDict:          opts.RemnantDictionary,
+		listMoves:        opts.MoveListColumns,
 		groupMaxPart:     opts.GroupMaxPartialFrac,
 	}
 	c.rowGroupBytes.Store(int64(opts.RowGroupBytes))

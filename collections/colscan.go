@@ -55,6 +55,11 @@ type colSegment struct {
 	// is in no record of the segment, which is an exact answer; without it the remnant has to be read.
 	remnants *remnantSet
 
+	// listsInBody records that the base blocks' list columns were read from the payload body (a version 3
+	// payload) rather than from the ignorable extension trailer: they hold lists no record holds, so a
+	// trailer that turns out not to parse must not take them with it.
+	listsInBody bool
+
 	// For a columnarized segment's payload only (see bindNative): the collection and the arena the
 	// remnants live in, and the lazily built index of the schema-field cells those remnants still
 	// hold (colheld.go). nil on a sidecar payload, whose blocks hold every value they describe.

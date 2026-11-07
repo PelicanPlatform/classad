@@ -268,7 +268,8 @@ func TestListColumnBytesReport(t *testing.T) {
 	}
 	sample := loadCorpus(t)
 	dir := t.TempDir()
-	opts := Options{Dir: dir, Shards: 1, SegmentSize: 8 << 20, GroupSchemaCount: -1}
+	// The copy's cost: moving off (TestListMoveBytesReport measures moving).
+	opts := Options{Dir: dir, Shards: 1, SegmentSize: 8 << 20, GroupSchemaCount: -1, MoveListColumns: -1}
 	c, err := Open(opts)
 	if err != nil {
 		t.Fatal(err)
@@ -347,4 +348,91 @@ func TestListColumnBytesReport(t *testing.T) {
 	noListTotal, _, _ := segBytes()
 	t.Logf("same ads without their list attributes: %d sealed segment bytes; the lists cost the records about %d (%.2f%%)",
 		noListTotal, withoutTotal-noListTotal, 100*float64(withoutTotal-noListTotal)/float64(withoutTotal))
+}
+
+// sealedSegmentBytes is the used bytes of c's sealed segments, and of its columnarized ones.
+func sealedSegmentBytes(c *Collection) (sealed, columnarized int64) {
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg == nil || seg == sh.act {
+				continue
+			}
+			sealed += int64(seg.used)
+			if seg.columnarized() {
+				columnarized += int64(seg.used)
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return
+}
+
+// TestListMoveBytesReport measures what moving lists out of their records saves: the sealed segment bytes
+// (seg.used) of one store columnarized with no list columns (what main writes), with list columns as
+// copies, and with lists moved, and how many cells moved or stayed for their bytes. The committed pool
+// sample is a mutable table; files named by CLASSAD_LISTCOL_ADS are measured as archives. Opt-in:
+// CLASSAD_LISTCOL_MEASURE=1.
+func TestListMoveBytesReport(t *testing.T) {
+	if os.Getenv("CLASSAD_LISTCOL_MEASURE") == "" {
+		t.Skip("set CLASSAD_LISTCOL_MEASURE=1 to run")
+	}
+	prev := colListColumns
+	t.Cleanup(func() { colListColumns = prev })
+	files := []string{committedCorpus}
+	if extra := os.Getenv("CLASSAD_LISTCOL_ADS"); extra != "" {
+		files = append(files, strings.Split(extra, ",")...)
+	}
+	for fi, f := range files {
+		ads := readOldAds(t, f)
+		n := envInt(envWorkingN, 4000)
+		colListColumns = false
+		var c *Collection
+		if fi == 0 {
+			var err error
+			c, err = Open(Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 8 << 20, GroupSchemaCount: -1, MoveListColumns: -1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < n; i += 512 {
+				var batch []AdUpdate
+				for j := i; j < i+512 && j < n; j++ {
+					batch = append(batch, AdUpdate{Key: []byte(fmt.Sprintf("ad-%d", j)), Ad: ads[j%len(ads)]})
+				}
+				if err := c.Update(batch); err != nil {
+					t.Fatal(err)
+				}
+			}
+		} else {
+			// Tiled, as the pool sample is: a fixture of a few ads seals no segment of its own.
+			a, err := CreateArchive(ArchiveOptions{Dir: t.TempDir(), SegmentSize: 1 << 20, GroupSchemaCount: -1, MoveListColumns: -1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range n {
+				if err := a.Append(ads[i%len(ads)]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c = a.c
+		}
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatalf("%s: no schema", f)
+		}
+		c.ColumnarizeSealed()
+		_, none := sealedSegmentBytes(c)
+		colListColumns = true
+		recolumnarizeAll(t, c)
+		_, copied := sealedSegmentBytes(c)
+		m0, k0 := ListCellsMoved()
+		c.listMoves = 1
+		recolumnarizeAll(t, c)
+		_, moved := sealedSegmentBytes(c)
+		m1, k1 := ListCellsMoved()
+		pct := func(x int64) string { return fmt.Sprintf("%+.2f%%", 100*float64(x-none)/float64(none)) }
+		t.Logf("%s: %d ads; columnarized segment bytes: no list columns %d, copies %d (%s), moved %d (%s); "+
+			"cells moved %d, kept for their bytes %d; payload versions %v",
+			f, n, none, copied, pct(copied), moved, pct(moved), m1-m0, k1-k0, payloadVersions(t, c))
+		c.Close()
+	}
 }

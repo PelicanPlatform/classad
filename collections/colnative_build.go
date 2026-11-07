@@ -320,6 +320,21 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		}
 		rems = append(rems, remnant{off: o, body: body})
 	}
+	// The list cells the list columns hold, moved out of the records (collistmove.go). After the name list
+	// read the bodies -- a moved list keeps its key, so its name is listed either way -- and before the
+	// remnant dictionary, which then sees each moved cell as the placeholder it now is.
+	listsMoved := false
+	if captureLists && c.writeListMoves() {
+		bodies := make([][]byte, len(rems))
+		for i := range rems {
+			bodies[i] = rems[i].body
+		}
+		c.moveBlockLists(blocks, bodies, d, c.regionCodec())
+		for i := range rems {
+			rems[i].body = bodies[i]
+		}
+		listsMoved = cs.hasMovedLists()
+	}
 	// The repeated non-literal values, stored once per block and referenced in place (colremdict.go).
 	// Built over the bodies exactly as they will be stored, after the name list read them, and before
 	// they are compressed -- the references are what makes each one smaller.
@@ -340,8 +355,9 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		rems[i].body = enc
 		total += recordLen(len(recKey(src.data, rems[i].off)), len(enc))
 	}
-	if remDict && !remNamed {
-		// Re-marshaled so the payload carries the dictionaries and the size below includes them.
+	if (remDict || listsMoved) && !remNamed {
+		// Re-marshaled so the payload carries the dictionaries and moved lists, and the size below
+		// includes them.
 		if blob = marshalColPayload(cs, func(id uint32) (string, bool) { return c.intern.Name(id) }); blob == nil {
 			return nil, nil, nil
 		}
