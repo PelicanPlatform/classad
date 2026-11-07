@@ -484,6 +484,12 @@ type Collection struct {
 	// persisted index sidecar was handled (adopted vs. to-be-rebuilt). Emitted once at the end
 	// of Open via OpenIndexDiagHook. Written only on the single-threaded Open path.
 	openIdxDiag OpenIndexDiag
+	// compRefused is the configured composite tuples this store's index configuration could
+	// not install, with the reason for each (see CompositeRefusal). Written on the
+	// single-threaded construction path only -- New sets it, and a persistent Open REPLACES
+	// it when it re-resolves the same tuples against the inline spec -- so it is bounded by
+	// Options.CompositeAttrs and does not grow across reopens. Read by CompositeRefusals.
+	compRefused []CompositeRefusal
 	// recWalked counts records examined one at a time by the phases that walk them: extent
 	// recovery, the directory rebuild, the searches for a segment's dictionary and columnar
 	// payload records, index and zone builds, and the seal-collapse check. Open reads it into
@@ -938,7 +944,7 @@ func New(opts Options) *Collection {
 	}
 	baseSpec := newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs)
 	baseSpec.setComponentAttrs(c.intern, opts.CategoricalComponentAttrs, opts.ValueComponentAttrs)
-	baseSpec.setComposites(c.intern, opts.CompositeAttrs, false)
+	c.compRefused = baseSpec.setComposites(c.intern, opts.CompositeAttrs, false)
 	c.spec.Store(baseSpec)
 	// Zone maps (append-only only): cover the explicit ZoneAttrs plus every value-indexed
 	// attribute (a range query on an indexed attr should prune whole segments too), matching

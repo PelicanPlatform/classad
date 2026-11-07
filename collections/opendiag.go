@@ -34,6 +34,19 @@ type OpenIndexDiag struct {
 	StrandedSealedDeltas int
 	StrandedSealedKeys   [][]byte
 
+	// CompositeRefusals names the configured composite tuples this open could not install,
+	// and why (see CompositeRefusal). Empty on a store whose configuration resolves, which
+	// is the only state worth having. A non-empty one says the store came up WITHOUT an
+	// index its configuration asks for -- the queries that tuple was configured for still
+	// answer, by intersecting postings or by scanning, so nothing else here will ever
+	// mention it. It is reported alongside the sidecar reasons above because it is the same
+	// question asked of the configuration rather than of the files: why did this store open
+	// with fewer indexes than it was told to have?
+	//
+	// It is a property of this open's configuration, not an accumulation: the same tuple
+	// refused at every reopen appears once per open, never twice in one.
+	CompositeRefusals []CompositeRefusal
+
 	// IgnoredFiles names files in a shard directory that recovery did not load because
 	// their names do not parse as "seg-<n>.d<dict>.dat". Recovery skips them in silence,
 	// which is how a mangled segment name becomes invisible -- and an invisible segment's
