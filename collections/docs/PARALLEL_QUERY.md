@@ -1,12 +1,13 @@
 # Parallel query execution (across segments)
 
-> Status: **implemented** in `parallel_scan.go`. A full-scan `Query` can fan out
+> Status: **implemented** in `parallel_scan.go` (full decode) and `rawwire_parallel.go`
+> / `rawwire_ordered.go` (the wire-form reads). A full-scan read can fan out
 > across the collection's segments using a bounded worker pool, gated by a work-size
 > threshold and a machine-wide worker budget. `Options.QueryParallelism = 0` (the
 > default) means **auto** — the library picks the policy (currently: up to 6 workers
 > per query, clamped to GOMAXPROCS); `1` forces serial; `N ≥ 2` caps workers per
-> query. Serial and parallel produce identical result sets. Indexed queries and
-> `QueryRaw` remain serial for now (see Limitations).
+> query. Serial and parallel produce identical result sets. Which reads fan out is
+> listed under *Which reads fan out*; everything else runs serial.
 
 ## Why it is safe (and cheap)
 
@@ -62,6 +63,11 @@ Fan-out is **gated**, because for cheap queries on small collections the fixed c
 - The scan must be large enough: total live segment bytes ≥ a threshold
   (`parallelMinBytes`, benchmark-tuned).
 - There must be at least two segments to split.
+- The filter must be a full scan: no conjunct an index can use (`len(rp.usable) == 0`)
+  and not a disjunctive plan (`rp.disjunctive()`). Both walk index candidates instead
+  of segments.
+- The collection must not chain to a parent (`parentKeyFor`), which is read through
+  `scanShardChained` before the gate.
 
 **Machine-wide worker budget.** Intra-query parallelism helps the *latency* of one
 query and helps throughput only when query concurrency is *low* — a store already
@@ -74,6 +80,21 @@ concurrency rises the budget is spoken for and queries fall back to serial rathe
 oversubscribing. The auto per-query cap (6) is deliberately below the budget so that
 *several* concurrent queries can each fan out — fairness — instead of one query taking
 the whole machine and starving the rest to serial.
+
+## Which reads fan out
+
+| read | fan-out |
+|---|---|
+| `Query` (full decode, filtered) | the stealing fan-out, unless the collection is newest-first |
+| `ScanRawWire`, `ScanRawWireRefs` | `runUnconstrainedWireFanout` |
+| `QueryRawWire`, `QueryRawWireRefs` | `runWireFanout` |
+| `Scan` (full decode, unfiltered) | none — serial |
+| `QueryRaw`, `ScanRaw`, `QueryRawProjected` | none — serial |
+
+A newest-first collection takes the **ordered** fan-out (`runOrderedWireQuery`) rather
+than the stealing one, so the rows it yields keep the order the serial read promises.
+`runWireFanout` makes that choice in one place so the constrained and unconstrained
+spellings of the read cannot drift into making it differently.
 
 ## Contention: what oversubscription actually does
 
@@ -114,12 +135,24 @@ selectivities, and the concurrency stress runs under `-race`.
 
 ## Limitations / follow-ups
 
-- **Indexed queries** (`planIndex` hit) and **`QueryRaw`** stay serial. Indexed scans
-  already visit far fewer records (less to gain), and `RawAd` aliases reused buffers,
-  so parallelizing it needs owned copies. Both are straightforward extensions of the
-  same task/worker structure.
-- **`Scan`** (unfiltered) could reuse this path (it is `Query` with an always-true
-  predicate); left serial until the benchmarks justify it.
+- **The `RawAd` reads** (`QueryRaw`, `ScanRaw`, `QueryRawProjected`) stay serial:
+  `RawAd` aliases buffers the scan reuses, so handing one to a caller from a worker
+  needs owned copies. The wire-form reads avoid this by owning their arenas, which is
+  why they fan out and these do not.
+- **`Query` on a newest-first collection** stays serial, because its fan-out carries
+  no order. The wire reads answer the same collection through `runOrderedWireQuery`,
+  so the ordered structure exists and is not specific to the wire form; an archive is
+  the only kind of collection that sets `reverseScan`, so this is the one read path
+  with no fan-out available to it at all.
+- **`Scan`** (unfiltered, full decode) stays serial, though it is `Query` with an
+  always-true predicate and could reuse the same task/worker structure. The
+  unconstrained *wire* scans already do, so the remaining question is the `*ClassAd`
+  yield, not the split.
+- **Indexed and disjunctive reads** stay serial by design rather than by omission: an
+  indexed read already visits far fewer records, and both walk index candidates in an
+  order the segment split does not preserve.
+- `ExplainQuery`'s `Plan` describes the full-decode path. A wire read of a newest-first
+  collection fans out where that label says `serial-scan`.
 - The threshold and cap are constants today; they could become adaptive (e.g. scale
   workers to measured scan size, or track live core occupancy).
 
