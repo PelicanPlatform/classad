@@ -301,7 +301,7 @@ func (si *mmapSegIndex) catFind(attrOff uint32, key string) (bmOff uint32, ok bo
 
 // catKeyBases returns the three bases of a categorical attr block: the key-offset array,
 // the bitmap-offset array, and the key blob, along with the key count.
-func (si *mmapSegIndex) catKeyBases(attrOff uint32) (n uint32, keyOffBase, bmOffBase, blobBase uint32) {
+func (si *mmapSegIndex) catKeyBases(attrOff uint32) (n, keyOffBase, bmOffBase, blobBase uint32) {
 	n = le32(si.data, attrOff+8)
 	keyOffBase = attrOff + 12
 	bmOffBase = keyOffBase + (n+1)*4

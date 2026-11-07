@@ -53,8 +53,8 @@ func prefixFixture(t *testing.T, opts Options, n int) *Collection {
 		default:
 			ad.InsertAttrString("GlobalJobId", gjid)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("k%05d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%05d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.Reindex()
@@ -314,8 +314,8 @@ func TestPrefixCoveringEveryKey(t *testing.T) {
 			ad.InsertAttrString("GlobalJobId", fmt.Sprintf("ap%02d.%d.0#%d", i%7, i, i))
 			posted++
 		}
-		if err := c.Put([]byte(fmt.Sprintf("k%05d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%05d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.Reindex()
@@ -355,8 +355,8 @@ func TestPrefixProbeOnANestedPath(t *testing.T) {
 			t.Fatal(perr)
 		}
 		ad.InsertExpr("Res", rec)
-		if err := c.Put([]byte(fmt.Sprintf("k%05d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%05d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.Reindex()
