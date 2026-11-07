@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -442,4 +443,99 @@ func (a *ladderKindsAcc) AddNum(v NumValue) {
 	case NumReal:
 		a.reals++
 	}
+}
+
+// TestConstrainedCountStarUsesTheIndexNotEveryColumn pins the routing that decides whether a
+// history table's most-asked query is fast or 25x slower, and which nothing else asserts.
+//
+// A selective COUNT(*) WHERE on an INDEXED attribute must not be answered by the columnar tier.
+// The columns tier evaluates every visible record, so its cost follows the size of the ARCHIVE;
+// the scan below it walks the index postings, so its cost follows the number of MATCHES. The
+// routing exists (CountQuery declines to the scan when an index could prune instead), but it is
+// FAIL-OPEN: the check resolves the probe's attribute to an id, and a resolution that comes back
+// empty reads as "no index on this attribute" rather than as "could not tell". So any change that
+// makes the lookup miss silently turns the guard off and nothing fails.
+//
+// It did. On a persistent archive, whose index spec stores inline names, the lookup went to the
+// intern table alone and missed; a COUNT(*) over an indexed owner on a 933-segment, 6.1M-record
+// history table took 400-700ms where COUNT(ProcId) over the same predicate took 16ms, and cost
+// the same again for an owner matching NOTHING -- the signature of work that follows the archive
+// rather than the matches. The nothing-matching case is in here for that reason.
+//
+// The assertion is on the TIER rather than on a duration: the tier is the routing decision itself,
+// and a timing threshold on a fixture this small would be noise.
+func TestConstrainedCountStarUsesTheIndexNotEveryColumn(t *testing.T) {
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{
+		SegmentSize:      1 << 14,
+		CategoricalAttrs: []string{"Owner"},
+		ValueAttrs:       []string{"ClusterId", "JobStatus", "ProcId", "QDate"},
+		ZoneAttrs:        []string{"QDate", "ProcId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One rare owner among many common ones: the shape a per-user history query has.
+	const n, rareEvery = 20000, 2000
+	for i := range n {
+		owner := fmt.Sprintf("common%d", i%8)
+		if i%rareEvery == 0 {
+			owner = "rare"
+		}
+		if err := a.AppendOld(fmt.Sprintf(
+			"ClusterId = %d\nProcId = %d\nJobStatus = %d\nOwner = %q\nQDate = %d",
+			i/10, i%10, []int{1, 2, 4, 5}[i%4], owner, 1700000000+i*37)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.BuildAndEnableSchemaScan(4000, 8)
+
+	countStar := func(t *testing.T, constraint string) (string, collections.AggTier) {
+		t.Helper()
+		var st collections.ScanStats
+		rows, err := a.AggregateColsStats(constraint, nil, []AggSpec{{Func: AggCount, Arg: "*"}}, &st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || len(rows[0].Values) != 1 {
+			t.Fatalf("COUNT(*) WHERE %s returned %v, want one row of one value", constraint, rows)
+		}
+		return rows[0].Values[0], st.Tier
+	}
+
+	for _, tc := range []struct{ name, constraint, want string }{
+		{"selective", `Owner == "rare"`, strconv.Itoa(n / rareEvery)},
+		// An owner present in no segment. The index answers it without reading anything; the
+		// columns tier still evaluates every record, so this is where the two diverge most.
+		{"matches nothing", `Owner == "nosuch"`, "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, tier := countStar(t, tc.constraint)
+			if got != tc.want {
+				t.Fatalf("COUNT(*) WHERE %s = %s, want %s", tc.constraint, got, tc.want)
+			}
+			if tier == collections.TierColumnar {
+				t.Errorf("COUNT(*) WHERE %s was answered by the columnar tier, which evaluates every "+
+					"record; an index on Owner can prune to the matches, so the scan must take it",
+					tc.constraint)
+			}
+		})
+	}
+
+	// The other half of the routing, so a fix cannot be a blanket "always decline to the scan":
+	// an UNSELECTIVE predicate belongs on the columns, where reading one column beats walking
+	// postings for most of the archive.
+	t.Run("unselective stays columnar", func(t *testing.T) {
+		got, tier := countStar(t, `JobStatus == 4`)
+		if want := strconv.Itoa(n / 4); got != want {
+			t.Fatalf("COUNT(*) WHERE JobStatus == 4 = %s, want %s", got, want)
+		}
+		if tier != collections.TierColumnar {
+			t.Errorf("an unselective COUNT(*) was answered by %v, want the columnar tier", tier)
+		}
+	})
 }

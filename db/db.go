@@ -128,6 +128,12 @@ type Config struct {
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
+	// CompositeAttrs names attribute TUPLES to index together, so a conjunction pinning
+	// every component of one is answered by a single lookup rather than by intersecting
+	// each component's postings. Each component must also be indexed in its own right.
+	// (`omitempty` for the same reason the archive's is: an unconfigured field must not
+	// change the bytes an existing deployment's config file is rewritten with.)
+	CompositeAttrs [][]string `json:",omitempty"`
 
 	// DisableReadVerification turns off the per-record checksum check on reads for
 	// this table. Verification is ON by default (see
@@ -251,6 +257,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		HotAttrs:                cfg.HotAttrs,
 		CategoricalAttrs:        cfg.CategoricalAttrs,
 		ValueAttrs:              cfg.ValueAttrs,
+		CompositeAttrs:          cfg.CompositeAttrs,
 		MatchClosureRoots:       cfg.MatchClosureRoots,
 		SchemaRequireAttrs:      cfg.SchemaRequireAttrs,
 		GroupSchemaCount:        cfg.GroupSchemaCount,
@@ -853,6 +860,11 @@ func (db *DB) persistRequire(changed bool) (bool, error) {
 // IndexedAttrs returns the currently-indexed attribute names, split into
 // categorical (string equality/membership) and value (numeric + range) indexes.
 func (db *DB) IndexedAttrs() (categorical, value []string) { return db.c.IndexedAttrs() }
+
+// CompositeAttrs returns the attribute tuples indexed compositely, each in its configured
+// order. A composite answers a conjunction pinning every one of its components to a single
+// value, and nothing else.
+func (db *DB) CompositeAttrs() [][]string { return db.c.CompositeAttrs() }
 
 // SuggestDrops recommends indexes to drop (unused or low-cardinality) from
 // observed demand and a sample of up to sampleMax live ads.
