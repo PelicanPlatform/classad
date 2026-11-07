@@ -419,24 +419,21 @@ func (s *indexSpec) pruneComposites() {
 	s.comps = kept
 }
 
-// compositePinned reports whether some configured composite has every one of its components
-// pinned to a single value by usable, and marks those components' ids in into.
+// compositePinned marks, in into, the component ids of every configured composite whose
+// every component usable pins to a single value.
 //
 // This is the planner's gate on a component-only probe. Such a probe can only ever be
 // answered by a composite -- there are no postings for it to fall back to -- so one that no
 // configured composite can consume is dropped from the plan entirely rather than carried
 // into the single-attribute machinery, where an absent posting map reads as "no record
 // matches" and silently drops rows.
-func (s *indexSpec) compositePinned(usable []usableProbe, into map[uint32]struct{}) bool {
-	pinned := false
+func (s *indexSpec) compositePinned(usable []usableProbe, into map[uint32]struct{}) {
 	for _, cs := range s.comps {
 		if _, _, ok := compositeTupleKey(cs, usable); !ok {
 			continue
 		}
-		pinned = true
 		for _, id := range cs.ids {
 			into[id] = struct{}{}
 		}
 	}
-	return pinned
 }
