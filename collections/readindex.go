@@ -245,8 +245,29 @@ func indexSkipsPrefix(ix indexPrimitives, usable []usableProbe) bool {
 func indexEstCandidates(ix indexPrimitives, up usableProbe) float64 {
 	if up.op == "prefix" {
 		// Needs the key run as well as the stats, so it cannot be expressed on a bare
-		// segStats the way the other operators are.
+		// segStats the way the other operators are. It counts the keys in the run itself,
+		// so it already answers 0 (plus the exception set) for a prefix no key begins
+		// with, and needs no help from the skip proof below.
 		return estPrefixCandidates(ix, up)
+	}
+	// A segment the index PROVES holds no match contributes no candidates. Saying so here
+	// is not an optimization of the estimate but a correction of it: the per-probe
+	// estimators below answer "how many records would this value have IF this segment held
+	// it", and estEqualFloat has nothing to tell it otherwise -- a value index keeps no
+	// membership filter the way a categorical one does, so an equality on a value absent
+	// from the segment falls through to avgTailCount and scores a whole average posting.
+	// Summed across segments by Collection.estimateCandidates that is an assumption made
+	// once per segment, so a key living in one segment of 171 was priced at 171 postings.
+	// The min/max bound (and, for a categorical, the bloom) already knows better, and the
+	// skip path has always consulted it; only the estimate did not.
+	//
+	// It does not make the estimate exact. A key the bounds cannot exclude -- a segment
+	// whose [min,max] spans it because its neighbours are stored there -- is still priced
+	// as though the segment held it, which on randomly ordered keys is every segment. That
+	// needs a per-segment membership filter on value indexes, which is a sidecar format
+	// change and is deliberately not attempted here.
+	if indexCanSkip(ix, up) {
+		return 0
 	}
 	var total float64
 	// Only the presence probes need the segment's record count, and only they pay for it.
