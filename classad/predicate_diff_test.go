@@ -226,19 +226,222 @@ func evalSafe(e *Evaluator, expr ast.Expr) (result Value) {
 	return e.Evaluate(expr)
 }
 
+// The overlay dimension.
+//
+// Every generated input below is run under each of these configurations of the
+// evaluator's two resolver hooks, applied identically to both arms. Without this
+// dimension the differential covers only evaluators with nothing installed, and the
+// fast path's resolution of a reference is a SECOND implementation of
+// resolveAttributeReference -- so anything that path learns and this one does not is
+// a wrong answer that nothing here would notice. That is not hypothetical: the fast
+// path shipped reading the ad underneath an installed partial resolver, and what
+// caught it was a downstream module's own tests rather than anything in this file.
+//
+// The two hooks are not variations on one thing and fail differently:
+//
+//   - SetResolver replaces scope resolution outright. The fast path cannot reproduce
+//     its contract and declines whenever one is installed, so these arms assert the
+//     decline holds over the whole input space rather than on one hand-written case.
+//   - SetPartialResolver OVERLAYS it and may decline per name, which is the harder
+//     shape: a name it answers has a Value already, and a name it declines must
+//     resolve exactly as it would with nothing installed. Both halves are wrong
+//     silently -- an overlay the fast path skips reads the ad's value, and a
+//     comparison against it comes out the other way with nothing raised.
+type resolverOverlay struct {
+	name    string
+	install func(*Evaluator)
+}
+
+// overlayValue is the value an overlay answers a name with: deterministic in the
+// name, and drawn from the same semantic edge cases as the literal table so that an
+// overlaid operand can be undefined, error, a NaN, or a string that differs from the
+// ad's only in case.
+func overlayValue(name string) Value {
+	table := []Value{
+		NewIntValue(1),
+		NewIntValue((1 << 53) + 1),
+		NewRealValue(math.NaN()),
+		NewRealValue(1.5),
+		NewStringValue("ALICE"),
+		NewStringValue("overlaid"),
+		NewBoolValue(true),
+		NewUndefinedValue(),
+		NewErrorValue(),
+	}
+	// FNV-1a over the folded name: names match case-insensitively, so two spellings
+	// of one attribute must be answered with one value or the two arms would differ
+	// for a reason that is the test's fault.
+	var h uint32 = 2166136261
+	for _, c := range strings.ToLower(name) {
+		h = (h ^ uint32(c)) * 16777619
+	}
+	return table[h%uint32(len(table))]
+}
+
+// overlayAnswers decides which names an overlay claims, by the same hash, so that a
+// single run reaches both the answered and the declined branch rather than needing
+// one configuration for each.
+func overlayAnswers(name string) bool {
+	var h uint32 = 2166136261
+	for _, c := range strings.ToLower(name) {
+		h = (h ^ uint32(c)) * 16777619
+	}
+	return h%2 == 0
+}
+
+const (
+	overlayNone       = "no overlay"
+	overlayDeclines   = "partial declines everything"
+	overlayAnswersAll = "partial answers everything"
+)
+
+func resolverOverlays() []resolverOverlay {
+	return []resolverOverlay{
+		{name: overlayNone, install: func(*Evaluator) {}},
+		{
+			// The configuration that pins the fall-through: an overlay is installed
+			// and answers nothing, so every reference must resolve exactly as it
+			// does with no overlay at all -- same answers AND the same fast-path
+			// share, which the caller asserts.
+			name: overlayDeclines,
+			install: func(e *Evaluator) {
+				e.SetPartialResolver(func(string, ast.AttributeScope) (Value, bool) {
+					return NewUndefinedValue(), false
+				})
+			},
+		},
+		{
+			name: overlayAnswersAll,
+			install: func(e *Evaluator) {
+				e.SetPartialResolver(func(name string, _ ast.AttributeScope) (Value, bool) {
+					return overlayValue(name), true
+				})
+			},
+		},
+		{
+			// The realistic shape: some names bound, the rest left to the ad, both
+			// reached within a single evaluation.
+			name: "partial answers some",
+			install: func(e *Evaluator) {
+				e.SetPartialResolver(func(name string, _ ast.AttributeScope) (Value, bool) {
+					if !overlayAnswers(name) {
+						return NewUndefinedValue(), false
+					}
+					return overlayValue(name), true
+				})
+			},
+		},
+		{
+			// Scope-sensitive: the overlay claims MY.x and not x, so an arm that
+			// passed the wrong scope (or dropped it) would answer the wrong half of
+			// the references and diverge.
+			name: "partial answers MY only",
+			install: func(e *Evaluator) {
+				e.SetPartialResolver(func(name string, scope ast.AttributeScope) (Value, bool) {
+					if scope != ast.MyScope {
+						return NewUndefinedValue(), false
+					}
+					return overlayValue(name), true
+				})
+			},
+		},
+		{
+			name: "full resolver",
+			install: func(e *Evaluator) {
+				e.SetResolver(func(name string, _ ast.AttributeScope) Value {
+					return overlayValue(name)
+				})
+			},
+		},
+		{
+			// Both installed, which is the composition SetPartialResolver documents:
+			// a declined name falls to the full resolver and never to the ad. An
+			// implementation that fell to the ad instead would pass every arm above.
+			name: "partial over full resolver",
+			install: func(e *Evaluator) {
+				e.SetPartialResolver(func(name string, _ ast.AttributeScope) (Value, bool) {
+					if !overlayAnswers(name) {
+						return NewUndefinedValue(), false
+					}
+					return overlayValue(name), true
+				})
+				e.SetResolver(func(name string, _ ast.AttributeScope) Value {
+					return NewStringValue("from-resolver-" + strings.ToLower(name))
+				})
+			},
+		},
+	}
+}
+
+// evaluatorFor builds an evaluator over ad with ov installed. Both arms of every
+// differential go through it, so neither can be configured differently from the
+// other by accident.
+func evaluatorFor(ad *ClassAd, ov resolverOverlay) *Evaluator {
+	e := NewEvaluator(ad)
+	ov.install(e)
+	return e
+}
+
 // TestPredicateOperandDifferential asserts that every comparison the fast path
 // accepts produces exactly what the ordinary Value path produces for the same
-// operands, over generated ads crossed with the literal table, in every scope.
+// operands, over generated ads crossed with the literal table, in every scope, under
+// every overlay configuration.
 //
 // It reports the share of attempts that took the fast path. That number is the point
 // of the exercise and also the test's own health check: a decline rate of 100% would
 // make everything below pass while proving nothing, so the test fails if the fast
 // path turns out never to fire or never to decline.
+//
+// The shares across overlays are themselves asserted, because agreement alone cannot
+// tell a fast path that consults an overlay from one that stands down whenever a
+// hook is installed -- both answer correctly. See the checks after the loop.
 func TestPredicateOperandDifferential(t *testing.T) {
 	ads := append(generatedAds(t, 60), cyclicAds(t)...)
 	operands := append(refOperands(), literalOperands()...)
 
-	var attempts, fast int
+	shares := make(map[string]float64)
+	for _, ov := range resolverOverlays() {
+		t.Run(ov.name, func(t *testing.T) {
+			attempts, fast := operandDifferential(t, ads, operands, ov)
+			if fast == 0 {
+				t.Fatal("the fast path never fired: this subtest proved nothing")
+			}
+			if fast == attempts {
+				t.Fatal("the fast path never declined: the decline cases are untested")
+			}
+			shares[ov.name] = float64(fast) / float64(attempts)
+			t.Logf("operand differential: %d comparisons attempted, %d took the fast path (%.1f%%), %d declined (%.1f%%)",
+				attempts, fast, 100*shares[ov.name],
+				attempts-fast, 100*float64(attempts-fast)/float64(attempts))
+		})
+	}
+	if t.Failed() {
+		return
+	}
+
+	// An overlay that answers NOTHING must leave the fast path exactly where it was.
+	// This is the assertion that a coarse "stand down whenever a partial resolver is
+	// installed" guard fails: it is correct, so every divergence check above passes
+	// under it, and only the share shows that the overlay cost the fast path every
+	// reference it was supposed to cost it none of.
+	if shares[overlayDeclines] != shares[overlayNone] {
+		t.Errorf("an overlay that answers nothing changed the fast-path share: %.1f%% with it, %.1f%% without; a declined name must resolve as it does with no overlay installed",
+			100*shares[overlayDeclines], 100*shares[overlayNone])
+	}
+	// An overlay that answers EVERYTHING must cost the fast path every reference:
+	// the overlay hands back a Value, which is the ordinary path by definition. If
+	// this share did not drop, the fast path is reading the ad instead of asking.
+	if shares[overlayAnswersAll] >= shares[overlayNone] {
+		t.Errorf("an overlay that answers everything did not reduce the fast-path share (%.1f%% vs %.1f%%): references are being answered from the ad rather than from the overlay",
+			100*shares[overlayAnswersAll], 100*shares[overlayNone])
+	}
+}
+
+// operandDifferential is the body of the operand differential for one overlay: it
+// returns how many comparisons it attempted and how many the fast path decided, and
+// fails on the first divergence.
+func operandDifferential(t *testing.T, ads []*ClassAd, operands []ast.Expr, ov resolverOverlay) (attempts, fast int) {
+	t.Helper()
 	for _, ad := range ads {
 		for _, opStr := range predicateOps {
 			// The parser normalizes =?= / =!= to "is"/"isnt"; comparisonKind and
@@ -258,19 +461,19 @@ func TestPredicateOperandDifferential(t *testing.T) {
 			for _, lhs := range operands {
 				for _, rhs := range operands {
 					attempts++
-					got, ok := fastCompare(NewEvaluator(ad), c, lhs, rhs)
+					got, ok := fastCompare(evaluatorFor(ad, ov), c, lhs, rhs)
 					if !ok {
 						continue
 					}
 					fast++
 
-					slowEv := NewEvaluator(ad)
+					slowEv := evaluatorFor(ad, ov)
 					lv := evalSafe(slowEv, lhs)
 					rv := evalSafe(slowEv, rhs)
 					want := slowEv.applyBinaryValues(normOp, lv, rv)
 					if !valuesIdentical(got, want) {
-						t.Fatalf("predicate divergence\n  ad:    %s\n  expr:  %s %s %s\n  fast:  %s\n  slow:  %s\n  left:  %s\n  right: %s",
-							ad.String(), lhs.String(), opStr, rhs.String(),
+						t.Fatalf("predicate divergence\n  overlay: %s\n  ad:    %s\n  expr:  %s %s %s\n  fast:  %s\n  slow:  %s\n  left:  %s\n  right: %s",
+							ov.name, ad.String(), lhs.String(), opStr, rhs.String(),
 							describeValue(got), describeValue(want),
 							describeValue(lv), describeValue(rv))
 					}
@@ -278,15 +481,7 @@ func TestPredicateOperandDifferential(t *testing.T) {
 			}
 		}
 	}
-	if fast == 0 {
-		t.Fatal("the fast path never fired: this test proved nothing")
-	}
-	if fast == attempts {
-		t.Fatal("the fast path never declined: the decline cases are untested")
-	}
-	t.Logf("operand differential: %d comparisons attempted, %d took the fast path (%.1f%%), %d declined (%.1f%%)",
-		attempts, fast, 100*float64(fast)/float64(attempts),
-		attempts-fast, 100*float64(attempts-fast)/float64(attempts))
+	return attempts, fast
 }
 
 // armor rewrites an expression so the predicate fast path cannot fire anywhere in it,
@@ -483,6 +678,10 @@ func predicateExprs(t *testing.T) []ast.Expr {
 // short-circuiting past a comparison that would have errored, an undefined conjunct
 // poisoning a conjunction but not a disjunction, a conditional whose condition is a
 // fast-path comparison, and unary not over one.
+//
+// Each overlay configuration is applied to both arms, so a reference overlaid in the
+// middle of a conjunction has to compose the same way whether or not the comparison
+// around it took the fast path.
 func TestPredicateEndToEndDifferential(t *testing.T) {
 	ads := append(generatedAds(t, 25), cyclicAds(t)...)
 	exprs := predicateExprs(t)
@@ -495,20 +694,24 @@ func TestPredicateEndToEndDifferential(t *testing.T) {
 		assertArmored(t, armored[i])
 	}
 
-	var checked int
-	for _, ad := range ads {
-		for i, e := range exprs {
-			got := evalSafe(NewEvaluator(ad), e)
-			want := evalSafe(NewEvaluator(ad), armored[i])
-			if !valuesIdentical(got, want) {
-				t.Fatalf("end-to-end divergence\n  ad:      %s\n  expr:    %s\n  armored: %s\n  fast:    %s\n  slow:    %s",
-					ad.String(), e.String(), armored[i].String(),
-					describeValue(got), describeValue(want))
+	for _, ov := range resolverOverlays() {
+		t.Run(ov.name, func(t *testing.T) {
+			var checked int
+			for _, ad := range ads {
+				for i, e := range exprs {
+					got := evalSafe(evaluatorFor(ad, ov), e)
+					want := evalSafe(evaluatorFor(ad, ov), armored[i])
+					if !valuesIdentical(got, want) {
+						t.Fatalf("end-to-end divergence\n  overlay: %s\n  ad:      %s\n  expr:    %s\n  armored: %s\n  fast:    %s\n  slow:    %s",
+							ov.name, ad.String(), e.String(), armored[i].String(),
+							describeValue(got), describeValue(want))
+					}
+					checked++
+				}
 			}
-			checked++
-		}
+			t.Logf("end-to-end differential: %d (ad, expression) pairs agreed", checked)
+		})
 	}
-	t.Logf("end-to-end differential: %d (ad, expression) pairs agreed", checked)
 }
 
 // TestPredicateMatchmakingDifferential runs the same comparison under a MatchClassAd,
@@ -754,4 +957,64 @@ func fastCompare(e *Evaluator, c cmpKind, lhs, rhs ast.Expr) (result Value, ok b
 		return Value{}, false
 	}
 	return mapState(compareLiterals(c, l, r)), true
+}
+
+// TestPredicateOverlayConsultedOnce pins the two properties of the overlay consult
+// that the differential above cannot see, because both arms agree under either.
+//
+// First, an overlay is asked once per reference, not once per attempt. fn is the
+// caller's code; nothing in SetPartialResolver's contract makes it cheap or free of
+// effects, and asking twice is the shape a fast path falls into when it tests the
+// overlay and then hands the reference to Evaluate to do the work again.
+//
+// Second, a name the overlay declines resolves through the FULL resolver when one is
+// installed, never from the ad underneath it. The ad here holds a value that would
+// decide the comparison the other way, so an implementation that read it answers
+// false where the composition requires true.
+func TestPredicateOverlayConsultedOnce(t *testing.T) {
+	ad, err := Parse(`[ Owner = "from-the-ad"; Cpus = 1 ]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partialCalls, resolverCalls int
+	e := NewEvaluator(ad)
+	e.SetPartialResolver(func(string, ast.AttributeScope) (Value, bool) {
+		partialCalls++
+		return NewUndefinedValue(), false
+	})
+	e.SetResolver(func(name string, _ ast.AttributeScope) Value {
+		resolverCalls++
+		if strings.EqualFold(name, "Owner") {
+			return NewStringValue("from-the-resolver")
+		}
+		return NewUndefinedValue()
+	})
+
+	expr, err := parser.ParseExpr(`Owner == "from-the-resolver"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := evalSafe(e, expr)
+	if b, berr := got.BoolValue(); berr != nil || !b {
+		t.Fatalf("a declined name did not reach the full resolver: %s", describeValue(got))
+	}
+	if partialCalls != 1 {
+		t.Errorf("the overlay was consulted %d times for one reference, want 1", partialCalls)
+	}
+	if resolverCalls != 1 {
+		t.Errorf("the resolver was consulted %d times for one reference, want 1", resolverCalls)
+	}
+
+	// The same expression with the fast path suppressed: the ordinary path is the
+	// definition of how often each hook is asked, so this is what the count above is
+	// being held to rather than a number chosen here.
+	partialCalls, resolverCalls = 0, 0
+	slow := evalSafe(e, armor(expr))
+	if !valuesIdentical(got, slow) {
+		t.Fatalf("fast %s, slow %s", describeValue(got), describeValue(slow))
+	}
+	if partialCalls != 1 || resolverCalls != 1 {
+		t.Errorf("the ordinary path asked the overlay %d times and the resolver %d times; the fast path must match it, not a fixed number",
+			partialCalls, resolverCalls)
+	}
 }
