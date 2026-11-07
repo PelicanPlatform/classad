@@ -77,15 +77,6 @@ type ArchiveConfig struct {
 	// whole-segment query pruning (value-indexed attributes are included automatically).
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
-	// CompositeAttrs names attribute TUPLES to index together, so a conjunction pinning
-	// every component of one is answered by a single lookup rather than by intersecting
-	// each component's postings. Each component must also be indexed in its own right
-	// (categorically or by value); a tuple naming one that is not is dropped.
-	// (`omitempty` so a configuration with no composite writes the bytes it always wrote:
-	// the committed config fixtures are evidence that a deployment predating this code
-	// reopens unchanged, and a field that always appeared would spend that evidence.)
-	CompositeAttrs [][]string `json:",omitempty"`
-
 	// Unordered drops this archive's newest-first read order (collections.ArchiveOptions.
 	// Unordered). An archive that is a history file must leave it alone: condor_history's
 	// order is this table's whole contract. An archive whose rows are only aggregated or
