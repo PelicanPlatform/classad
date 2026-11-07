@@ -47,8 +47,9 @@ import (
 // IS WRITTEN -- there is no call instruction and no frame, so the program stays one program. A
 // body's bare name is a parameter, a name the body binds, or an attribute; the caller's locals are
 // not visible to it, which is the one thing a function changes about the binding model above. The
-// rest of what a function means, and why recursion is refused rather than bounded, is in
-// scriptfunc.go.
+// rest of what a function means, why recursion is refused rather than bounded, and why a call in
+// TAIL POSITION is the exception -- it is a back edge to the body's entry, which costs the model
+// nothing because a local is a place -- is in scriptfunc.go.
 //
 // WHEN A STATEMENT IS COMPILED. Statements are recorded as they are written and compiled by
 // Compile, which is what lets a call be written above the Func that defines it. A caller that wants

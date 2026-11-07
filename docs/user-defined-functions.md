@@ -457,13 +457,13 @@ engine's answer, so `?:` — which defaults only an `undefined` — does not cat
 it.
 
 **A local reads the same everywhere it appears.** A few constructs are handed to
-the tree-walking evaluator rather than compiled — a ternary, a selection, a lazy
-built-in such as `strcat` or `ifThenElse` — and they run with the script's locals
-overlaid on the ad, so a bare bound name there is the local:
+the tree-walking evaluator rather than compiled — a selection, a lazy built-in
+such as `strcat` — and they run with the script's locals overlaid on the ad, so a
+bare bound name there is the local:
 
 ```
 x = Cpus + 1
-result = x ? 2 : 3      # the ternary reads the LOCAL x
+result = strcat(x, " cpus")     # the lazy call reads the LOCAL x
 ```
 
 `MY.x` is the attribute there as everywhere, which is how you say you meant the
@@ -520,11 +520,43 @@ leave the caller's loop, and the same function would mean one thing where it is
 called from a loop and nothing at all where it is not. A function that wants to
 stop a caller's loop returns a value the caller breaks on.
 
+A function may call **itself in tail position** — `return f(...)` inside `f`,
+where the call's value is the function's value and nothing is left to do with
+it:
+
+```
+def fact(n, acc):
+    if n <= 1:
+        return acc
+    return fact(n - 1, acc * n)
+
+result = fact(10, 1)
+```
+
+The `return` is a jump back to the top of the body with the parameters set to
+the new arguments, so there is no second copy of the body and no stack to run
+out of. It counts as tail position wherever it is written — at the top of the
+body, inside an `if` or `else` arm, inside a `while` or a `for` — as long as the
+whole of what is returned is the call. Brackets round it make no difference:
+`return (fact(n - 1, acc * n))` is the same return. Each trip starts a fresh
+body: a name the body assigns is `undefined` again until that trip assigns it.
+Every argument is computed before any parameter is written, so a function can
+swap its own arguments.
+
+Nothing bounds the number of trips but the step budget, which is what bounds a
+`while` too. A function whose only statement is a call to itself compiles, and
+ends in `error` when the budget runs out.
+
 Three things a script function will not do:
 
-- **Recursion**, directly or in a cycle through other functions. A call is
-  written out in full where it appears, and something that contains itself
-  cannot be written out. The error names the cycle.
+- **Recursion anywhere but tail position.** `return f(x) + 1`,
+  `return g(f(x))`, `return (f(x)) + 1`, `x = f(x)`, a self-call in a
+  condition — each needs the call's value in the middle of something else, and
+  the only way to have one is to write the body out again, which for a call
+  that contains itself has no end. Mutual recursion, `f` calling `g` calling
+  `f`, is refused because the jump a tail call makes goes to the top of the
+  body it is written in, and `f`'s body is not `g`'s. The error names the
+  cycle.
 - **Shadowing.** A `def` may not take the name of a built-in or of a registered
   function, for the same reason a registration may not: `strcat` has to mean the
   same thing inside the script as outside it. In a *module* only the built-in
@@ -532,11 +564,11 @@ Three things a script function will not do:
   registered; whether the name is free is answered by the registry, as
   `ErrFunctionExists`.
 - **Being called from a construct that is evaluated rather than compiled** — a
-  ternary, a list or ad literal, a selection. That evaluator resolves a function
-  name against the built-ins and the registered functions, and a script's own
-  function is in neither, so the call would be `error`. The refusal carries a
-  line and column. Call the function from a statement and use the local, which a
-  ternary can read.
+  list or ad literal, a selection, a lazy built-in. That evaluator resolves a
+  function name against the built-ins and the registered functions, and a
+  script's own function is in neither, so the call would be `error`. The refusal
+  carries a line and column. Call the function from a statement and use the
+  local, which a ternary or a subscript can read.
 
 A function defined inside a script belongs to that script, and nothing outside it
 can call one. A script can also *call* a UDF, which is how one rule is shared
@@ -578,8 +610,12 @@ examplePct(Used, Label)     error
 the body does not bind is an attribute of the subject ad, and that is most of what
 makes a script function useful there. A registration has no subject ad, so
 `def fits(requested, cap): return Optimistic` is refused rather than registered —
-along with `MY.RequestMemory`, a call to `random()`, a ternary and a subscript.
-Pass what the function needs as a parameter. The error says which rule refused it
+along with `MY.RequestMemory`, a call to `random()`, a list literal and a
+selection. Pass what the function needs as a parameter.
+
+A body may use the operators and constructs the compiler lowers natively, over
+its parameters: arithmetic and comparison, `&&` and `||`, `?:`, a ternary
+`c ? t : f`, a subscript, `ifThenElse` and the strict built-ins. The error says which rule refused it
 and what to write instead, and `errors.Is(err, vm.ErrReadsAd)` tells that refusal
 apart from a function that simply does not compile.
 

@@ -49,7 +49,7 @@ result = largest * 1000 + over
 	// Output:
 	// [Cap = 4096; Requests = {1024, 8192, 2048}] -> 8192001
 	// [Cap = 4096; Requests = {}]                -> 0
-	// [Cap = 4096]                               -> condition fault at for #1 condition: the condition was neither true nor false
+	// [Cap = 4096]                               -> condition fault at for #1 condition: the condition was an error value
 }
 
 // A script local can be indexed, which is what the element load is for: `seq[0]` reads the local's

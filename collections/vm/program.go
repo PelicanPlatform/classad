@@ -39,6 +39,13 @@ type condTargets struct {
 	// header is the instruction a loop's condition starts at, which is where its back edge lands.
 	// Zero for an If.
 	header int32
+
+	// trueEnd is the instruction that closes a TERNARY's true arm -- its OpTernTrue -- and so the
+	// end of the region that arm occupies. The ternary is the one construct here whose arms are not
+	// delimited by the other targets: its false arm begins at onFalse and ends one before end, but
+	// the true arm's extent is visible nowhere else, and the vector executor needs it to know which
+	// records to run that arm for. Zero for an If or a While, neither of which has one.
+	trueEnd int32
 }
 
 // refInfo is a pooled attribute reference (name + scope) targeted by OpLoadRef.
@@ -107,6 +114,15 @@ type Program struct {
 	// restarts it from inside an arm. See execVec, which declines such a program to the per-record
 	// path rather than running a shape it would read as some other construct.
 	hasLoopJump bool
+
+	// hasTailCall marks a program holding a self-tail-call, whose back edge goes to the first
+	// instruction of a function body. It is set by the script builder for the vector executor, which
+	// reads control flow by REGION: a While is recognised by the conditional at its header, and that
+	// conditional is what drops the records it has become false for from the live set. A function
+	// entry has no conditional on it, so there is nothing for the lockstep walk to shrink the batch
+	// by, and a tail call written in one arm of an If would take the whole batch backwards with the
+	// other arm unrun. See execVec, which declines such a program to the per-record path.
+	hasTailCall bool
 
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick

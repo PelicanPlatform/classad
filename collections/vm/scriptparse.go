@@ -54,7 +54,10 @@ import (
 // a local of the code that called it. A function is therefore not pure, and one with no parameters
 // is still useful: `def over(): return RequestMemory > 4096` reads the ad. `return` with no operand,
 // and falling off the end, both give UNDEFINED. Recursion is refused, directly or in a cycle,
-// because an expansion that contains itself has no end; see scriptfunc.go.
+// because an expansion that contains itself has no end -- except for `return f(...)` inside f, where
+// the call IS the function's value: that one is a back edge to the top of the body with the
+// parameters set to the new arguments, and the step budget bounds it exactly as it bounds a `while`.
+// See scriptfunc.go.
 //
 // A `break` or a `continue` in a body is bound by a loop IN THAT BODY, and refused when there is
 // none -- including when the call itself sits inside a loop. The expansion puts the body's

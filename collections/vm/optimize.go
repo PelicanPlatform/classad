@@ -95,10 +95,12 @@ func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 		for _, b := range rp.nodeLocals[in.Imm] {
 			buf = append(buf, b.reg)
 		}
-	case RBinop, RCombineAnd, RCombineOr, RSubscript:
+	case RBinop, RCombineAnd, RCombineOr, RSubscript, RTernTrue, RTernFalse:
+		// A ternary arm's closer reads the condition (A) as well as the arm's value (B): which of
+		// the two it writes, and whether it writes at all, is decided by the condition.
 		buf = append(buf, in.A, in.B)
 	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond,
-		RShortSubscript:
+		RShortSubscript, RTernBranch:
 		buf = append(buf, in.A)
 	case RCallFunc:
 		buf = append(buf, rp.args[in.Args]...)
@@ -235,9 +237,17 @@ func substitute(rp *RegProgram, j int, from, to int32) {
 		if in.B == from {
 			in.B = to
 		}
-	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond, RShortSubscript:
+	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond,
+		RShortSubscript, RTernBranch:
 		if in.A == from {
 			in.A = to
+		}
+	case RTernTrue, RTernFalse:
+		if in.A == from {
+			in.A = to
+		}
+		if in.B == from {
+			in.B = to
 		}
 	case REvalNode:
 		// A delegated subtree reads the registers of the locals it mentions, which are operands

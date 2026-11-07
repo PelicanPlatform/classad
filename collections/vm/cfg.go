@@ -49,6 +49,14 @@ func stackSuccs(p *Program, ip int, buf []int) []int {
 		c := p.conds[in.A]
 		// Fallthrough is the true path; the other three are the condition's remaining states.
 		return append(buf, ip+1, int(c.onFalse), int(c.onUndef), int(c.onError))
+	case OpTernBranch:
+		c := p.conds[in.A]
+		// True and undefined both fall through into the true arm; false goes to the false arm; a
+		// condition with no truthiness leaves for the join having run neither.
+		return append(buf, ip+1, int(c.onFalse), int(c.end))
+	case OpTernTrue:
+		// True leaves for the join; undefined falls through into the false arm.
+		return append(buf, ip+1, int(p.conds[in.A].end))
 	case OpFault:
 		// Terminates the program. No successor, not even the exit: nothing after it runs.
 		return buf
@@ -198,6 +206,10 @@ func regSuccs(rp *RegProgram, ip int, buf []int) []int {
 	case RShortAnd, RShortOr, RJmpIfDefined, RShortSubscript:
 		// Defines Dst and jumps, or falls through without defining it.
 		return append(buf, int(in.T), ip+1)
+	case RTernBranch:
+		return append(buf, ip+1, int(rp.conds[in.Imm].onFalse), int(in.T))
+	case RTernTrue:
+		return append(buf, ip+1, int(in.T))
 	}
 	return append(buf, ip+1)
 }

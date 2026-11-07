@@ -129,6 +129,19 @@ const (
 
 	// RSubscript sets Dst to ApplySubscript(A, B) -- the container indexed by the index.
 	RSubscript
+
+	// RTernBranch, RTernTrue and RTernFalse are the ternary, one for one with the stack form's
+	// OpTernBranch/OpTernTrue/OpTernFalse. A holds the condition in all three; B holds the arm's
+	// value in the two that close an arm; T is the construct's join. All three write the same Dst,
+	// which is what the ternary needs instead of a join move: the register form's phi is resolved by
+	// construction here as it is for a logical operator, except that there are three writers rather
+	// than two and no path that leaves the value where it already was.
+	//
+	// RTernBranch uses RegProgram.conds[Imm] for the false arm's start. The other two need no target
+	// table: RTernTrue's only jump is to the join, and RTernFalse falls through to it.
+	RTernBranch
+	RTernTrue
+	RTernFalse
 )
 
 // RegInstr is one register-form instruction. Dst, A and B are register numbers; Imm is an index into
@@ -315,6 +328,10 @@ type lowerer struct {
 	// shortDst, so that an unbalanced one of either kind is found where it happened.
 	subDst []int32
 
+	// ternDst is the destination allocated by each open ternary, popped by the RTernFalse that
+	// closes it. Its own stack for the same reason, and because ternaries nest.
+	ternDst []int32
+
 	// pending maps a stack-form jump target to the joins that land there, innermost last.
 	pending map[int][]*joinPoint
 
@@ -478,8 +495,10 @@ func (l *lowerer) retarget() {
 		t.onError = l.newIdx[t.onError]
 		// end is unused by the register form -- a conditional's paths converge through joinPoint,
 		// not by a recorded index -- but it is mapped anyway so the struct never holds a mix of
-		// stack-form and register-form indices for the next reader to trip over.
+		// stack-form and register-form indices for the next reader to trip over. trueEnd goes the
+		// same way, for the same reason: the register form reads neither.
 		t.end = l.newIdx[t.end]
+		t.trueEnd = l.newIdx[t.trueEnd]
 	}
 }
 
@@ -592,6 +611,48 @@ func (l *lowerer) one(ip int) {
 		d := l.subDst[n-1]
 		l.subDst = l.subDst[:n-1]
 		l.emit(RegInstr{Op: RSubscript, Dst: d, A: a, B: b})
+		l.push(d)
+	case OpTernBranch:
+		// The condition stays on the stack for the rest of the construct, exactly as a logical
+		// operator's left operand stays for its combine. The destination allocated here is written
+		// by all three of the ternary's instructions, so the value is in one register at the join
+		// whichever outcome ran and there is nothing for a join move to carry.
+		if len(l.vstack) == 0 {
+			panic("vm: register lowering found a ternary with no condition")
+		}
+		a := l.vstack[len(l.vstack)-1]
+		d := l.reg()
+		t := l.src.conds[in.A]
+		l.rp.conds = append(l.rp.conds, t) // stack-form targets; retarget() maps them
+		k := int32(len(l.rp.conds) - 1)
+		ci := l.emit(RegInstr{Op: RTernBranch, Dst: d, A: a, Imm: k, T: t.end})
+		l.condInstrs = append(l.condInstrs, ci)
+		l.jumps = append(l.jumps, ci)
+		l.ternDst = append(l.ternDst, d)
+	case OpTernTrue:
+		// The arm's value is popped either way: on the true outcome it is moved into the
+		// destination, and on the undefined outcome it is discarded and the false arm runs next.
+		if len(l.ternDst) == 0 {
+			panic("vm: register lowering found a ternary true arm with no matching branch")
+		}
+		tv := l.pop()
+		if len(l.vstack) == 0 {
+			panic("vm: register lowering lost a ternary's condition")
+		}
+		a := l.vstack[len(l.vstack)-1]
+		d := l.ternDst[len(l.ternDst)-1]
+		j := l.emit(RegInstr{Op: RTernTrue, Dst: d, A: a, B: tv, T: l.src.conds[in.A].end})
+		l.jumps = append(l.jumps, j)
+	case OpTernFalse:
+		n := len(l.ternDst)
+		if n == 0 {
+			panic("vm: register lowering found a ternary false arm with no matching branch")
+		}
+		fv := l.pop()
+		a := l.pop() // the condition leaves the stack here, and the result takes its place
+		d := l.ternDst[n-1]
+		l.ternDst = l.ternDst[:n-1]
+		l.emit(RegInstr{Op: RTernFalse, Dst: d, A: a, B: fv})
 		l.push(d)
 	case OpCombineAnd, OpCombineOr:
 		b := l.pop()
@@ -728,29 +789,44 @@ func RunRegistersLimited(rp *RegProgram, scope *classad.ClassAd, budget int) (re
 func RunRegistersFault(rp *RegProgram, scope *classad.ClassAd, budget int) (result classad.Value, ok bool, fault *Fault) {
 	ev := classad.NewEvaluator(scope)
 	defer classad.RecoverCyclic(&result)
-	result, ok, site, _ := execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
-	if site >= 0 {
-		fault = rp.src.faultAt(site)
+	result, ok, fp, _ := execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
+	if fp.site >= 0 {
+		fault = rp.src.faultAt(fp.site, fp.cond)
 	}
 	return result, ok, fault
+}
+
+// faultPoint is where a fault stopped a run and what the condition held there. site is -1 when
+// nothing faulted.
+//
+// The condition VALUE travels with the site because the site alone cannot say why: a fault site is
+// static and the three causes an unreadable condition can have -- undefined, error, no truthiness
+// at all -- are only distinguishable from the value. See conditionCause.
+type faultPoint struct {
+	site int32
+	cond classad.Value
 }
 
 // execReg runs rp against ev, using regs as the register file. regs must have at least rp.nregs
 // entries; the caller may retain its backing array to amortize allocation across evaluations.
 //
-// site is the fault site an RFault stopped at, or -1 if none did. It is returned rather than looked
-// up here because the lookup is a diagnostic the hot path should not pay for: a caller that does not
-// want a report ignores it.
-func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool, int32, int) {
+// The fault point is returned rather than rendered here because the report is a diagnostic the hot
+// path should not pay for: a caller that does not want one ignores it.
+func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool, faultPoint, int) {
 	p := rp.src
 	code := rp.code
 	steps := 0
+	// The condition of the branch that last declined to choose, which is the one that sent control
+	// to a fault site: RFault is reachable from nowhere else, and the branch that reaches it is the
+	// one executed immediately before. Carrying it here rather than on the instruction keeps the
+	// fault site a static thing and costs an assignment on a path that is about to end the run.
+	var faultCond classad.Value
 	for ip := 0; ip < len(code); {
 		in := code[ip]
 		if isRegValueOp(in.Op) {
 			steps++
 			if steps > budget {
-				return classad.NewErrorValue(), false, -1, steps
+				return classad.NewErrorValue(), false, faultPoint{site: -1}, steps
 			}
 		}
 		switch in.Op {
@@ -812,7 +888,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 		case RFault:
 			// Ends the script. Returning here rather than jumping to an end label keeps the fault
 			// out of the register file: there is no result to have produced.
-			return classad.NewErrorValue(), true, in.Imm, steps
+			return classad.NewErrorValue(), true, faultPoint{site: in.Imm, cond: faultCond}, steps
 		case RBranchCond:
 			t := rp.conds[in.Imm]
 			switch classad.ConditionState(regs[in.A]) {
@@ -821,8 +897,10 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 			case classad.CondFalse:
 				ip = int(t.onFalse)
 			case classad.CondUndef:
+				faultCond = regs[in.A]
 				ip = int(t.onUndef)
 			default:
+				faultCond = regs[in.A]
 				ip = int(t.onError)
 			}
 		case RShortAnd:
@@ -846,6 +924,32 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 			} else {
 				ip++
 			}
+		case RTernBranch:
+			switch classad.ConditionState(regs[in.A]) {
+			case classad.CondTrue, classad.CondUndef:
+				ip++
+			case classad.CondFalse:
+				ip = int(rp.conds[in.Imm].onFalse)
+			default:
+				// Neither arm runs: a condition with no truthiness is the whole answer.
+				regs[in.Dst] = classad.NewErrorValue()
+				ip = int(in.T)
+			}
+		case RTernTrue:
+			if classad.ConditionState(regs[in.A]) == classad.CondTrue {
+				regs[in.Dst] = regs[in.B]
+				ip = int(in.T)
+			} else {
+				// Undefined: the arm's value is discarded and the false arm runs next.
+				ip++
+			}
+		case RTernFalse:
+			if classad.ConditionState(regs[in.A]) == classad.CondUndef {
+				regs[in.Dst] = classad.NewUndefinedValue()
+			} else {
+				regs[in.Dst] = regs[in.B]
+			}
+			ip++
 		case RShortSubscript:
 			if v := regs[in.A]; v.IsUndefined() || v.IsError() {
 				regs[in.Dst] = v
@@ -862,7 +966,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 		}
 	}
 	if rp.res < 0 {
-		return classad.NewUndefinedValue(), true, -1, steps
+		return classad.NewUndefinedValue(), true, faultPoint{site: -1}, steps
 	}
-	return regs[rp.res], true, -1, steps
+	return regs[rp.res], true, faultPoint{site: -1}, steps
 }

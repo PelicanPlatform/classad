@@ -138,6 +138,42 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) 
 			default:
 				ip = int(t.onError)
 			}
+		case OpTernBranch:
+			// The condition stays on the stack: the two instructions that close the arms read it
+			// again. A condition with no truthiness takes its slot as the result and leaves,
+			// running neither arm.
+			t := p.conds[in.A]
+			switch classad.ConditionState(stack[len(stack)-1]) {
+			case classad.CondTrue, classad.CondUndef:
+				ip++
+			case classad.CondFalse:
+				ip = int(t.onFalse)
+			default:
+				stack[len(stack)-1] = classad.NewErrorValue()
+				ip = int(t.end)
+			}
+		case OpTernTrue:
+			n := len(stack)
+			if classad.ConditionState(stack[n-2]) == classad.CondTrue {
+				// The arm's value is the result; the condition under it goes.
+				stack[n-2] = stack[n-1]
+				stack = stack[:n-1]
+				ip = int(p.conds[in.A].end)
+			} else {
+				// Undefined: the arm ran for whatever evaluating it did, and its value is not the
+				// answer. The false arm runs next, for the same reason.
+				stack = stack[:n-1]
+				ip++
+			}
+		case OpTernFalse:
+			n := len(stack)
+			res := stack[n-1]
+			if classad.ConditionState(stack[n-2]) == classad.CondUndef {
+				res = classad.NewUndefinedValue()
+			}
+			stack = stack[:n-1]
+			stack[n-2] = res
+			ip++
 		case OpCallFunc:
 			f := p.funcs[in.A]
 			base := len(stack) - f.argc

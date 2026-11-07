@@ -373,6 +373,10 @@ func TestFunctionCallsAreNative(t *testing.T) {
 		`ifThenElse(Cpus > 2, 1, 2) + 1`,
 		`ifThenElse(Cpus > 2, ifThenElse(Flag, 1, 2), 3)`, // nested
 		`IFTHENELSE(Cpus > 2, 1, 2)`,                      // names fold
+		// The ternary is its own triple of opcodes, so a strict call over one stays native too.
+		`Cpus > 2 ? 1 : 2`, `Missing ? 1 : 2`, `Cpus > 2 ? Owner : "none"`,
+		`Cpus > 2 ? (Flag ? 1 : 2) : 3`, // nested
+		`toUpper(Cpus > 2 ? "a" : "b")`,
 	}
 	for _, expr := range native {
 		q, err := Parse(expr)
@@ -387,7 +391,6 @@ func TestFunctionCallsAreNative(t *testing.T) {
 	delegated := map[string]string{
 		`ifThenElse(Cpus > 2, 1)`:       "wrong arity: ERROR without evaluating the arguments",
 		`ifThenElse(Cpus > 2, 1, 2, 3)`: "likewise",
-		`Cpus > 2 ? 1 : 2`:              "the ternary evaluates BOTH branches on an undefined condition",
 		`strcat(Owner, "!")`:            "lazy: stops at the first undefined/error argument",
 		`eval("Cpus + 1")`:              "parses a runtime string and resolves it in the scope",
 		`unparse(Cpus)`:                 "needs the argument's raw AST, not its value",
@@ -400,7 +403,6 @@ func TestFunctionCallsAreNative(t *testing.T) {
 		`pow(1, 2, 3)`:                  "likewise",
 		`noSuchFunction(Cpus)`:          "unknown name: ERROR without evaluating the arguments",
 		`size({1, 2, 3})`:               "strict call, but its argument is a delegated list literal",
-		`toUpper(Cpus > 2 ? "a" : "b")`: "strict call, but its argument is a delegated conditional",
 	}
 	for expr, why := range delegated {
 		q, err := Parse(expr)
@@ -456,14 +458,23 @@ func TestIfThenElseIsABranchNotACall(t *testing.T) {
 	if classad.StrictFunction("ifThenElse", 3) {
 		t.Error("StrictFunction accepts ifThenElse; the eager-call path must stay shut")
 	}
-	// The ternary keeps the same shape it had: delegated, because its undefined case evaluates both
-	// branches and a jump-based lowering would have to emit each branch twice.
+	// The ternary is native too, but it is NOT this construct: its undefined case evaluates both
+	// arms, so it gets the triple that shares them rather than a branch with a block per outcome.
 	tq, err := Parse(`Cpus > 2 ? 1 : 2`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tq.Native() {
-		t.Error("the ternary is native; its undefined case evaluates both branches")
+	if !tq.Native() {
+		t.Error("the ternary is delegated")
+	}
+	tp := tq.Program()
+	if usesOp(tp, OpBranchCond) {
+		t.Error("the ternary compiled to OpBranchCond, which does not evaluate either arm when the condition is undefined")
+	}
+	for _, op := range []Opcode{OpTernBranch, OpTernTrue, OpTernFalse} {
+		if !usesOp(tp, op) {
+			t.Errorf("the ternary did not emit opcode %d", op)
+		}
 	}
 }
 

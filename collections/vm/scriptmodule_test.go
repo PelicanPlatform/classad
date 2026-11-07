@@ -161,8 +161,11 @@ func TestScriptFuncCallsSibling(t *testing.T) {
 	}
 }
 
+// TestScriptFuncRecursionRefused pins that a module's inliner refuses a cycle exactly as a script's
+// does. The self-call has work left after it; one in tail position is a back edge and compiles, which
+// TestScriptTailCallInAModule covers.
 func TestScriptFuncRecursionRefused(t *testing.T) {
-	m, err := ParseScriptModule("def loop(x):\n    return loop(x)\n")
+	m, err := ParseScriptModule("def loop(x):\n    return loop(x) * 2\n")
 	if err != nil {
 		t.Fatalf("ParseScriptModule: %v", err)
 	}
@@ -190,14 +193,13 @@ func TestScriptFuncPurityGate(t *testing.T) {
 		{"target_read", "def f():\n    return TARGET.Memory\n", "reads TARGET.Memory"},
 		// A nondeterministic built-in is not compiled natively, so it arrives as a delegated node.
 		{"nondeterministic_builtin", "def f():\n    return random(10)\n", "random(10)"},
-		// A ternary over no local at all is delegated too, which is rule 4 again.
-		{"constant_ternary", "def f():\n    return (1 ? 2 : 3)\n", "(1 ? 2 : 3)"},
-		// A delegated construct over a parameter compiles -- the ternary reads the parameter's
-		// register -- and is refused HERE, by rule 4, because a registered function has no ad for
-		// the tree-walker to evaluate the rest of that subtree against and that evaluator need not
-		// be deterministic. Pinned because it is the one case where the overlay makes a function
-		// compile that used to be refused earlier, and the gate has to catch it either way.
-		{"ternary_over_param", "def f(x):\n    return (x ? 1 : 0)\n", "(x ? 1 : 0)"},
+		// A delegated construct over a parameter compiles -- the overlay binds the parameter's
+		// register for the tree-walker -- and is refused HERE, by rule 4, because a registered
+		// function has no ad for that evaluator to resolve the rest of the subtree against and
+		// that evaluator need not be deterministic. Pinned because it is the one case where the
+		// overlay makes a function compile that the compiler would otherwise refuse, and the gate
+		// has to catch it either way.
+		{"lazy_builtin_over_param", "def f(x):\n    return eval(x)\n", "eval(x)"},
 		// A list literal over a parameter is still refused by the COMPILER, before the gate: the
 		// elements are evaluated later, from a captured scope, where the register does not exist.
 		{"list_over_param", "def f(x):\n    return {x, 1}\n", `reads the local "x"`},
@@ -327,10 +329,10 @@ func TestScriptFuncConcurrent(t *testing.T) {
 	}
 }
 
-// TestScriptFuncDelegatedHintFitsWhatWasFound pins that the refusal's advice is chosen from the
-// construct that caused it. One fixed hint listed every workaround at once, so the author of a list
-// literal was told to rewrite a ternary they had not written.
-func TestScriptFuncDelegatedHintFitsWhatWasFound(t *testing.T) {
+// TestScriptFuncDelegatedRefusalNamesWhatWasFound pins that rule 4's refusal names the construct
+// that caused it, rather than listing every construct that could have. An author reading it should
+// find the expression they wrote in it.
+func TestScriptFuncDelegatedRefusalNamesWhatWasFound(t *testing.T) {
 	refusal := func(t *testing.T, src string) string {
 		t.Helper()
 		m, err := ParseScriptModule(src)
@@ -344,16 +346,16 @@ func TestScriptFuncDelegatedHintFitsWhatWasFound(t *testing.T) {
 		return ""
 	}
 
-	ternary := refusal(t, "def f(x):\n    return (1 ? 2 : 3)\n")
-	if !strings.Contains(ternary, "`if` statement") {
-		t.Errorf("a ternary should be told about `if`; got %q", ternary)
-	}
-
 	list := refusal(t, "def f(x):\n    return size({1, 2, 3})\n")
-	if strings.Contains(list, "ternary") {
-		t.Errorf("a list literal should not be told to rewrite a ternary; got %q", list)
-	}
 	if !strings.Contains(list, "{1, 2, 3}") {
 		t.Errorf("the refusal should name what it found; got %q", list)
+	}
+
+	lazy := refusal(t, "def f(x):\n    return eval(x)\n")
+	if !strings.Contains(lazy, "eval(x)") {
+		t.Errorf("the refusal should name what it found; got %q", lazy)
+	}
+	if strings.Contains(lazy, "{1, 2, 3}") {
+		t.Errorf("the refusal names a construct the function does not contain; got %q", lazy)
 	}
 }

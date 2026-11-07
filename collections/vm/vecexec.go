@@ -343,6 +343,14 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 		// case cannot be read as the first.
 		return nil, false
 	}
+	if p.hasTailCall {
+		// A self-tail-call. Its back edge goes to a function body's entry, which is not a loop
+		// header this walk ever opened a region for, and the records going round it are not the
+		// records of any one region: a tail call in an If arm would carry the batch backwards while
+		// the other arm still had records waiting to run. Declining is the whole answer, and it
+		// costs the scalar path nothing, which is where a recursive script is running anyway.
+		return nil, false
+	}
 	if p.hasStatements {
 		s.initPredicates()
 	}
@@ -520,6 +528,38 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 				s.intersectLive(b.masks[k])
 			}
 			s.pushBlend(b)
+		case OpTernBranch:
+			if s.depth == 0 {
+				return nil, false
+			}
+			ct := p.conds[in.A]
+			b := blendPending{target: int(ct.end), base: s.depth - 1, cond: true, tern: true}
+			// TWO REGIONS, ONE PER ARM, rather than one per condition state: the ternary has two
+			// arms and an undefined condition runs BOTH of them, so the true arm is needed by the
+			// records whose condition is TRUE or UNDEFINED and the false arm by those whose
+			// condition is FALSE or UNDEFINED. A record whose condition has no truthiness runs
+			// neither, which is why it is in no arm mask; the join gives it ERROR.
+			b.bounds = [5]int32{int32(ip + 1), ct.trueEnd, ct.onFalse, ct.end - 1, ct.end}
+			for k := range b.masks {
+				b.masks[k] = s.takeMask()
+			}
+			condStatePlanes(s.top(), b.masks, s.n)
+			// masks[2] is the undefined set, which is folded into both arms here and read again by
+			// nobody: the join asks the selector's condition state per record, exactly as these
+			// planes were built from it.
+			for w := range b.masks[0] {
+				b.masks[0][w] |= b.masks[2][w]
+				b.masks[1][w] |= b.masks[2][w]
+			}
+			for k := range b.masks {
+				s.intersectLive(b.masks[k])
+			}
+			s.pushBlend(b)
+		case OpTernTrue, OpTernFalse:
+			// No-ops, for OpJmp's reason. The scalar dispatch these perform -- take this arm's
+			// value, or discard it and run the other arm -- is a per-record choice, and here both
+			// arms run under their own masks and the join makes that choice per record. Each arm's
+			// value stays on the stack for it to read.
 		case OpJmp:
 			// Still a no-op. It is a conditional path's tail jump, and this executor runs every path in
 			// sequence and blends at the join -- so taking the jump would skip the paths that have not
@@ -639,12 +679,58 @@ type blendPending struct {
 	base   int  // stack slot of the selector; path values follow it
 	cond   bool // a conditional (four paths); otherwise Elvis (two)
 
+	// tern narrows cond to the TERNARY, which has two paths rather than four: its arms are shared
+	// between the outcomes that reach them, because an undefined condition evaluates both. It
+	// implies cond -- the selector is a condition, read by the same condition-state rule and never
+	// a source of the result -- and everything that asks how many paths there are asks this first.
+	tern bool
+
 	// For a conditional: where each path starts (plus the join, so every path has an end), which
 	// records take it, and which one has not been opened yet. The masks are owned HERE rather than by
 	// the regions that borrow them, because all four outlive the paths that run one at a time.
+	//
+	// For a ternary: each arm's start and end as a pair, [start0, end0, start1, end1], because its
+	// arms are not contiguous -- an instruction closes each of them -- so one arm's end is not the
+	// next one's start. masks[0] and masks[1] are the arms; masks[2] and masks[3] are the raw
+	// undefined and non-coercible sets, which the arm masks were built from and nothing reads again.
 	bounds   [5]int32
 	masks    [4][]uint64
 	nextPath int
+}
+
+// nPaths is how many conditionally-executed regions this construct has.
+func (b *blendPending) nPaths() int {
+	switch {
+	case b.tern:
+		return 2
+	case b.cond:
+		return 4
+	}
+	return 1
+}
+
+// pathStart and pathEnd give path k's half-open extent.
+func (b *blendPending) pathStart(k int) int32 {
+	if b.tern {
+		return b.bounds[2*k]
+	}
+	return b.bounds[k]
+}
+
+func (b *blendPending) pathEnd(k int) int32 {
+	if b.tern {
+		return b.bounds[2*k+1]
+	}
+	return b.bounds[k+1]
+}
+
+// pathSkip is where control goes when path k is taken by no record at all: the next path's start,
+// or the join if there is no next path.
+func (b *blendPending) pathSkip(k int) int32 {
+	if k+1 < b.nPaths() {
+		return b.pathStart(k + 1)
+	}
+	return int32(b.target)
 }
 
 // pushBlend records a construct whose join has not been reached.
@@ -675,12 +761,10 @@ func (s *VecScratch) applyBlends(ip int) bool {
 // mean a vector that is half one form and half the other.
 func (s *VecScratch) blend(b blendPending) bool {
 	// How many path values sit above the selector. A conditional pushes four (true, false, undefined,
-	// error). Elvis pushes ONE: its left operand is both the selector and the value taken when the
-	// selector is defined, so only the fallback is a separate path.
-	nPaths := 1
-	if b.cond {
-		nPaths = 4
-	}
+	// error); a ternary pushes two, one per arm. Elvis pushes ONE: its left operand is both the
+	// selector and the value taken when the selector is defined, so only the fallback is a separate
+	// path.
+	nPaths := b.nPaths()
 	if s.depth != b.base+1+nPaths {
 		return false // a path did not leave exactly one value; decline rather than guess
 	}
@@ -704,7 +788,24 @@ func (s *VecScratch) blend(b blendPending) bool {
 	}
 	for i := 0; i < dst.n; i++ {
 		var from *Vec
-		if b.cond {
+		switch {
+		case b.tern:
+			switch classad.ConditionState(sel.value(i)) {
+			case classad.CondTrue:
+				from = paths[0]
+			case classad.CondFalse:
+				from = paths[1]
+			case classad.CondUndef:
+				// Both arms ran for this record, and neither value is the answer: evaluating them
+				// was the observable part and UNDEFINED is the result.
+				dst.St[i], dst.I[i] = VsUndef, 0
+				continue
+			default:
+				// Neither arm ran for this record; a condition with no truthiness is the answer.
+				dst.St[i], dst.I[i] = VsError, 0
+				continue
+			}
+		case b.cond:
 			switch classad.ConditionState(sel.value(i)) {
 			case classad.CondTrue:
 				from = paths[0]
@@ -715,9 +816,9 @@ func (s *VecScratch) blend(b blendPending) bool {
 			default:
 				from = paths[3]
 			}
-		} else if sel.value(i).IsUndefined() {
+		case sel.value(i).IsUndefined():
 			from = paths[0] // the Elvis fallback
-		} else {
+		default:
 			from = sel // the left operand IS the value when it is defined
 		}
 		from.toData()

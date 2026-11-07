@@ -8,10 +8,10 @@ import (
 
 // Example_scriptDelegatedLocals shows what a delegated construct sees of a script's locals.
 //
-// A ternary, a select and a lazy built-in are evaluated by the tree-walking evaluator rather than
-// compiled, and they run with the script's locals overlaid on the ad. So a bare bound name there is
-// the local, exactly as it is in a compiled position -- and MY.x is still the attribute, which is
-// how a script says it meant the ad.
+// A select and a lazy built-in are evaluated by the tree-walking evaluator rather than compiled, and
+// they run with the script's locals overlaid on the ad. So a bare bound name there is the local,
+// exactly as it is in a compiled position such as a ternary -- and MY.x is still the attribute,
+// which is how a script says it meant the ad, in either kind of position.
 //
 // The ad below defines x as well, with a different value, so each line's answer says which one was
 // read.

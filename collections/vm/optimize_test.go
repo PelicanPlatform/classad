@@ -290,7 +290,7 @@ func TestDeadCodeKeepsWhatCanPanic(t *testing.T) {
 	}
 	// A DELEGATED SUBTREE is the same hazard by a different route: this one compiles to a single
 	// REvalNode, which hands the expression to the tree-walker, which hits the cycle.
-	cond, err := parser.ParseExpr("Cyc ? 1 : 2")
+	cond, err := parser.ParseExpr(`strcat(Cyc, "x")`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,11 +299,11 @@ func TestDeadCodeKeepsWhatCanPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	if countOp(spc.RegProgram(), REvalNode) == 0 {
-		t.Fatal("the conditional did not compile to REvalNode; this case is not testing what it says")
+		t.Fatal("the lazy call did not compile to REvalNode; this case is not testing what it says")
 	}
 	wantC := RunRegisters(spc.RegProgram(), scope)
 	if wantC.String() != "error" {
-		t.Fatalf("unoptimized conditional = %s, want error", wantC)
+		t.Fatalf("unoptimized delegated subtree = %s, want error", wantC)
 	}
 	if gotC := RunRegisters(Optimize(spc.RegProgram(), AllPasses()), scope); !valuesEqual(wantC, gotC) {
 		t.Errorf("optimized = %s, unoptimized = %s; a dead delegated subtree was removed",
