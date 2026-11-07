@@ -248,11 +248,14 @@ type Options struct {
 	// CompositeAttrs names attribute TUPLES to index together, so a conjunction of
 	// equalities on all of them (`ClusterId == 7 && ProcId == 3`) is one index lookup
 	// rather than a probe per attribute whose posting lists are then intersected. Each
-	// tuple's attributes must also appear in CategoricalAttrs or ValueAttrs -- a composite
-	// answers only the full tuple, and everything else (one attribute alone, a range) is
-	// served by the components' own indexes; a tuple naming an unindexed attribute is
-	// ignored. Order matters for identity: {"ClusterId","ProcId"} and {"ProcId","ClusterId"}
-	// are two composites, and either answers the same conjunctions. Optional.
+	// tuple's attributes must also appear in CategoricalAttrs or ValueAttrs, or in
+	// CategoricalComponentAttrs / ValueComponentAttrs; a tuple naming an attribute none of
+	// those lists mentions is ignored, because there is then no kind to fold its values
+	// with. A composite answers only the full tuple, and everything else (one attribute
+	// alone, a range) is served by the components' own indexes -- or, for a component-only
+	// attribute, by a scan. Order matters for identity: {"ClusterId","ProcId"} and
+	// {"ProcId","ClusterId"} are two composites, and either answers the same conjunctions.
+	// Optional.
 	CompositeAttrs [][]string
 	// CategoricalComponentAttrs / ValueComponentAttrs name attributes that are indexed ONLY
 	// as composite components: they may appear in a CompositeAttrs tuple, and they get no
