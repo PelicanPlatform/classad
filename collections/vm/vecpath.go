@@ -233,7 +233,7 @@ func (s *VecScratch) condPathAt(prefix []int32, ip int) (int, bool) {
 		return 0, false
 	}
 	b := &s.blends[len(s.blends)-1]
-	if !b.cond || b.nextPath >= 4 || int(b.bounds[b.nextPath]) != ip {
+	if !b.cond || b.nextPath >= b.nPaths() || int(b.pathStart(b.nextPath)) != ip {
 		return 0, false
 	}
 	k := b.nextPath
@@ -243,10 +243,11 @@ func (s *VecScratch) condPathAt(prefix []int32, ip int) (int, bool) {
 		// Bill everything up to here first, at the count that was in force for it, and only then
 		// move the run past the skipped path -- which itself bills nobody.
 		s.flushCharge(prefix, ip)
-		s.spanStart = int(b.bounds[k+1])
-		return int(b.bounds[k+1]), true
+		to := int(b.pathSkip(k))
+		s.spanStart = to
+		return to, true
 	}
-	s.openPathBorrowed(prefix, ip, b.bounds[k+1], b.masks[k])
+	s.openPathBorrowed(prefix, ip, b.pathEnd(k), b.masks[k])
 	return 0, false
 }
 

@@ -310,16 +310,12 @@ func (f *ScriptFunc) checkPure() error {
 	// The cost is that a few harmless expressions are refused too, which the message says how to
 	// work around.
 	if len(p.nodes) != 0 {
-		// The hint is chosen from what was actually found. A fixed one listed every workaround at
-		// once, which told the author of a list literal to rewrite a ternary they had not written.
-		hint := ""
-		if _, isTernary := p.nodes[0].(*ast.ConditionalExpr); isTernary {
-			hint = "; an `if` statement compiles natively where a ternary does not"
-		}
+		// The refusal names what it FOUND rather than listing every construct that could have
+		// caused one, so the author reads about the expression they wrote.
 		return fmt.Errorf("vm: %s contains %s, which this compiler evaluates against the ad rather "+
 			"than compiling: a registered function has no ad to evaluate it against, and that "+
-			"evaluator need not be deterministic%s: %w",
-			f.name, p.nodes[0].String(), hint, ErrReadsAd)
+			"evaluator need not be deterministic: %w",
+			f.name, p.nodes[0].String(), ErrReadsAd)
 	}
 	return nil
 }

@@ -336,8 +336,8 @@ above the definition it names.
 - The expanded program is **bounded**. Nesting is multiplicative — a function that calls another
   twice, which calls a third twice, expands the third four times — so a script that expands more
   than 256 calls is refused rather than compiled.
-- A call inside a construct the compiler delegates to the tree-walking evaluator — a conditional, a
-  list or ad literal, a subscript, a select, a lazy built-in — is **refused**, for the same reason a
+- A call inside a construct the compiler delegates to the tree-walking evaluator — a list or ad
+  literal, a select, a lazy built-in — is **refused**, for the same reason a
   local read in that position is: the evaluator resolves a function name against the built-ins and
   the registry, where a script's own function does not appear, and would quietly answer `ERROR`.
 - A `def` may not shadow a built-in or a registered function, which is `classad.RegisterFunction`'s

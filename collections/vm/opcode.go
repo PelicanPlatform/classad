@@ -69,9 +69,9 @@ const (
 	// a value without evaluating either branch, which only control flow can express.
 	//
 	// Note it does NOT lower the ternary `c ? t : f`, whose semantics differ in exactly one place: an
-	// UNDEFINED condition still evaluates BOTH branches (absorbing an error value but propagating a
-	// cyclic reference), which a jump-based lowering can only express by emitting both branches
-	// twice -- exponential in nesting depth. The ternary stays delegated.
+	// UNDEFINED condition still evaluates BOTH branches, so no arrangement of four blocks that each
+	// produce a value can serve it. The ternary has its own triple of opcodes, which share the two
+	// arms between the three outcomes that reach them; see OpTernBranch.
 	OpBranchCond
 
 	// OpCallFunc calls funcs[A], a STRICT built-in: it pops the function's argc
@@ -181,6 +181,47 @@ const (
 	// so `x = SomeList` followed by `x[0]` is refused when the subscript is delegated. It is also
 	// what `for` desugars onto, and what lets a registered script function contain one.
 	OpSubscript
+
+	// OpTernBranch opens the ternary `c ? t : f`. The condition is already on the stack and STAYS
+	// there for the whole construct, because all three of these instructions dispatch on it;
+	// conds[A] holds where the false arm begins (onFalse), where the true arm ends (trueEnd) and
+	// where the construct converges (end).
+	//
+	//	CondTrue, CondUndef  fall through to the true arm
+	//	CondFalse            jump to onFalse, the false arm
+	//	anything else        replace the condition with ERROR and jump to end
+	//
+	// TRUE AND UNDEFINED SHARE THE FALL-THROUGH, which is the whole difference from OpBranchCond.
+	// An undefined condition yields UNDEFINED, but the reference engine evaluates BOTH arms first
+	// and discards their values, so the arms are reached on three of the four outcomes rather than
+	// one. Running them is observable even though their values are not: an error VALUE in an arm is
+	// absorbed, while a cyclic self-reference is a hard failure that propagates. So
+	// `undefined ? 1 : error` is UNDEFINED and `undefined ? {} : A0` -- A0 being the attribute
+	// being evaluated -- is ERROR, and only an engine that evaluates the arms can tell them apart.
+	//
+	// A non-coercible condition (a string, a list, an ad, an error) is ERROR and evaluates NEITHER
+	// arm, which is why it leaves by a jump rather than through the arms.
+	OpTernBranch
+
+	// OpTernTrue closes the ternary's true arm, with the arm's value on top of the stack and the
+	// condition beneath it. conds[A] is the construct's target triple, as for OpTernBranch.
+	//
+	//	CondTrue   the arm's value IS the result: drop the condition under it and jump to end
+	//	CondUndef  discard the arm's value and fall through into the false arm, which runs next
+	//
+	// No other state reaches it, because OpTernBranch sent them elsewhere.
+	OpTernTrue
+
+	// OpTernFalse closes the ternary's false arm and produces the result: it pops the arm's value
+	// and the condition and pushes the arm's value for a false condition, or UNDEFINED for an
+	// undefined one, both arms having run by then.
+	//
+	// EACH ARM IS EMITTED ONCE, which is what this triple buys over a branch with one block per
+	// outcome. The undefined outcome needs both arms, so a four-block lowering would have to emit
+	// each arm a second time, and a ternary nested in a ternary would double again -- while a chain
+	// of ternaries is how ClassAd spells a lookup table. Here the undefined outcome walks the same
+	// two blocks the true and false outcomes walk, and the construct's size is the sum of its parts.
+	OpTernFalse
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose
