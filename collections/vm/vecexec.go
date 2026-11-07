@@ -58,8 +58,16 @@ import (
 // evaluator, this reasoning would fail and both constructs would have to decline again.
 //
 // NOT HANDLED, returning ok=false so the caller falls back rather than guessing: the magic CurrentTime
-// attribute, delegated subtrees (OpEvalNode, which Native() already excludes), and any built-in call
-// whose result a vector cannot hold (a list or a nested ad -- see callFuncVec).
+// attribute, delegated subtrees (OpEvalNode, which Native() already excludes), any built-in call
+// whose result a vector cannot hold (a list or a nested ad -- see callFuncVec), and the element load
+// OpSubscript.
+//
+// THE ELEMENT LOAD DECLINES BECAUSE A Vec CANNOT HOLD A CONTAINER. Its operands are a list or an ad
+// and its result is an arbitrary element, so a kernel would need a plane of lists to read from and
+// a plane of anything to write to -- neither of which a Vec has, and both of which are a larger
+// change than the opcode. Declining costs the batch nothing but the fallback to the per-record path,
+// which is where a subscript was evaluated before the opcode existed. TestSubscriptDeclinesVector
+// pins the decline so it stays a decline and never becomes a partial answer.
 //
 // FUNCTION CALLS are handled, but elementwise rather than as kernels: see callFuncVec for why that is
 // the useful increment and what would change that. member/identicalMember over a constant list is the
@@ -325,6 +333,16 @@ func (q *Query) VecEval(src ColumnSource, n int, scratch *VecScratch) (*Vec, boo
 
 func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecScratch, budget int64) (*Vec, bool) {
 	s.reset(n)
+	if p.hasLoopJump {
+		// A `break` or a `continue`. This executor reads control flow by REGION -- an If by the
+		// jumps that end its arms, a While by the back edge at its header -- and both of those
+		// jumps are matched against the innermost open region. A jump that leaves a loop from
+		// inside an If arm matches neither, and one that restarts a loop from inside an arm looks
+		// exactly like a back edge while leaving that arm's region open and its other side unrun.
+		// The decline is checked here rather than left to the region matching so that the second
+		// case cannot be read as the first.
+		return nil, false
+	}
 	if p.hasStatements {
 		s.initPredicates()
 	}
@@ -535,7 +553,8 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			}
 			next = t
 		default:
-			return nil, false // OpEvalNode, OpFault, anything added later
+			// OpEvalNode, OpFault, OpShortSubscript/OpSubscript, anything added later.
+			return nil, false
 		}
 		ip = next
 	}

@@ -23,11 +23,20 @@ import (
 // x, and a later `x` is the local. That is the Python rule, and it is the reason the decision has to
 // be made by the compiler: only the compiler knows what is bound at a given point.
 //
-// WHERE A LOCAL CANNOT BE READ. A construct the compiler delegates to the tree-walking evaluator --
-// a conditional, a list or ad literal, a subscript, a select, a lazy built-in -- is evaluated against
-// the ad, which has never heard of a local. Reading a local from inside one is refused at compile
-// time rather than silently resolved to the attribute of the same name; see compiler.delegate and
-// LocalCaptureError for why the refusal is the right answer and not a stopgap.
+// A DELEGATED CONSTRUCT READS LOCALS TOO. A conditional, a select or a lazy built-in is evaluated
+// by the tree-walking evaluator rather than compiled, and it runs with the script's locals overlaid
+// on the ad, so `result = x ? 2 : 3` reads the local x. The overlay answers only the bare names the
+// compiler resolved to locals, so MY.x is the attribute there as everywhere. See compiler.delegate
+// and evalDelegated.
+//
+// THREE POSITIONS CANNOT READ ONE: a list literal's elements, an ad literal's attribute values, and
+// the first argument of countMatches or evalInEachContext. Each is evaluated in an evaluator of its
+// own, built from a captured scope -- a list literal's elements possibly long after the script has
+// finished -- and a local read in one is refused with LocalCaptureError rather than silently
+// resolved to the attribute of the same name.
+//
+// A SUBSCRIPT IS NOT ONE OF THEM: `x = SomeList` followed by `x[0]` compiles to an element load that
+// reads the register. See OpSubscript.
 //
 // WHY ONE PROGRAM. Every statement's expression is compiled into a single Program, through the same
 // compile.go emitter an expression uses, and the whole thing is lowered to registers once. Nothing
@@ -94,6 +103,27 @@ type Script struct {
 	// inside one can run more than once, which is the only case where a call has to reset its own
 	// registers rather than rely on their program-start initialization. See expandCall.
 	loopDepth int
+
+	// loops is the stack of While bodies a Break or a Continue may name, innermost last.
+	//
+	// It is NOT loopDepth with the targets attached, and the difference is the whole of the
+	// function-body rule. A function expansion starts with an empty stack and gets the caller's
+	// back when it ends (see inline), so a `break` written in a body can only name a loop written
+	// in that same body. loopDepth keeps counting across the expansion, because the question it
+	// answers -- can this expansion run more than once -- is about the caller.
+	loops []*loopFrame
+}
+
+// loopFrame is one While whose body is being emitted, and the two addresses a jump out of it or
+// round it needs.
+//
+// The header is known as soon as the loop starts, so a Continue is an ordinary backward jump with
+// its target already in hand. The end is not known until the body and the condition's fault site
+// have been laid out, so each Break records its jump here and whileNow patches them all at once --
+// the same forward-patch If already does for the tail of its arms.
+type loopFrame struct {
+	header int32
+	breaks []int
 }
 
 // NewScript returns an empty script.
@@ -272,9 +302,12 @@ func (s *Script) whileNow(cond ast.Expr, body func(*Script)) {
 	k := int32(len(s.c.p.conds) - 1)
 	s.c.ins(OpBranchVoid, k)
 
+	frame := &loopFrame{header: int32(header)}
 	if body != nil {
 		s.loopDepth++
+		s.loops = append(s.loops, frame)
 		body(s)
+		s.loops = s.loops[:len(s.loops)-1]
 		s.loopDepth--
 	}
 	// The back edge. Every other jump this compiler emits goes forward; this one does not, and the
@@ -290,6 +323,78 @@ func (s *Script) whileNow(cond ast.Expr, body func(*Script)) {
 		onFalse: int32(end), onUndef: int32(onFault), onError: int32(onFault), end: int32(end),
 		loop: true, header: int32(header),
 	}
+	// A Break lands exactly where a false condition does. It skips the fault site on the way, which
+	// is right: the loop is not ending because the condition could not be read.
+	for _, j := range frame.breaks {
+		s.c.patch(j, end)
+	}
+}
+
+// Break leaves the innermost enclosing While and continues after it.
+//
+// It is a jump to the address a false condition goes to, so a loop that breaks on its first
+// iteration terminates for the same reason one whose condition is false terminates: there is no
+// back edge on that path.
+//
+// A BREAK IS BOUND BY A LOOP IN THE SAME FUNCTION BODY. A call is expanded where it is written, so
+// a function called from inside a loop sits, instruction for instruction, inside that loop -- and a
+// Break in its body would leave the CALLER's loop. That would make a function mean one thing at one
+// call site and something else at another, and the same body legal in one place and nonsense in
+// another. So a body starts with no enclosing loop, whatever the call site is inside, and a Break
+// with nothing to name is refused.
+//
+// Outside a loop altogether it is refused for the same reason: there is nothing to leave.
+func (s *Script) Break() *Script {
+	s.stage(func() { s.loopJump(true) })
+	return s
+}
+
+// Continue starts the innermost enclosing While's next iteration.
+//
+// It jumps to the loop's HEADER, which is the condition, so the next iteration re-tests it exactly
+// as falling off the end of the body does. It is bound by the same rule as Break.
+func (s *Script) Continue() *Script {
+	s.stage(func() { s.loopJump(false) })
+	return s
+}
+
+// loopJump emits a Break or a Continue. The two differ only in where they go and in what they are
+// called, which is why they share this.
+func (s *Script) loopJump(isBreak bool) {
+	word := "continue"
+	if isBreak {
+		word = "break"
+	}
+	if s.err != nil {
+		return
+	}
+	if s.hasRes {
+		s.err = fmt.Errorf("vm: '%s' after Result", word)
+		return
+	}
+	if len(s.loops) == 0 {
+		s.err = errors.New("vm: script: " + s.noLoopDetail(word))
+		return
+	}
+	s.c.p.hasLoopJump = true
+	frame := s.loops[len(s.loops)-1]
+	if isBreak {
+		frame.breaks = append(frame.breaks, s.c.ins(OpJmpVoid, -1))
+		return
+	}
+	s.c.ins(OpJmpVoid, frame.header)
+}
+
+// noLoopDetail says why a Break or a Continue had nothing to name, which is a different mistake
+// inside a function body than outside one and is worth two messages.
+func (s *Script) noLoopDetail(word string) string {
+	if s.fn != nil {
+		return fmt.Sprintf("'%s' in a function body with no loop in that body: a call is expanded "+
+			"where it is written, so a '%s' here would leave a loop at the call site and the "+
+			"function would mean something different everywhere it is called; put the loop in the "+
+			"body, or return a value and let the caller break", word, word)
+	}
+	return fmt.Sprintf("'%s' outside a loop", word)
 }
 
 // Result sets the script's value. It must be called last and exactly once.
@@ -331,6 +436,18 @@ type ScriptProgram struct {
 
 // Compile lowers the script to a single register program.
 func (s *Script) Compile() (*ScriptProgram, error) {
+	return s.compile(nil)
+}
+
+// compile is Compile, with the locals whose registers must be left alone named by the caller.
+//
+// preset names locals that are filled from OUTSIDE the program, before it runs: the parameters of a
+// function compiled on its own (see scriptmodule.go). Nothing in the program stores to one, so the
+// dominance analysis would correctly conclude that its reads are not dominated by a store and emit
+// an UNDEFINED initializer -- which would overwrite the value the caller just put there. Suppressing
+// the initializer for exactly those locals is what makes the register a parameter rather than a
+// local that happens never to be bound.
+func (s *Script) compile(preset []int32) (*ScriptProgram, error) {
 	s.flush()
 	if s.err != nil {
 		return nil, s.err
@@ -344,7 +461,11 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 	s.c.p.readAttrs = s.scriptReads()
 	s.c.p.vops = vopPrefix(s.c.p.code)
 	s.c.p.refSlots, s.c.p.nColSlots = colSlots(s.c.p.refs)
-	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
+	needInit := localsNeedingInit(s.c.p)
+	for _, l := range preset {
+		needInit[l] = false
+	}
+	return &ScriptProgram{rp: lowerWithInit(s.c.p, needInit), p: s.c.p}, nil
 }
 
 // scriptReads is the set of attribute names the compiled script may read, in first-seen order.
@@ -355,9 +476,10 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 //
 //   - p.refs, the unscoped references emitted as OpLoadRef. A bare name that was a local is not
 //     among them: it compiled to OpLoadLocal instead.
-//   - the unscoped names inside p.nodes, the subtrees handed to the tree-walking evaluator, which
-//     resolves every one of them against the ad. A delegated subtree that reads a local is refused
-//     before this runs, so none of these is a local either.
+//   - the unscoped names inside p.nodes, the subtrees handed to the tree-walking evaluator, MINUS
+//     the ones that subtree reads from a register. A delegated subtree runs with its locals
+//     overlaid on the ad (see evalDelegated), so a name the overlay answers is not a column the
+//     planner has to find -- and telling it otherwise sends it looking for one that may not exist.
 //
 // COLLECTING THE SYNTAX AND SUBTRACTING THE LOCALS IS A DIFFERENT ANSWER, and wrong in both
 // directions. `x = x + 1` reads the ATTRIBUTE x before it binds the local, so subtracting x drops a
@@ -377,8 +499,18 @@ func (s *Script) scriptReads() []string {
 		seen[r.name] = true
 		out = append(out, r.name)
 	}
-	for _, n := range s.c.p.nodes {
-		out = collectReads(n, seen, out)
+	for i, n := range s.c.p.nodes {
+		binds := s.c.p.nodeLocals[i]
+		// A fresh seen map per node, because the filter is per node: the same name may be a local
+		// in one delegated subtree and an attribute in another, and the shared map would let
+		// whichever came first decide for both.
+		for _, name := range collectReads(n, map[string]bool{}, nil) {
+			if seen[name] || lookupBind(binds, name) >= 0 {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
 	}
 	return out
 }
@@ -409,11 +541,11 @@ func (sp *ScriptProgram) RunWithFault(scope *classad.ClassAd) (result classad.Va
 
 // VecEval runs the script over a batch of n records, returning one result element per record.
 //
-// ok=false when the script uses something the vector executor does not implement, which today means
-// anything with control flow: a branch picks per record, and until the masked store is built the
-// executor has no way to run a statement for some records and not others. A script of bindings and a
-// result expression is exactly the part that needs none of that, and it is the part a constraint is
-// made of.
+// ok=false when the script uses something the vector executor does not implement. Control flow is
+// not in that set: an If runs both arms under a live mask and a While runs its iterations in
+// lockstep, letting the live set shrink as records finish. What declines is a delegated subtree,
+// which needs a real per-record scope, and a `break` or `continue`, which leaves a loop from a point
+// the lockstep walk has no region for.
 //
 // A DECLINE IS NOT A WRONG ANSWER. The caller falls back to running the script per record, which is
 // the same arrangement the expression executor has had since it was written.
@@ -432,9 +564,11 @@ func (sp *ScriptProgram) VecEval(src ColumnSource, n int, scratch *VecScratch) (
 
 // Program returns the underlying stack-form program.
 //
-// It is NOT runnable by the stack interpreter: a script's local loads are resolved by the register
-// lowering and have no stack-form implementation. It is exposed for the planner's read set and for
-// tests that inspect the compiled shape.
+// A script with statement-level control flow -- an If, a While, a fault site -- is NOT runnable by
+// the stack interpreter, which has no implementation for a statement jump. A straight-line script
+// is, local bindings and all, which is what lets the two interpreters be checked against each other
+// on the same program. It is exposed for the planner's read set and for tests that inspect the
+// compiled shape.
 func (sp *ScriptProgram) Program() *Program { return sp.p }
 
 // RegProgram returns the compiled register program.

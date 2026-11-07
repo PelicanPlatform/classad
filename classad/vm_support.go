@@ -90,6 +90,34 @@ func (e *Evaluator) SetResolver(fn func(name string, scope ast.AttributeScope) V
 	e.resolver = fn
 }
 
+// SetPartialResolver installs (or clears, with nil) a resolver that may DECLINE.
+// While set, every attribute reference is offered to fn(name, scope) first; ok=true
+// makes fn's value the reference's value, and ok=false leaves the reference to be
+// resolved exactly as it would be with nothing installed -- the full resolver if one
+// is set (SetResolver), otherwise the ClassAd scope, with the scope chain, the
+// MY/TARGET/PARENT rules, the evaluation of the referenced attribute's expression and
+// the CurrentTime substitution all intact.
+//
+// DECLINING IS THE WHOLE POINT. SetResolver replaces scope resolution outright, so a
+// caller that can answer for only SOME names -- a script overlaying its locals on the
+// ad -- has no way to say "not mine". Saying it by returning undefined is wrong twice
+// over: undefined is a value an ad can hold, and CurrentTime reads an undefined answer
+// as "the ad does not define it". A separate ok is the one answer those cases need.
+//
+// THE OVERLAY DOES NOT REACH INSIDE AN ATTRIBUTE'S VALUE. While the ad's own expression
+// for an attribute is evaluated, fn is not consulted: `A = B + 1` means the ad's B
+// wherever A is read, whatever the overlay calls B. Nor does it reach a nested scope --
+// a lazy list element, a nested ad, countMatches' per-ad context -- because each of
+// those evaluates in an evaluator of its own, which carries no resolver (see child).
+// A caller whose names must be visible there has to arrange it some other way.
+//
+// fn is called with the reference's original-cased name; names in ClassAd are matched
+// case-insensitively, so fn must fold. The Evaluator is not safe for concurrent use,
+// and neither is anything fn closes over.
+func (e *Evaluator) SetPartialResolver(fn func(name string, scope ast.AttributeScope) (Value, bool)) {
+	e.partial = fn
+}
+
 // ShortCircuit reports whether the left operand of a logical operator already
 // determines the result without evaluating the right operand, mirroring the
 // evaluator's short-circuit rules:
@@ -412,4 +440,61 @@ func (e *Evaluator) ResolveAlias(alias int, name string) (Value, bool) {
 		return Value{}, false
 	}
 	return e.aliasResolver(alias, name), true
+}
+
+// ApplySubscript indexes an already-evaluated container with an already-evaluated index, returning
+// the same value the tree-walking evaluator produces for the equivalent *ast.SubscriptExpr. It is
+// the subscript counterpart of ApplyBinaryOp, and evaluateSubscriptExpr is this function plus the
+// evaluation of its two operands, so the two cannot hold different ideas of what an index means.
+//
+// e materializes a LAZY list element, which is evaluated in the scope the list value captured
+// rather than in e's own, so only the indexed element is evaluated: {selfRef, x}[1] is x and does
+// not cycle. Pass the evaluator the operands were evaluated with.
+//
+// AN UNDEFINED OR ERROR CONTAINER SETTLES THE RESULT whatever the index is, so a caller that has
+// already evaluated both operands gets the right value from this function alone. It does not get
+// the right behaviour: the tree-walker never evaluates the index in that case, and evaluating one
+// can panic on a cyclic reference. A compiled form skips the index the same way.
+func (e *Evaluator) ApplySubscript(container, index Value) Value {
+	if container.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if container.IsError() {
+		return NewErrorValue()
+	}
+	if index.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if index.IsError() {
+		return NewErrorValue()
+	}
+
+	// A list takes an integer index, and nothing else: the accessor's error IS the type test, since
+	// it reports exactly the index that is not an integer. An out-of-range index -- including a
+	// negative one -- is ERROR in the reference engine rather than UNDEFINED.
+	if container.IsList() {
+		i, err := index.IntValue()
+		if err != nil {
+			return NewErrorValue()
+		}
+		if i < 0 || i >= int64(container.listLen()) {
+			return NewErrorValue()
+		}
+		return container.listElementAt(int(i), e)
+	}
+
+	// An ad takes a string key, read the same way.
+	if container.IsClassAd() {
+		key, err := index.StringValue()
+		if err != nil {
+			return NewErrorValue()
+		}
+		ad, err := container.ClassAdValue()
+		if err != nil {
+			return NewErrorValue()
+		}
+		return ad.EvaluateAttr(key)
+	}
+
+	return NewErrorValue()
 }

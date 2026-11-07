@@ -64,8 +64,12 @@ type Program struct {
 	refs      []refInfo       // OpLoadRef
 	aliasRefs []aliasRef      // OpLoadAlias
 	nodes     []ast.Expr      // OpEvalNode (delegated subtrees)
-	funcs     []funcInfo      // OpCallFunc
-	conds     []condTargets   // OpBranchCond
+	// nodeLocals[i] are the script locals nodes[i] reads, with the register each one lives in.
+	// Parallel to nodes, and empty at every index for an ordinary expression program, which has no
+	// locals. See evalDelegated.
+	nodeLocals [][]localBind
+	funcs      []funcInfo    // OpCallFunc
+	conds      []condTargets // OpBranchCond
 
 	// members are the constant lists of member/identicalMember calls (OpMember).
 	members []*memberSet
@@ -97,6 +101,13 @@ type Program struct {
 	// 2% of an expression scan and which an expression can never use.
 	hasStatements bool
 
+	// hasLoopJump marks a program holding a `break` or a `continue`. It is set by the script
+	// builder for the vector executor, which recognises an If by the shape of the jumps between its
+	// arms and a While by its back edge, and has no region for a jump that leaves a loop early or
+	// restarts it from inside an arm. See execVec, which declines such a program to the per-record
+	// path rather than running a shape it would read as some other construct.
+	hasLoopJump bool
+
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick
 	// the hot-header fast path; nil-safe to ignore.
@@ -105,6 +116,13 @@ type Program struct {
 	// expr is the source expression, retained so the store can compute a read
 	// plan (see ReadPlan) for partial-decode evaluation.
 	expr ast.Expr
+
+	// aliases are the join aliases the program was compiled with (CompileAliases), case-folded
+	// to their index. Retained because probe extraction has to tell `j.Owner` -- the Owner of
+	// the other side of a join -- from `Res.Mem`, a select into a nested record of THIS ad:
+	// the two are the same AST node and only the declared alias list separates them. Nil for an
+	// ordinary expression, where every select is a genuine one.
+	aliases aliasIndex
 
 	// now, when nonzero, is the time a CurrentTime reference the scope does not define
 	// evaluates to (see Compile). Zero reads the clock, as the evaluator does.

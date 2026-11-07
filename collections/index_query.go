@@ -661,6 +661,13 @@ type QueryExplain struct {
 	IndexSegments        int   `json:"indexSegments,omitempty"`
 	IndexSkippedSegments int   `json:"indexSkippedSegments,omitempty"`
 	UnindexedSegments    int   `json:"unindexedSegments,omitempty"`
+	// CompositeSegments is how many of IndexSegments answered the conjunction from a
+	// COMPOSITE index -- one lookup over the attribute tuple -- instead of probing each
+	// attribute and intersecting. CompositeIndex names the tuple ("ClusterId+ProcId").
+	// A segment indexed before the composite was configured is not counted and falls back
+	// to the intersection, which is why this is a count rather than a flag.
+	CompositeSegments int    `json:"compositeSegments,omitempty"`
+	CompositeIndex    string `json:"compositeIndex,omitempty"`
 	// ZonePrunedSegments is how many segments the zone maps rule out before any record or
 	// posting is read, on either plan. An indexed plan's segment counts above cover only the
 	// segments left after it.
@@ -732,6 +739,9 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		}
 		if ex.UnindexedSegments > 0 {
 			ex.Reason += fmt.Sprintf("; %d segments have no index on it and are scanned in full", ex.UnindexedSegments)
+		}
+		if ex.CompositeSegments > 0 {
+			ex.Reason += fmt.Sprintf("; %d answered it from the composite index on %s, in one lookup", ex.CompositeSegments, ex.CompositeIndex)
 		}
 	case dnfReason != "":
 		ex.Plan = scan
@@ -841,7 +851,22 @@ func (c *Collection) explainGroups(q *vm.Query, plan []vm.ProbeGroup, ex *QueryE
 	if ex.UnindexedSegments > 0 {
 		ex.Reason += fmt.Sprintf("; %d segments have no index on every disjunct and are scanned in full", ex.UnindexedSegments)
 	}
+	if ex.CompositeSegments > 0 {
+		ex.Reason += fmt.Sprintf("; %d answered a disjunct from the composite index on %s, in one lookup", ex.CompositeSegments, ex.CompositeIndex)
+	}
 	return true
+}
+
+// compositeLabel renders a composite's tuple identity as its attribute names
+// ("ClusterId+ProcId"). The identity travels as ids, which is all a sealed sidecar stores;
+// the live spec is what knows the names.
+func (c *Collection) compositeLabel(key string) string {
+	if spec := c.spec.Load(); spec != nil {
+		if cs, ok := spec.compositeFor(key); ok {
+			return cs.label()
+		}
+	}
+	return "a composite index"
 }
 
 // explainIndexSegmentsGroups is explainIndexSegments for a disjunctive plan: each segment's verdict
@@ -869,10 +894,22 @@ func (c *Collection) explainIndexSegmentsGroups(q *vm.Query, plan []vm.ProbeGrou
 			default:
 				ex.IndexSegments++
 				var sum float64
+				used := false
 				for _, g := range groups {
-					least := math.Inf(1)
-					for _, up := range g {
-						least = math.Min(least, si.estCandidates(up))
+					least, tuple, composite := si.compositeCandidates(g)
+					if composite {
+						if !used {
+							ex.CompositeSegments++
+							used = true
+						}
+						if ex.CompositeIndex == "" {
+							ex.CompositeIndex = c.compositeLabel(tuple)
+						}
+					} else {
+						least = math.Inf(1)
+						for _, up := range g {
+							least = math.Min(least, si.estCandidates(up))
+						}
 					}
 					sum += least
 				}
@@ -929,9 +966,20 @@ func (c *Collection) explainIndexSegments(q *vm.Query, usable []usableProbe, ex 
 				ex.IndexSkippedSegments++
 			default:
 				ex.IndexSegments++
-				least := math.Inf(1)
-				for _, up := range usable {
-					least = math.Min(least, si.estCandidates(up))
+				// A composite over the tuple this conjunction pins knows the JOINT count
+				// exactly, where the per-attribute minimum below is the best of several
+				// independent estimates of correlated columns.
+				least, tuple, composite := si.compositeCandidates(usable)
+				if composite {
+					ex.CompositeSegments++
+					if ex.CompositeIndex == "" {
+						ex.CompositeIndex = c.compositeLabel(tuple)
+					}
+				} else {
+					least = math.Inf(1)
+					for _, up := range usable {
+						least = math.Min(least, si.estCandidates(up))
+					}
 				}
 				cand += least * live[i]
 			}
@@ -963,6 +1011,53 @@ func (c *Collection) explainZonePruned(q *vm.Query) (pruned, total int) {
 	return pruned, total
 }
 
+// NESTED PROBES AND THE COLUMNAR FAST PATHS.
+//
+// A columnar segment stores one field per TOP-LEVEL attribute, keyed by that attribute's
+// interned id; a nested path has no field of its own, and its value lives inside the parent
+// attribute's node, which the field holds whole. Resolving `Res.Mem` against the field for
+// `Res` would compare a record literal with a number; resolving it by NAME would find a field
+// only if some ad carried an attribute literally called "Res.Mem", whose values have nothing
+// to do with the path's. Both answer a question the query did not ask, and both do it in the
+// block-pruning position, where a wrong answer is a block never scanned rather than a row
+// re-verified and dropped.
+//
+// So the columnar prefilters, aggregates, string-zone prunes and presence fast paths all
+// decline a probe whose Nested() is true; the row scan -- and the postings index, which does
+// resolve paths -- answers it instead.
+//
+// None of those declines is reachable today: a select compiles to a delegated subtree, so a
+// query carrying a nested probe is never Native, and every columnar fast path is gated on
+// Native. They are written anyway because that gate is a statement about the PROGRAM, not
+// about the probe, and the day a select compiles natively it would stop covering this.
+
+// probeAttrID resolves the index key a probe is about, REQUIRING the probe's shape to match
+// the spec's: a nested-path probe only resolves to an index configured on that same path, and
+// a probe on a top-level attribute never resolves to a path index. Both land on the same id
+// when an ad carries an attribute literally named like a configured path (see indexSpec.paths),
+// and reading either one's postings for the other would answer with a candidate set that is
+// missing matching records. A mismatch declines, and the query scans.
+func (c *Collection) probeAttrID(spec *indexSpec, p vm.Probe) (uint32, bool) {
+	var id uint32
+	var ok bool
+	if spec.inline {
+		id, ok = spec.nameToID[strings.ToLower(p.Attr)]
+	} else {
+		id, ok = c.intern.LookupID(p.Attr)
+	}
+	if !ok {
+		return 0, false
+	}
+	have, isPath := spec.paths[id]
+	if p.Nested() != isPath {
+		return 0, false
+	}
+	if isPath && !samePath(have.comps, p.Path) {
+		return 0, false
+	}
+	return id, true
+}
+
 // probeIndexKind reports whether a probe's attribute is indexed and, if so, its
 // index kind, whether this probe's operator can use it (mirrors planIndex's
 // per-probe decision), and the resolved usableProbe when usable.
@@ -971,13 +1066,7 @@ func (c *Collection) probeIndexKind(p vm.Probe) (indexed bool, kind string, up u
 	if !spec.any() {
 		return false, "", usableProbe{}, false
 	}
-	var id uint32
-	var ok bool
-	if spec.inline {
-		id, ok = spec.nameToID[strings.ToLower(p.Attr)]
-	} else {
-		id, ok = c.intern.LookupID(p.Attr)
-	}
+	id, ok := c.probeAttrID(spec, p)
 	if !ok {
 		return false, "", usableProbe{}, false
 	}
@@ -1063,13 +1152,7 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 	}
 	var out []usableProbe
 	for _, p := range probes {
-		var id uint32
-		var ok bool
-		if spec.inline {
-			id, ok = spec.nameToID[strings.ToLower(p.Attr)]
-		} else {
-			id, ok = c.intern.LookupID(p.Attr)
-		}
+		id, ok := c.probeAttrID(spec, p)
 		if !ok {
 			continue
 		}
@@ -1106,9 +1189,17 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 		return usableProbe{attrID: id, cat: true, op: "==", svals: []string{"true"}}, true
 	case "untruthy": // `!attr`: matches boolean false, same superset argument.
 		return usableProbe{attrID: id, cat: true, op: "==", svals: []string{"false"}}, true
+	case "prefix":
+		// The literal folds like any other categorical key, and the folded run it names is
+		// a superset of the case-sensitive matches (see index_prefix.go).
+		s, ok := catFold(p.Vals[0])
+		if !ok || s == "" {
+			return usableProbe{}, false
+		}
+		return usableProbe{attrID: id, cat: true, op: "prefix", svals: []string{s}}, true
 	case "==", "!=", "in":
 	default:
-		return usableProbe{}, false // ranges are not indexed for categoricals
+		return usableProbe{}, false // ordering comparisons are not indexed for categoricals
 	}
 	svals := make([]string, 0, len(p.Vals))
 	for _, v := range p.Vals {
@@ -1379,6 +1470,17 @@ func (si *segIndex) bloomAbsent(up usableProbe) bool {
 	return true
 }
 
+// compositeMatch finds the composite index covering a conjunction's equality probes among
+// those this segment holds (see composite.go).
+func (si *segIndex) compositeMatch(usable []usableProbe) (compositeMatch, bool) {
+	return compositeMatchIn(si.comp, usable)
+}
+
+// compositeCandidates reports the exact candidates a composite would hand the scan here.
+func (si *segIndex) compositeCandidates(usable []usableProbe) (float64, string, bool) {
+	return indexCompositeCandidates(si, usable)
+}
+
 // estCandidates estimates how many records in the indexed prefix this probe would
 // admit (its candidate-bitmap cardinality). Used only to order probes, so a rough
 // estimate is fine; it never affects correctness.
@@ -1477,6 +1579,20 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		case "absent": // attr is undefined: everything but the definitely-posted records
 			bm := si.all.Clone()
 			bm.AndNot(cp.posted)
+			return bm
+		case "prefix":
+			// Boundary-search the folded keys to the run that carries the prefix and union
+			// only those keys' postings, then the exceptions (which no key holds and the
+			// pattern may still match).
+			keys := cp.sortedKeys()
+			from, to := strPrefixSpan(keys, up.svals[0])
+			if to-from == len(keys) {
+				bm := cp.posted.Clone() // every key: see index_prefix.go
+				bm.Or(cp.exc)
+				return bm
+			}
+			bm := unionPostings(to-from, func(i int) *roaring.Bitmap { return cp.post[keys[from+i]] })
+			bm.Or(cp.exc)
 			return bm
 		case "is": // =?= exact (case-sensitive)
 			// The exceptions too: an attribute holding an expression rather than a string literal

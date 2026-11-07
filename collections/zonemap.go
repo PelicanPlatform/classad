@@ -6,12 +6,12 @@ import (
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
-// Zone maps for an append-only collection: a sealed segment records the numeric
-// [min,max] span of each configured ZoneAttr across its records, so a query with a
-// range/equality constraint on such an attribute can skip whole segments whose span
-// cannot contain a match (the archive's per-segment pruning, expressed as a Collection
-// rule). The zoneRange type and the zonePrune/zoneMayMatch predicates are shared with
-// the archive (archive.go / archive_query.go).
+// Zone maps: a sealed segment records the numeric [min,max] span of each configured
+// ZoneAttr across its records, so a query with a range/equality constraint on such an
+// attribute can skip whole segments whose span cannot contain a match (the archive's
+// per-segment pruning, expressed as a Collection rule). The zoneRange type and the
+// zonePrune/zoneMayMatch predicates are shared with the archive (archive.go /
+// archive_query.go).
 //
 // A missing entry means "nothing known" to every reader: no pruning, no age retention, no
 // wholesale attribution. That is how an attribute some record holds an expression for is
@@ -21,6 +21,23 @@ import (
 // and is always scanned, so an in-flight record is never pruned away. Zones are
 // computed once when a segment stops being active (seal) and, on reopen, for every
 // non-active segment (loadShard).
+//
+// WHY A MUTABLE COLLECTION HAS THEM TOO. These were append-only for a long time, and the
+// reason was never soundness -- it is that a zone bounds the values a segment HOLDS, and
+// what makes that a bound a query may prune on is that a sealed segment's values never
+// change. A mutable collection satisfies that for the same reason an append log does: an
+// update does not rewrite a record, it appends the new version and marks the old one
+// superseded (shard.put), so a sealed segment only ever LOSES records. A zone computed at
+// seal therefore stays a superset of what the segment still holds, and a superset is
+// exactly what pruning needs -- too wide only costs a segment read, where too narrow would
+// drop a real match.
+//
+// Compaction is the one path that fills a segment that is sealed from birth, and it needs
+// nothing special here: its output starts with no zone map, which every reader takes as
+// "nothing known" and so prunes nothing, and the Reindex compaction already runs rezones
+// those segments (rezoneSealed). An explicit pass over the output was written first and
+// then removed -- with it and without it the pruning measured identical on every shape
+// that could be built, and a branch whose removal nothing detects is worse than none.
 
 // zoneAttr is one zone-mapped attribute: its (folded) name for inline-encoded records
 // and its interned id for id-encoded records. The computed zone map is keyed by id
@@ -202,8 +219,7 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 
 // ZoneAttrs returns the attributes this collection keeps per-segment [min,max] zone maps
 // on, in configuration order (explicit ZoneAttrs first, then the value-indexed attributes
-// that are zoned automatically). Empty for a mutable collection, which has no zone maps.
-// Diagnostic only -- it is how `.indexes` on an archive can show which range queries prune
+// that are zoned automatically). Empty when none are configured. Diagnostic only -- it is how `.indexes` on an archive can show which range queries prune
 // whole segments rather than only postings.
 func (c *Collection) ZoneAttrs() []string {
 	if !c.hasZones.Load() || len(c.shards) == 0 {
@@ -219,6 +235,19 @@ func (c *Collection) ZoneAttrs() []string {
 	return names
 }
 
+// topLevelNames drops the nested paths from a list of configured index names. A zone map
+// holds one [min,max] per top-level attribute of a segment, so a path has nothing to put in
+// one -- and zonePrune declines a nested probe for the same reason.
+func topLevelNames(names []string) []string {
+	out := names[:0:0]
+	for _, n := range names {
+		if splitAttrPath(n) == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // addZoneAttrs extends the zone-mapped attribute set of an append-only collection with
 // names not already covered, so a value index added at RUNTIME gets whole-segment pruning
 // too (construction wires ZoneAttrs + ValueAttrs together; see New). Segments already
@@ -226,7 +255,7 @@ func (c *Collection) ZoneAttrs() []string {
 // the new attribute starts pruning from the next segment sealed, or across the whole
 // archive after a Rewrite. No-op unless the collection is append-only.
 func (c *Collection) addZoneAttrs(names []string) {
-	if !c.appendOnly() || len(names) == 0 {
+	if len(names) == 0 {
 		return
 	}
 	for _, sh := range c.shards {
@@ -249,10 +278,10 @@ func (c *Collection) addZoneAttrs(names []string) {
 }
 
 // sealZones computes and installs zones for a segment that has just stopped being the
-// active append target. No-op unless the shard is append-only with zone attributes
-// configured. Caller holds the shard write lock.
+// active append target. No-op unless zone attributes are configured. Caller holds the
+// shard write lock.
 func (sh *shard) sealZones(seg *segment) {
-	if seg == nil || !sh.appendOnly || len(sh.zoneAttrs) == 0 || seg.zones != nil {
+	if seg == nil || len(sh.zoneAttrs) == 0 || seg.zones != nil {
 		return
 	}
 	// nil collection: the segment being sealed is the active append target, which is whole-record by

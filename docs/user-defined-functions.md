@@ -15,25 +15,27 @@ Every sample is an excerpt from a file `go test` runs; section 9 lists them.
 |---|---|---|
 | **Go** | `classad.RegisterFunction` | `db.RegisterAggregate` |
 | **WebAssembly** | `wasmudf.Register` | `wasmudf.RegisterAggregate` |
+| **ClassAd Script** | `scriptudf.Register` | — |
 
 A **scalar function** is called once per value, anywhere a built-in like `pow()`
 can appear. An **aggregate** reduces a group of rows to one answer, named in an
 `AggSpec` as `AggUser`, and reduced by the same `GROUP BY` core as `SUM`.
 
-The WebAssembly rows are not a separate mechanism. `wasmudf` loads a guest
-module, wraps it in the Go signature the registry above it takes, and registers
-it there. Sections 2 and 3 apply to a wasm extension too.
+The second and third rows are not separate mechanisms. `wasmudf` loads a guest
+module; `scriptudf` compiles a module written in **ClassAd Script**, the statement
+language of section 7. Each picks one of the module's exports by name, wraps it in
+the Go signature the registry above it takes, and registers it there. Sections 2
+and 3 apply to all three.
 
-(There is also **ClassAd Script**, a statement language — locals, `if`, `while` —
-over the same engine. It is partly built and cannot yet be used from a query. See
-section 7.)
-
-## 2. Go or WebAssembly
+## 2. Go, WebAssembly or ClassAd Script
 
 Pick by **whose code it is**. Write it in Go when it is part of the system you
 are building. Use WebAssembly when the function comes from outside your trust
 boundary — a site admin, a user — because then the isolation is the reason you
-are here.
+are here. Use ClassAd Script when the rule is policy someone writes and reads
+rather than code someone builds: it needs no toolchain, it is the language your
+policy expressions are already written in, and a function that would reach beyond
+its arguments is refused at registration rather than trusted.
 
 A wasm guest can reach nothing: no I/O, no clock, no randomness, no WASI. That is
 not a policy, it is the absence of anything to call. The host offers exactly one
@@ -374,9 +376,9 @@ every call is visible there and nowhere else.
 ## 7. ClassAd Script
 
 ClassAd Script is a statement language over the same engine: locals, `if`,
-`while`, and a result, compiled to one instruction stream so the optimizer can
-see across the whole thing. It exists for what a single expression says badly — a
-loop, or a derived value used three times.
+`while`, `for`, and a result, compiled to one instruction stream so the optimizer
+can see across the whole thing. It exists for what a single expression says badly
+— a loop, or a derived value used three times.
 
 ```go
 sp, err := vm.ParseScript(`
@@ -401,9 +403,45 @@ Python-shaped statements over ordinary ClassAd expressions: `is` is `=?=`, and
 every expression between the statements is parsed by the same parser an
 attribute's value is. Blocks are introduced by `:` and delimited by indentation,
 which has to be spaces — braces were not available, since `{...}` is already a
-list literal and `[...]` an ad literal. `elif`, `else`, `while`, `pass`, `def`,
-`return` and the compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`) are there;
-`for` is not, and neither are writes back to the ad.
+list literal and `[...]` an ad literal. `elif`, `else`, `while`, `for`, `break`,
+`continue`, `pass`, `def`, `return` and the compound assignments (`+=`, `-=`,
+`*=`, `/=`, `%=`) are there; writes back to the ad are not.
+
+**`for NAME in SEQUENCE:`** walks a list:
+
+```
+largest = 0
+for request in MY.Requests:
+    if request > largest:
+        largest = request
+result = largest
+```
+
+The sequence is evaluated once, before the first trip. `NAME` is an ordinary
+local — function-scoped like any other, still bound after the loop, holding the
+last element visited. An empty list runs the body zero times. A sequence that is
+**not a list** is a fault: the script ends with `error`, the same way an `if` on
+an undefined condition does, so a misspelled attribute says so rather than
+turning the loop into one that quietly does nothing. The step budget bounds the
+loop; there is no separate iteration limit.
+
+**`break` and `continue`** work in either loop. `break` leaves the innermost
+enclosing loop and `continue` starts its next iteration — re-testing a `while`
+condition, or advancing to the next element of a `for`. Both take no operand,
+and both are refused with a line and column where no loop encloses them:
+
+```
+i = 0
+total = 0
+while i < 100:
+    i = i + 1
+    if i % 3 == 0:
+        continue        # skip the multiples of three
+    if total > 50:
+        break           # and stop as soon as we have enough
+    total = total + i
+result = total
+```
 
 `ParseScriptBuilder` returns the script before compilation, for a caller that
 wants to add to it. The builder API it returns is also usable directly.
@@ -412,22 +450,40 @@ wants to add to it. The builder API it returns is also usable directly.
 anything else is an attribute. So `want = MY.RequestMemory` binds a local, and
 every later `want` is that local, while `MY.want` always means the attribute.
 
-**A local is not visible to every expression**, and the compiler now says so
-rather than quietly answering from the ad. A few constructs are handed to the
-tree-walking evaluator — a ternary, a list or ad literal, a subscript, a
-selection — and that evaluator resolves names against the ad, which has never
-heard of your local:
+**A local can be indexed.** `seq = MY.Sizes` followed by `seq[0]` reads the
+local, and `rec["K"]` reads a key out of a nested ad the same way. An index past
+the end of a list is `error` rather than `undefined`, which is the reference
+engine's answer, so `?:` — which defaults only an `undefined` — does not catch
+it.
+
+**A local reads the same everywhere it appears.** A few constructs are handed to
+the tree-walking evaluator rather than compiled — a ternary, a selection, a lazy
+built-in such as `strcat` or `ifThenElse` — and they run with the script's locals
+overlaid on the ad, so a bare bound name there is the local:
 
 ```
 x = Cpus + 1
-result = x ? 2 : 3      # refused: the ternary would read the ATTRIBUTE x
+result = x ? 2 : 3      # the ternary reads the LOCAL x
 ```
 
-That used to compute silently from the wrong `x`. It is now an error carrying the
-line and column. Write it as an `if`, or name the attribute explicitly with
-`MY.x` if that is what you meant. The ternary is not an oversight waiting on a
-fix: an UNDEFINED condition evaluates both branches, which a jump cannot express
-without emitting each branch twice.
+`MY.x` is the attribute there as everywhere, which is how you say you meant the
+ad.
+
+**Three places still cannot read a local**, and each is refused with a line and
+column rather than answered from the ad:
+
+```
+x = Cpus
+result = {x, 1}                     # a list literal
+result = [a = x].a                  # an ad literal
+result = countMatches(x, MY.GPUs)   # a per-ad context
+```
+
+Each of those evaluates in a scope of its own. A list literal is the clearest
+case: its elements are evaluated on demand, in a scope captured when the list was
+built, which may be long after the script has finished and its locals are gone.
+Bind the whole construct to a local first, or write `MY.x` if the attribute was
+what you meant.
 
 **A script can define its own functions**, for a rule it applies more than once:
 
@@ -457,6 +513,13 @@ well as of its arguments, and one with no parameters at all is still useful.
 Every argument is evaluated, left to right, before the body starts, even where
 the body never reads it.
 
+A `break` or a `continue` in a body names a loop **in that body**, and is
+refused when there is none — even where the call itself sits inside a loop. The
+call is written out where it appears, so a `break` bound by the call site would
+leave the caller's loop, and the same function would mean one thing where it is
+called from a loop and nothing at all where it is not. A function that wants to
+stop a caller's loop returns a value the caller breaks on.
+
 Three things a script function will not do:
 
 - **Recursion**, directly or in a cycle through other functions. A call is
@@ -464,15 +527,66 @@ Three things a script function will not do:
   cannot be written out. The error names the cycle.
 - **Shadowing.** A `def` may not take the name of a built-in or of a registered
   function, for the same reason a registration may not: `strcat` has to mean the
-  same thing inside the script as outside it.
-- **Being called from a ternary, a list or ad literal, a subscript or a
-  selection.** Those are the same constructs that cannot see a local, for the
-  same reason, and the refusal carries a line and column. Call the function from
-  a statement and use the local.
+  same thing inside the script as outside it. In a *module* only the built-in
+  half of that applies, because a module's own functions are the ones being
+  registered; whether the name is free is answered by the registry, as
+  `ErrFunctionExists`.
+- **Being called from a construct that is evaluated rather than compiled** — a
+  ternary, a list or ad literal, a selection. That evaluator resolves a function
+  name against the built-ins and the registered functions, and a script's own
+  function is in neither, so the call would be `error`. The refusal carries a
+  line and column. Call the function from a statement and use the local, which a
+  ternary can read.
 
-So a script function is not a fifth way to write a UDF: it belongs to the script
-that defines it and nothing outside can call it. A script can also *call* a UDF,
-which is how one rule gets shared between scripts.
+A function defined inside a script belongs to that script, and nothing outside it
+can call one. A script can also *call* a UDF, which is how one rule is shared
+between scripts.
+
+### Registering a script function
+
+A **script module** is source that defines functions and produces no value —
+`def` at the left margin and nothing else, no `result`. Register one of its
+functions and every expression in the process can call it, exactly as it calls a
+built-in:
+
+```go
+mod, err := vm.ParseScriptModule(`
+def examplePct(used, total):
+    if used is undefined:
+        return undefined
+    if total is undefined:
+        return undefined
+    if total <= 0:
+        return error
+    return used * 100.0 / total
+`)
+
+f, err := scriptudf.Register(mod, scriptudf.ClassAdRegistry(), "examplePct")
+```
+
+```
+examplePct(Used, Total)     37.5
+EXAMPLEPCT(Used, Total)     37.5
+examplePct(Used, Absent)    undefined
+examplePct(Used, Label)     error
+```
+
+`mod.Functions()` lists what a module exports. There is no arity to supply: the
+`def` states how many arguments it takes, and that is the minimum and the maximum.
+
+**A registered script function cannot read the ad.** Inside a script, a bare name
+the body does not bind is an attribute of the subject ad, and that is most of what
+makes a script function useful there. A registration has no subject ad, so
+`def fits(requested, cap): return Optimistic` is refused rather than registered —
+along with `MY.RequestMemory`, a call to `random()`, a ternary and a subscript.
+Pass what the function needs as a parameter. The error says which rule refused it
+and what to write instead, and `errors.Is(err, vm.ErrReadsAd)` tells that refusal
+apart from a function that simply does not compile.
+
+Everything else in section 3 holds. Compilation happens before registration, so a
+name is only ever registered against a function that compiled; registration is
+append-only; names fold case; and a call that runs too long gives ERROR rather
+than hanging the scan, because a script may loop.
 
 The language's design, and what remains to build, are in
 [docs/SCRIPTING_LANGUAGE_DESIGN.md](SCRIPTING_LANGUAGE_DESIGN.md).
@@ -494,6 +608,7 @@ The samples above, all run by `go test`:
 | `collections/vm/example_scriptparse_test.go` | the ClassAd Script above |
 | `collections/vm/example_script_test.go` | the same script through the builder API |
 | `collections/vm/example_scriptfunc_test.go` | the script function above |
+| `collections/scriptudf/example_test.go` | registering a script module's function |
 | `db/example_udaf_test.go` | the Go aggregate and `CheckAggregateEqual` |
 | `wasmudf/example_test.go` | loading and registering both kinds of wasm module |
 | `wasmudf/testdata/examplepct.wat` | the wasm function |

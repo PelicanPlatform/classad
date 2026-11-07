@@ -29,8 +29,16 @@ import (
 //	else:
 //	    pass
 //	while want > 65536:
+//	    if want is error:
+//	        break                   # leave the innermost enclosing 'while'
 //	    want = want / 2
+//	for size in MY.Sizes:           # one trip per element of a list
+//	    want += size
 //	result = want                   # the script's value; top level, last, exactly once
+//
+// `break` leaves the innermost enclosing `while` and `continue` starts its next iteration, which
+// re-tests the condition exactly as falling off the end of the body does. Both take no operand, and
+// both are refused with a line and column when no loop encloses them.
 //
 // FUNCTIONS:
 //
@@ -48,6 +56,11 @@ import (
 // and falling off the end, both give UNDEFINED. Recursion is refused, directly or in a cycle,
 // because an expansion that contains itself has no end; see scriptfunc.go.
 //
+// A `break` or a `continue` in a body is bound by a loop IN THAT BODY, and refused when there is
+// none -- including when the call itself sits inside a loop. The expansion puts the body's
+// instructions inside the caller's loop, so a `break` bound by the call site would make the same
+// function mean one thing where it is called from a loop and nothing at all where it is not.
+//
 // SOFT KEYWORDS, which is a requirement and not a style choice. ClassAd attribute names are
 // case-insensitive, so `For`, `IF` and `Result` have to stay usable as attributes. A word is a
 // keyword only when it is spelled in lowercase AND leads a statement; everywhere else it lexes as an
@@ -63,23 +76,17 @@ import (
 // `if x: y = 1` would destroy that: the line would end in `1`, and finding the block colon would
 // require backtracking over an arbitrary expression.
 //
-// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), `break`,
-// `continue`, `fail` and `defer` are all refused by name with a message saying so. None of them has
-// a machine behind it -- the compiler has no opcode that mutates the scope and no way out of a loop
-// -- and a parser that accepted them would have to invent one. Refusing a word the language is
-// going to grow is a better failure than parsing it into something that is not what it says.
+// WHAT IS DELIBERATELY NOT HERE. Ad writes (`MY.X = ...`, `self[e] = ...`, `del`), `fail` and
+// `defer` are all refused by name with a message saying so. None of them has a machine behind it --
+// the compiler has no opcode that mutates the scope -- and a parser that accepted them would have
+// to invent one. Refusing a word the language is going to grow is a better failure than parsing it
+// into something that is not what it says.
 //
-// `for` IS REFUSED FOR A MORE SPECIFIC REASON, and it is worth writing down because the shape of it
-// is not obvious. A `for` over a list desugars cleanly into a counted `while` -- bind the sequence,
-// bind its length, bind an index, and read element i each trip -- and every piece of that except one
-// compiles natively today. The exception is `seq[i]`. A subscript is delegated to the tree-walking
-// evaluator, which resolves names against the ad and cannot see a register, so the desugared loop
-// would read the ATTRIBUTE named seq and the ATTRIBUTE named i, both absent, on every trip. (The
-// compiler now refuses that rather than computing it; see LocalCaptureError.) `for` is therefore one
-// native opcode away -- an element load with the semantics of evaluateSubscriptExpr -- and that
-// opcode is a change to the instruction set, with its own vector decline, step cost and parity
-// tests. It is not parser work, and guessing at it here to make a keyword appear would be the
-// expensive half of the job done badly.
+// `for NAME in SEQUENCE:` IS A COUNTED `while`, and the parser spells it rather than implements it:
+// the sequence is bound once, its length is bound once, and an index reads one element per trip.
+// NAME is an ordinary local, function-scoped like every other, and the body is an ordinary suite. A
+// sequence that is not a list is a FAULT rather than an empty loop, for the same reason a
+// non-boolean `if` condition is. See Script.For, which holds the lowering and the reasoning.
 
 // ScriptSyntaxError is a syntax error with the position of the thing that caused it.
 //
@@ -173,6 +180,16 @@ type whileStmt struct {
 	body []stmt
 }
 
+// forStmt is `for name in seq:` over body. It is kept whole rather than desugared here, so the
+// shape the author wrote is the shape a diagnostic names; the lowering into a counted loop is the
+// builder's, in scriptfor.go.
+type forStmt struct {
+	stmtAt
+	name string
+	seq  ast.Expr
+	body []stmt
+}
+
 type resultStmt struct {
 	stmtAt
 	expr ast.Expr
@@ -191,6 +208,13 @@ type returnStmt struct {
 	stmtAt
 	expr ast.Expr
 }
+
+// breakStmt and continueStmt carry nothing but their position. Which loop each one names is settled
+// by the builder, which is the only thing that knows the loop's addresses; the parser does not even
+// track whether one encloses the statement.
+type breakStmt struct{ stmtAt }
+
+type continueStmt struct{ stmtAt }
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -225,6 +249,50 @@ func (p *scriptParser) parseTop() ([]stmt, error) {
 		return nil, err
 	}
 	return stmts, p.checkResult(stmts)
+}
+
+// parseModuleTop parses a MODULE: top-level `def` statements and nothing else.
+//
+// It is parseTop's sibling rather than a mode of it, because the two differ in exactly one place --
+// what a top-level statement may be -- and a flag threaded through parseTop would put that question
+// somewhere a reader of either language has to answer it.
+//
+// Everything below the top level is identical: a `def` body is parsed by the same code whichever
+// entry point reached it, so there is no possibility of a statement meaning one thing in a script
+// and another in a module.
+func (p *scriptParser) parseModuleTop() ([]stmt, error) {
+	if len(p.lines) == 0 {
+		return nil, fmt.Errorf("%w: the source is empty", ErrNoFunctions)
+	}
+	if p.lines[0].indent != 0 {
+		return nil, p.at(p.lines[0], "unexpected indent: the first statement must start at column 1")
+	}
+	p.levels = []int{0}
+	stmts, err := p.statements(0)
+	if err != nil {
+		return nil, err
+	}
+	for _, st := range stmts {
+		if _, isDef := st.(*defStmt); isDef {
+			continue
+		}
+		// A `result` gets its own message because it is the mistake an author of scripts makes
+		// first, and because "this is not a def" does not say what to do about it.
+		if _, isResult := st.(*resultStmt); isResult {
+			return nil, p.pos.errorAt(st.at(), "a module has no 'result': it defines functions "+
+				"rather than computing a value, and each function's value is its 'return'")
+		}
+		// Everything else, a binding included. A top-level binding has no moment at which it would
+		// be computed: a module is never run, only the functions it exports are, each with its own
+		// registers. Bind inside the function that needs the value.
+		return nil, p.pos.errorAt(st.at(), "a module holds only 'def' statements at the top level: "+
+			"a module is not run, so there is no point at which a statement outside a function "+
+			"would execute")
+	}
+	if len(stmts) == 0 {
+		return nil, fmt.Errorf("%w: the source holds no statements", ErrNoFunctions)
+	}
+	return stmts, nil
 }
 
 // checkResult enforces that `result` is present, top level, and last.
@@ -330,9 +398,8 @@ func (p *scriptParser) statement(indent int) (stmt, error) {
 		}
 		return &whileStmt{stmtAt: stmtAt{ln.off}, cond: cond, body: body}, nil
 	case "for":
-		return nil, p.at(ln, "'for' is not implemented in ClassAd Script: "+
-			"a loop over a list needs an element load the compiler does not have yet; "+
-			"use 'while' with an explicit index once it does")
+		p.idx++
+		return p.forLine(ln, after, indent)
 	case "pass":
 		p.idx++
 		if p.text(after, ln.end) != "" {
@@ -345,7 +412,17 @@ func (p *scriptParser) statement(indent int) (stmt, error) {
 	case "return":
 		p.idx++
 		return p.returnLine(ln, after)
-	case "break", "continue", "del", "fail", "defer":
+	case "break", "continue":
+		p.idx++
+		if p.text(after, ln.end) != "" {
+			return nil, p.pos.errorAt(after, fmt.Sprintf("expected end of line after '%s': it "+
+				"takes no operand", word))
+		}
+		if word == "break" {
+			return &breakStmt{stmtAt{ln.off}}, nil
+		}
+		return &continueStmt{stmtAt{ln.off}}, nil
+	case "del", "fail", "defer":
 		return nil, p.at(ln, fmt.Sprintf("'%s' is not implemented in ClassAd Script", word))
 	case "result":
 		p.idx++
@@ -450,6 +527,89 @@ func (p *scriptParser) defHeader(from, to int) (string, []string, error) {
 		params = append(params, pname)
 	}
 	return name, params, nil
+}
+
+// forLine parses `for NAME in <expr>:` and the indented suite that follows it.
+func (p *scriptParser) forLine(ln scriptLine, after, indent int) (stmt, error) {
+	end, err := p.blockColon(ln, after, "for")
+	if err != nil {
+		return nil, err
+	}
+	name, rest, err := p.forTarget(after, end)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(p.text(rest, end)) == "" {
+		return nil, p.pos.errorAt(rest, "expected a sequence after 'in', as in 'for x in MY.Sizes:'")
+	}
+	seq, err := p.expr(rest, end)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.block(ln, indent, "for")
+	if err != nil {
+		return nil, err
+	}
+	return &forStmt{stmtAt: stmtAt{ln.off}, name: name, seq: seq, body: body}, nil
+}
+
+// forTarget reads `NAME in` from the head of a `for` header, returning the name and the offset just
+// past the `in`.
+//
+// `in` is read as a WORD rather than searched for, which is what keeps it out of the expression: a
+// sequence may perfectly well contain the letters -- `for x in Inputs:` -- and a search would cut
+// the header in the wrong place. The loop variable is one token, so the word after it is the only
+// place `in` can be.
+func (p *scriptParser) forTarget(from, to int) (string, int, error) {
+	from, to = trimRange(p.clean, from, to)
+	if from >= to {
+		return "", 0, p.pos.errorAt(from, "expected a loop variable, as in 'for x in MY.Sizes:'")
+	}
+	if p.clean[from] == '\'' {
+		// The quoted form, for a name that is not a bare identifier -- the same escape hatch an
+		// assignment target has.
+		name, n, ok := unquoteIdent(string(p.clean[from:to]))
+		if !ok {
+			return "", 0, p.pos.errorAt(from, "expected a quoted attribute name")
+		}
+		return p.forIn(name, from, from+n, to)
+	}
+	i := from
+	for i < to && identPart(p.clean[i]) {
+		i++
+	}
+	name := string(p.clean[from:i])
+	if !isBareIdent(name) {
+		if i > from {
+			return "", 0, p.pos.errorAt(from, fmt.Sprintf("expected a loop variable name, found %q", name))
+		}
+		return "", 0, p.pos.errorAt(from,
+			fmt.Sprintf("expected a loop variable name, found %q", p.text(from, to)))
+	}
+	return p.forIn(name, from, i, to)
+}
+
+// forIn consumes the `in` that separates a `for` header's variable from its sequence. nameAt is
+// where the variable started, for the one diagnostic that is about the variable and not about `in`.
+func (p *scriptParser) forIn(name string, nameAt, from, to int) (string, int, error) {
+	i := from
+	for i < to && (p.clean[i] == ' ' || p.clean[i] == '\t') {
+		i++
+	}
+	j := i
+	for j < to && identPart(p.clean[j]) {
+		j++
+	}
+	if string(p.clean[i:j]) != "in" {
+		if name == "in" {
+			// `for in L:` read `in` as the variable, which is the one case where the complaint is
+			// about what is missing in FRONT of it.
+			return "", 0, p.pos.errorAt(nameAt,
+				"expected a loop variable before 'in', as in 'for x in MY.Sizes:'")
+		}
+		return "", 0, p.pos.errorAt(i, "expected 'in' after the loop variable, as in 'for x in MY.Sizes:'")
+	}
+	return name, j, nil
 }
 
 // returnLine parses `return` and `return <expr>`.
@@ -855,6 +1015,10 @@ func (e *emitter) block(s *Script, stmts []stmt) {
 		e.one(s, st)
 		s.flush()
 		switch {
+		case e.err != nil:
+			// A statement whose lowering expanded a call already blamed the line INSIDE the body
+			// that the compiler refused, through this same loop one level down. That line is the
+			// one the author edits, so the statement that contained the call does not take it over.
 		case !hadCapture && s.c.capture != nil:
 			e.err = e.pos.errorAt(st.at(), captureDetail(s.c.capture))
 		case hadErr == nil && s.err != nil:
@@ -881,8 +1045,14 @@ func (e *emitter) one(s *Script, st stmt) {
 		s.If(v.cond, e.suite(v.then), e.suite(v.els))
 	case *whileStmt:
 		s.While(v.cond, e.suite(v.body))
+	case *forStmt:
+		s.For(v.name, v.seq, e.suite(v.body))
 	case *returnStmt:
 		s.Return(v.expr)
+	case *breakStmt:
+		s.Break()
+	case *continueStmt:
+		s.Continue()
 	case *defStmt:
 	}
 }

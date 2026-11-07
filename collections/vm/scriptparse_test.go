@@ -362,8 +362,16 @@ func TestParseScriptErrors(t *testing.T) {
 		{"comparison is not an assignment", "x = 1\nx >= 2\nresult = x\n", 2, 1, "expected a statement"},
 		{"ad write", "MY.Foo = 1\nresult = 1\n", 1, 1, "writing to the ad is not implemented"},
 		{"dynamic write", "self[\"a\"] = 1\nresult = 1\n", 1, 1, "writing to the ad is not implemented"},
-		{"for is refused", "for x in MY.L:\n    y = x\nresult = y\n", 1, 1, "'for' is not implemented"},
-		{"break is refused", "while MY.x:\n    break\nresult = 1\n", 2, 5, "'break' is not implemented"},
+		{"for without in", "for x MY.L:\n    y = x\nresult = y\n", 1, 7, "expected 'in' after the loop variable"},
+		{"for without a variable", "for in MY.L:\n    y = 1\nresult = y\n", 1, 5, "expected a loop variable before 'in'"},
+		{"for without a sequence", "for x in:\n    y = 1\nresult = y\n", 1, 9, "expected a sequence after 'in'"},
+		{"for without a colon", "for x in MY.L\n    y = x\nresult = y\n", 1, 14, "expected ':' at the end of the 'for' header"},
+		{"for without a body", "for x in MY.L:\nresult = 1\n", 1, 15, "expected an indented block after 'for'"},
+		{"for target is not a name", "for x.y in MY.L:\n    z = 1\nresult = z\n", 1, 6, "expected 'in' after the loop variable"},
+		{"break outside a loop", "break\nresult = 1\n", 1, 1, "'break' outside a loop"},
+		{"continue outside a loop", "continue\nresult = 1\n", 1, 1, "'continue' outside a loop"},
+		{"junk after break", "while MY.x:\n    break 1\nresult = 1\n", 2, 10, "expected end of line after 'break'"},
+		{"junk after continue", "while MY.x:\n    continue 1\nresult = 1\n", 2, 13, "expected end of line after 'continue'"},
 		{"def inside a block", "if MY.x:\n    def f(a):\n        return a\nresult = 1\n", 2, 5, "'def' must be a top-level statement"},
 		{"return outside a function", "return 1\nresult = 1\n", 1, 1, "'return' outside a function body"},
 		{"junk after pass", "if MY.x:\n    pass 1\nresult = 1\n", 2, 9, "expected end of line after 'pass'"},
@@ -372,8 +380,9 @@ func TestParseScriptErrors(t *testing.T) {
 		{"block comment spans lines", "x = 1 /* two\nlines */ + 1\nresult = x\n", 1, 7, "may not span a line break"},
 		{"expression error carries the script position", "x = 1\ny = 2\nresult = y +\n", 3, 12, "syntax error"},
 		{"quoted name hint", "x = 'alice' +\nresult = x\n", 1, 13, "quoted attribute name"},
-		{"local in a conditional", "x = MY.Cpus\nresult = x ? 1 : 2\n", 2, 1, `reads the local "x"`},
 		{"local in a list literal", "x = MY.Cpus\nresult = {x, 1}\n", 2, 1, `reads the local "x"`},
+		{"local in an ad literal", "x = MY.Cpus\nresult = [a = x].a\n", 2, 1, `reads the local "x"`},
+		{"local in a per-ad context", "x = MY.Cpus\nresult = countMatches(x, MY.GPUs)\n", 2, 1, `reads the local "x"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -476,14 +485,14 @@ func TestParseScriptAssignmentTargets(t *testing.T) {
 }
 
 // TestScriptLocalCaptureIsTyped checks the refusal a caller might want to recognize rather than
-// print: a local read from inside a construct that is evaluated against the ad.
+// print: a local read from a position no overlay can reach.
 func TestScriptLocalCaptureIsTyped(t *testing.T) {
 	// Through the builder, where there is no position to attach and the error arrives bare.
 	x, err := parser.ParseExpr("MY.Cpus")
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := parser.ParseExpr("x ? 1 : 2")
+	res, err := parser.ParseExpr("{x, 1}")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,8 +506,18 @@ func TestScriptLocalCaptureIsTyped(t *testing.T) {
 	}
 	// Printed bare it names the package, the local and the subtree, because a builder caller has no
 	// line to be told about and the subtree is the only handle they have on it.
-	if msg := lc.Error(); !strings.HasPrefix(msg, "vm: script: ") || !strings.Contains(msg, "x ? 1 : 2") {
+	if msg := lc.Error(); !strings.HasPrefix(msg, "vm: script: ") || !strings.Contains(msg, "{x, 1}") {
 		t.Errorf("Error() = %q", msg)
+	}
+
+	// A conditional over the same local compiles: a ternary is evaluated by the tree-walker in the
+	// evaluator the overlay is installed on, so the local is readable there.
+	resT, err := parser.ParseExpr("x ? 1 : 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, cerr := NewScript().Let("x", x).Result(resT).Compile(); cerr != nil {
+		t.Errorf("a conditional over a local should compile: %v", cerr)
 	}
 
 	// The same expression with no local in it compiles, because nothing is captured: the delegated

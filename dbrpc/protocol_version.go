@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 4
+const ProtocolVersion = 5
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -115,6 +115,15 @@ const (
 	FeatJoinChain     Feature = "joinchain"
 	FeatJoinChainWire Feature = "joinchainwire"
 
+	// FeatJoinExplain is the join access-path report (opJoinExplain, opJoinChainExplain).
+	// Postdates advertisement, so silence is a no.
+	//
+	// One feature for both opcodes, unlike the join itself. A server gains the two
+	// together -- they are one handler over the two body layouts -- and the thing that
+	// made FeatJoinChain separate does not apply: a build without chains cannot answer
+	// either, because it has no chain planner to report on.
+	FeatJoinExplain Feature = "joinexplain"
+
 	// FeatEvalTypes is the EVALUATED half of the attribute type report (opAttrTypes with
 	// attrFlagEvaluate). Postdates advertisement, so silence is a no.
 	//
@@ -136,6 +145,17 @@ const (
 	// not know fails the query with db.ErrNoSuchAggregate, which is a different error for a
 	// different cause, and deliberately not an "undefined" column.
 	FeatNamedAggregate Feature = "namedagg"
+
+	// FeatTypedGroups is the aggregate reply whose GROUP cells are tagged VALUES rather
+	// than the group's rendered text (opAggregateTyped, opArchiveAggregateTyped).
+	// Postdates advertisement, so silence is a no.
+	//
+	// A client that does not get it is not stuck: db.ParseGroupValue reads the rendered
+	// text back, and the client fills AggRow.GroupValues with it, so a caller sees values
+	// from every server. The feature is what saves the round trip through text, not what
+	// makes the values available -- which is why its absence costs accuracy nowhere and
+	// needs no fallback path in the caller.
+	FeatTypedGroups Feature = "typedgroups"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -171,6 +191,8 @@ var serverFeatures = []Feature{
 	FeatValueDict,
 	FeatEvalTypes,
 	FeatNamedAggregate,
+	FeatJoinExplain,
+	FeatTypedGroups,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar
@@ -217,6 +239,14 @@ func (s *Server) SessionAttrs() map[string]string {
 		}
 		if f == FeatJoinChainWire {
 			if _, ok := s.cat.(joinWireCatalog); !ok || !catalogJoinsChains(s.cat) {
+				continue
+			}
+		}
+		// Explaining a join is its own capability, not one implied by running one: the
+		// report describes decisions a catalog from an older build makes without being
+		// able to name them.
+		if f == FeatJoinExplain {
+			if _, ok := s.cat.(joinExplainCatalog); !ok {
 				continue
 			}
 		}

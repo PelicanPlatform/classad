@@ -472,6 +472,9 @@ func (c *Collection) strEqProbes(q *vm.Query, s *adSchema) []strProbe {
 		default:
 			continue // "!=" and "isnt" can never rule a block out; see strProbe
 		}
+		if p.Nested() {
+			continue // a columnar field is one top-level attribute (see index_query.go)
+		}
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
 			continue
@@ -513,6 +516,9 @@ func (c *Collection) zonePrunableTests(q *vm.Query, s *adSchema) ([]int, []field
 	var idxs []int
 	var preds []fieldPred
 	for _, p := range q.Probes() {
+		if p.Nested() {
+			continue // a columnar field is one top-level attribute (see index_query.go)
+		}
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
 			continue
@@ -555,7 +561,7 @@ func (c *Collection) indexCanPrune(q *vm.Query) bool {
 		return false
 	}
 	for _, p := range q.Probes() {
-		id, ok := c.intern.LookupID(p.Attr)
+		id, ok := c.probeAttrID(spec, p)
 		if !ok {
 			continue
 		}

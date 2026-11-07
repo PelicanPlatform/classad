@@ -46,13 +46,33 @@ func Optimize(rp *RegProgram, passes OptPasses) *RegProgram {
 	cp := *rp
 	out := &cp
 	out.code = append([]RegInstr(nil), rp.code...)
-	// args stays shared, so copyProp deep-copies the one argument list it rewrites.
+	// args stays shared, so copyProp deep-copies the one argument list it rewrites. nodeLocals
+	// cannot work that way -- its index is the delegated node's, shared with src.nodes, so a
+	// rewritten entry has to go back at the same index -- and it is detached whole instead.
 	if passes.CopyProp {
+		out.nodeLocals = cloneNodeLocals(rp.nodeLocals)
 		copyProp(out)
 	}
 	// After CopyProp, so the copies it detaches from their readers are then dead.
 	if passes.DeadCode {
 		deadCode(out)
+	}
+	return out
+}
+
+// cloneNodeLocals deep-copies a delegated-node binding table so a pass may rewrite it without
+// reaching back into the program it was given, which is the oracle the optimized one is checked
+// against. nil in, nil out.
+func cloneNodeLocals(src [][]localBind) [][]localBind {
+	if len(src) == 0 {
+		return src
+	}
+	out := make([][]localBind, len(src))
+	for i, binds := range src {
+		if len(binds) == 0 {
+			continue
+		}
+		out[i] = append([]localBind(nil), binds...)
 	}
 	return out
 }
@@ -65,11 +85,20 @@ func Optimize(rp *RegProgram, passes OptPasses) *RegProgram {
 func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 	buf = buf[:0]
 	switch in.Op {
-	case RNop, RConst, RTrue, RFalse, RUndef, RError, RLoadRef, REvalNode, RJump, RFault:
+	case RNop, RConst, RTrue, RFalse, RUndef, RError, RLoadRef, RJump, RFault:
 		// No register operands.
-	case RBinop, RCombineAnd, RCombineOr:
+	case REvalNode:
+		// A DELEGATED SUBTREE READS REGISTERS, even though none is named in the instruction: the
+		// script locals it mentions are handed to the tree-walker through a resolver backed by the
+		// register file (see evalDelegated). Listing them here is what stops dead-code elimination
+		// from deleting the store that fills one.
+		for _, b := range rp.nodeLocals[in.Imm] {
+			buf = append(buf, b.reg)
+		}
+	case RBinop, RCombineAnd, RCombineOr, RSubscript:
 		buf = append(buf, in.A, in.B)
-	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
+	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond,
+		RShortSubscript:
 		buf = append(buf, in.A)
 	case RCallFunc:
 		buf = append(buf, rp.args[in.Args]...)
@@ -199,16 +228,24 @@ func copyProp(rp *RegProgram) {
 func substitute(rp *RegProgram, j int, from, to int32) {
 	in := &rp.code[j]
 	switch in.Op {
-	case RBinop, RCombineAnd, RCombineOr:
+	case RBinop, RCombineAnd, RCombineOr, RSubscript:
 		if in.A == from {
 			in.A = to
 		}
 		if in.B == from {
 			in.B = to
 		}
-	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
+	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond, RShortSubscript:
 		if in.A == from {
 			in.A = to
+		}
+	case REvalNode:
+		// A delegated subtree reads the registers of the locals it mentions, which are operands
+		// although the instruction names none of them. Rewritten in the table Optimize detached.
+		for k := range rp.nodeLocals[in.Imm] {
+			if rp.nodeLocals[in.Imm][k].reg == from {
+				rp.nodeLocals[in.Imm][k].reg = to
+			}
 		}
 	case RCallFunc:
 		// Copied before writing: Optimize shares the argument lists with the program it was given,

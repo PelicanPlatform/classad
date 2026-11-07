@@ -24,11 +24,29 @@ func (cp *catPostings) sizeBytes() int64 {
 	for k, v := range cp.exactCase {
 		n += int64(len(k) + len(v))
 	}
+	// The sorted key order, if a prefix probe has built it. The keys themselves are post's,
+	// counted above; this is the slice's own array of string headers.
+	if ks := cp.keys.Load(); ks != nil {
+		n += int64(len(*ks)) * 16
+	}
 	if cp.exc != nil {
 		n += int64(cp.exc.GetSizeInBytes())
 	}
 	if cp.posted != nil {
 		n += int64(cp.posted.GetSizeInBytes())
+	}
+	return n
+}
+
+// sizeBytes estimates the resident footprint of one composite's postings: the encoded tuple
+// keys and their bitmaps, plus the exception set.
+func (cp *compPostings) sizeBytes() int64 {
+	var n int64
+	for k, bm := range cp.post {
+		n += int64(len(k)) + int64(bm.GetSizeInBytes())
+	}
+	if cp.exc != nil {
+		n += int64(cp.exc.GetSizeInBytes())
 	}
 	return n
 }
@@ -161,8 +179,8 @@ func sidecarSketchBreakdown(data []byte) (mph, bloom int64) {
 
 // IndexSize is the measured memory footprint of one attribute's index.
 type IndexSize struct {
-	Attr  string `json:"attr"`
-	Kind  string `json:"kind"`  // "categorical" | "value"
+	Attr  string `json:"attr"`  // the attribute, or a composite's tuple ("ClusterId+ProcId")
+	Kind  string `json:"kind"`  // "categorical" | "value" | "composite"
 	Bytes int64  `json:"bytes"` // resident posting bytes (roaring bitmaps + keys) across all live segments
 	// SketchBytes is the resident memory of this attribute's per-segment sketches --
 	// the categorical bloom filter and the HyperLogLog distinct-count registers --
@@ -194,6 +212,8 @@ func (c *Collection) IndexSizes() IndexSizes {
 	valBytes := map[uint32]int64{}
 	catSketch := map[uint32]int64{}
 	valSketch := map[uint32]int64{}
+	compBytes := map[string]int64{}
+	compSpec := map[string]compositeSpec{}
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		for _, seg := range sh.segs {
@@ -211,6 +231,10 @@ func (c *Collection) IndexSizes() IndexSizes {
 			for id, vp := range si.val {
 				valBytes[id] += vp.sizeBytes()
 				valSketch[id] += vp.stats.sketchBytes()
+			}
+			for key, cp := range si.comp {
+				compBytes[key] += cp.sizeBytes()
+				compSpec[key] = cp.spec
 			}
 		}
 		sh.mu.RUnlock()
@@ -244,6 +268,18 @@ func (c *Collection) IndexSizes() IndexSizes {
 	}
 	appendSizes(catBytes, catSketch, "categorical")
 	appendSizes(valBytes, valSketch, "value")
+	// A composite is reported under its tuple rather than an attribute, so its memory is
+	// visible to the same watermark as every other index rather than hiding inside the
+	// components it is built from.
+	for key, b := range compBytes {
+		cs := compSpec[key]
+		sz := IndexSize{Attr: cs.label(), Kind: "composite", Bytes: b, Auto: cs.auto}
+		if dataBytes > 0 {
+			sz.Frac = float64(b) / float64(dataBytes)
+		}
+		out.PerIndex = append(out.PerIndex, sz)
+		out.TotalBytes += b
+	}
 	// Largest first: the indexes a memory budget would trim.
 	sort.Slice(out.PerIndex, func(i, j int) bool {
 		if out.PerIndex[i].Bytes != out.PerIndex[j].Bytes {

@@ -11,7 +11,7 @@ import (
 
 // CompileProgram lowers a ClassAd expression to a Program. Node types with
 // subtle scope/short-circuit/laziness semantics (conditional, list, record,
-// select, subscript) are emitted as OpEvalNode and delegated to the tree-walking
+// select) are emitted as OpEvalNode and delegated to the tree-walking
 // evaluator at run time; the rest are native instructions.
 //
 // A function call is native when classad.StrictFunction accepts it -- the
@@ -34,10 +34,11 @@ func compileProgramAliases(expr ast.Expr, aliases aliasIndex) *Program {
 		// per-node depth, so a deep operator chain would otherwise compute a value
 		// where the tree-walker's guard fires and returns error. Real expressions
 		// are a handful of levels deep; this only trips on adversarial input.
-		c.ins(OpEvalNode, c.addNode(expr))
+		c.ins(OpEvalNode, c.addNode(expr, nil))
 	} else {
 		c.emit(expr)
 	}
+	c.p.aliases = aliases
 	c.p.readAttrs = collectReads(expr, map[string]bool{}, nil)
 	c.p.expr = expr
 	c.p.vops = vopPrefix(c.p.code)
@@ -159,8 +160,11 @@ func (c *compiler) addFunc(name string, argc int) int32 {
 	return int32(len(c.p.funcs) - 1)
 }
 
-func (c *compiler) addNode(n ast.Expr) int32 {
+// addNode pools a delegated subtree together with the script locals it reads, which must stay
+// parallel: the interpreter indexes both with the one operand.
+func (c *compiler) addNode(n ast.Expr, binds []localBind) int32 {
 	c.p.nodes = append(c.p.nodes, n)
+	c.p.nodeLocals = append(c.p.nodeLocals, binds)
 	return int32(len(c.p.nodes) - 1)
 }
 
@@ -262,72 +266,65 @@ func (c *compiler) emit(expr ast.Expr) {
 			return
 		}
 		c.delegate(expr)
+	case *ast.SubscriptExpr:
+		c.emitSubscript(v)
 	default:
-		// ConditionalExpr, ListLiteral, RecordLiteral, SubscriptExpr, or any future
-		// node: delegate to the evaluator. (A FunctionCall reaches the evaluator too,
-		// but only the ones StrictFunction refuses; the case above compiles the rest.)
+		// ConditionalExpr, ListLiteral, RecordLiteral, or any future node: delegate to
+		// the evaluator. (A FunctionCall reaches the evaluator too, but only the ones
+		// StrictFunction refuses; the case above compiles the rest.)
 		c.delegate(expr)
 	}
 }
 
-// delegate emits a subtree as a tree-walking evaluation, first checking -- in a script -- that the
-// subtree does not read a local.
+// delegate emits a subtree as a tree-walking evaluation, binding -- in a script -- the locals that
+// subtree reads to the registers holding them.
 //
-// A LOCAL IS INVISIBLE TO THE TREE-WALKER, AND THAT IS A WRONG ANSWER, NOT A SLOW ONE. A delegated
-// subtree is evaluated with ev.Evaluate against the SCOPE: the ad, and nothing else. A script's
-// locals live in registers the evaluator has never heard of, so a bare name that this compiler would
-// have resolved to a local resolves inside a delegated subtree to the ATTRIBUTE of that name -- or
-// to UNDEFINED, when the ad has no such attribute. Nothing fails; the script simply computes
-// something other than what it says.
+// A delegated subtree is evaluated with ev.Evaluate against the SCOPE, which is the ad and knows
+// nothing of a script's registers. So before running one the interpreter overlays the locals it
+// reads on that scope with a partial resolver, and which names the overlay answers is decided here,
+// at compile time: a bare name bound as a local where the subtree sits is the local, and everything
+// else -- MY.x included -- is resolved against the ad as it always was. See evalDelegated.
 //
 //	x = Cpus + 1
-//	result = x ? 2 : 3      -- the ternary is delegated, so this reads the ATTRIBUTE x
+//	result = x ? 2 : 3      -- the ternary is delegated, and reads the LOCAL x
 //
-// The ternary is not an oversight that will be fixed next week: an UNDEFINED condition evaluates
-// BOTH of its branches, which a jump-based lowering can express only by emitting each branch twice,
-// exponentially in nesting depth. See OpBranchCond, which lowers ifThenElse for exactly the reason
-// the ternary cannot be lowered that way. The same goes for a list literal, an ad literal, a
-// subscript, a select and a lazy built-in, each of which needs the record itself.
-//
-// So the compiler refuses rather than silently reading the wrong thing. The refusal is what makes
-// the restriction discoverable: a script that cannot say what it means should say so at compile
-// time, and the ways around it -- an `if` statement instead of a ternary, or `MY.x` where the
-// attribute really was meant -- are both one line away.
+// THREE POSITIONS STILL CANNOT READ A LOCAL, because they are evaluated by an evaluator of their
+// own that the overlay does not reach: a list literal's elements (lazy -- materialized later, from
+// a captured scope, possibly after the script's registers are gone), an ad literal's attribute
+// values, and the first argument of countMatches/evalInEachContext. A local read in one of them is
+// refused with LocalCaptureError rather than silently resolved to the attribute of the same name,
+// and the ways around it -- binding the whole construct to a local, or MY.x where the attribute
+// really was meant -- are both one line away.
 func (c *compiler) delegate(expr ast.Expr) {
-	c.noteCapture(expr)
-	c.ins(OpEvalNode, c.addNode(expr))
+	c.ins(OpEvalNode, c.addNode(expr, c.bindDelegated(expr)))
 }
 
-// noteCapture records the first bound local a delegated subtree would read, if any. The first one
-// wins: later ones are almost always the same mistake, and a compiler that reports five is a
-// compiler whose first line is ignored.
-func (c *compiler) noteCapture(expr ast.Expr) {
-	if c.capture != nil {
-		return
-	}
-	// A CALL IS THE SAME MISTAKE AS A LOCAL READ, one level up. The evaluator resolves a function
-	// name against the built-ins and the UDF registry; a script's own function is in neither, so a
-	// delegated subtree calling one evaluates to ERROR. Refused here rather than computed, exactly
-	// as a captured local is.
-	if c.isScriptFunc != nil {
+// bindDelegated resolves a delegated subtree's local reads, recording the first refusal it finds.
+// The first one wins: later ones are almost always the same mistake, and a compiler that reports
+// five is a compiler whose first line is ignored.
+func (c *compiler) bindDelegated(expr ast.Expr) []localBind {
+	// A CALL TO A SCRIPT FUNCTION IS A DIFFERENT MISTAKE AND IS STILL REFUSED. The evaluator
+	// resolves a function name against the built-ins and the UDF registry; a script's own function
+	// is in neither, so a delegated subtree calling one evaluates to ERROR. The overlay cannot help
+	// -- it answers attribute references, and a call is not one.
+	if c.capture == nil && c.isScriptFunc != nil {
 		if name := callsScriptFunc(expr, c.isScriptFunc); name != "" {
 			c.capture = &ScriptCallCaptureError{Func: name, Expr: expr.String()}
-			return
 		}
 	}
 	if c.locals == nil {
-		return
+		return nil
 	}
-	for _, name := range collectReads(expr, map[string]bool{}, nil) {
-		if _, bound := c.locals[foldLocal(name)]; bound {
-			c.capture = &LocalCaptureError{Local: name, Expr: expr.String()}
-			return
-		}
+	binds, blocked := scanDelegatedLocals(expr, c.locals)
+	if blocked != nil && c.capture == nil {
+		c.capture = blocked
 	}
+	return binds
 }
 
-// LocalCaptureError reports a script expression that reads a local from inside a construct the
-// compiler evaluates against the ad, where the local does not exist. See compiler.delegate.
+// LocalCaptureError reports a script expression that reads a local from a position no overlay can
+// reach: inside a list literal, an ad literal, or the first argument of countMatches or
+// evalInEachContext, each of which is evaluated in an evaluator of its own. See compiler.delegate.
 type LocalCaptureError struct {
 	Local string // the local the subtree reads, as the script spelled it
 	Expr  string // the delegated subtree, unparsed
@@ -338,9 +335,10 @@ func (e *LocalCaptureError) Error() string { return "vm: script: " + e.detail() 
 // detail is the sentence without the package prefix, for a caller -- the parser -- that puts a line
 // and column in front of it instead.
 func (e *LocalCaptureError) detail() string {
-	return fmt.Sprintf("%s reads the local %q, but this construct is evaluated against the ad, "+
-		"where a local does not exist; use an if statement instead of a conditional, "+
-		"or MY.%s if the attribute was meant", e.Expr, e.Local, e.Local)
+	return fmt.Sprintf("%s reads the local %q from a list literal, an ad literal or a per-ad "+
+		"context, each of which is evaluated in a scope of its own where a local does not exist; "+
+		"bind the whole construct to a local first, or write MY.%s if the attribute was meant",
+		e.Expr, e.Local, e.Local)
 }
 
 // detailed is a compiler refusal that can render itself without the "vm: script: " prefix.
@@ -461,6 +459,12 @@ func collectReads(expr ast.Expr, seen map[string]bool, out []string) []string {
 			out = collectReads(a, seen, out)
 		}
 	case *ast.SelectExpr:
+		// Only the record, unlike ReadPlan's walk, which also seeds the member because
+		// it chains out to this ad. This set is the demand signal (which attributes a
+		// scan would profit from having indexed), and an index on the chained-to name
+		// answers nothing: a select yields no probe. ScriptFunc.checkPure, the other
+		// reader of this set, refuses a select outright -- it compiles to a delegated
+		// subtree, which is its rule 4 -- so it does not depend on this case either.
 		out = collectReads(v.Record, seen, out)
 	case *ast.SubscriptExpr:
 		out = collectReads(v.Container, seen, out)
@@ -473,4 +477,27 @@ func collectReads(expr ast.Expr, seen map[string]bool, out []string) []string {
 		}
 	}
 	return out
+}
+
+// emitSubscript compiles `container[index]` to an element load.
+//
+// The layout is the Elvis operator's, for the same reason: the index must not be evaluated when the
+// container already settles the result.
+//
+//	<container>
+//	shortSubscript -> END      ; container UNDEFINED or ERROR: it is the result
+//	<index>
+//	subscript                  ; pop index, container; push the element
+//	END:
+//
+// The operands are ordinary compiled expressions, so each is native or delegated on its own merits:
+// `{1, x}[0]` has a delegated list literal under a native element load. What matters is that the
+// load itself is native, because that is what a script needs to index one of its own locals and
+// what `for` is built on.
+func (c *compiler) emitSubscript(v *ast.SubscriptExpr) {
+	c.emit(v.Container)
+	j := c.ins(OpShortSubscript, -1)
+	c.emit(v.Index)
+	c.ins(OpSubscript, 0)
+	c.patch(j, len(c.p.code))
 }

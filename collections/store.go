@@ -223,8 +223,23 @@ type Options struct {
 	// names numeric attributes to index for equality and range (`Attr >= n`). A
 	// query filtering on an indexed attribute visits only candidate ads instead of
 	// scanning all of them. Optional.
+	//
+	// A name holding a dot indexes a NESTED PATH, written the way a query writes it:
+	// "Res.Mem" indexes what `Res.Mem` selects, so a constraint on it is a probe rather
+	// than a scan. An attribute whose own name contains a dot therefore cannot be indexed
+	// as itself -- a path is what a dot means here, and that ambiguity is resolved once,
+	// at configuration, rather than at every query (see indexSpec.paths).
 	CategoricalAttrs []string
 	ValueAttrs       []string
+	// CompositeAttrs names attribute TUPLES to index together, so a conjunction of
+	// equalities on all of them (`ClusterId == 7 && ProcId == 3`) is one index lookup
+	// rather than a probe per attribute whose posting lists are then intersected. Each
+	// tuple's attributes must also appear in CategoricalAttrs or ValueAttrs -- a composite
+	// answers only the full tuple, and everything else (one attribute alone, a range) is
+	// served by the components' own indexes; a tuple naming an unindexed attribute is
+	// ignored. Order matters for identity: {"ClusterId","ProcId"} and {"ProcId","ClusterId"}
+	// are two composites, and either answers the same conjunctions. Optional.
+	CompositeAttrs [][]string
 	// Ordered configures maintained, filtered, ordered indexes -- the schedd
 	// priority-queue pattern (see docs/MATCH.md §3 and Collection.Ordered). Each
 	// spec groups members into partitions and keeps them sorted on the write path,
@@ -880,14 +895,16 @@ func New(opts Options) *Collection {
 	for _, r := range opts.MatchClosureRoots {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
-	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	baseSpec := newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs)
+	baseSpec.setComposites(c.intern, opts.CompositeAttrs, false)
+	c.spec.Store(baseSpec)
 	// Zone maps (append-only only): cover the explicit ZoneAttrs plus every value-indexed
 	// attribute (a range query on an indexed attr should prune whole segments too), matching
 	// the archive. Each attribute carries both its folded name and its interned id so the
 	// per-segment scan can read the value whether records are inline- or id-encoded; the
 	// zone map is keyed by id, which zonePrune/age-retention resolve names to via c.intern.
 	// zoneInline is finalized in Open (a persistent collection stores inline names).
-	if opts.AppendOnly && (len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0) {
+	if len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0 {
 		var zattrs []zoneAttr
 		seen := map[uint32]struct{}{}
 		addZone := func(name string) {
@@ -901,7 +918,7 @@ func New(opts Options) *Collection {
 		for _, n := range opts.ZoneAttrs {
 			addZone(n)
 		}
-		for _, n := range opts.ValueAttrs { // value-indexed attrs are zoned automatically
+		for _, n := range topLevelNames(opts.ValueAttrs) { // value-indexed attrs are zoned automatically
 			addZone(n)
 		}
 		c.hasZones.Store(len(zattrs) > 0)
@@ -933,8 +950,17 @@ func New(opts Options) *Collection {
 	if c.sealer = sealer; c.sealer != nil {
 		enc := foldedSet(opts.EncryptedAttrs)
 		for _, idxAttr := range append(append([]string{}, opts.CategoricalAttrs...), opts.ValueAttrs...) {
-			_, explicit := enc[strings.ToLower(idxAttr)]
-			if explicit || classad.IsPrivateAttribute(idxAttr) {
+			// A nested path is judged by its ROOT attribute: that is the one stored, and
+			// sealing it makes every value under it opaque, so an index on anything inside
+			// it could never match. The index would not be wrong, only useless -- every
+			// record an exception -- and a useless index that was asked for is a
+			// misconfiguration worth naming.
+			root := idxAttr
+			if comps := splitAttrPath(idxAttr); comps != nil {
+				root = comps[0]
+			}
+			_, explicit := enc[strings.ToLower(root)]
+			if explicit || classad.IsPrivateAttribute(root) {
 				panic("collections.New: attribute " + idxAttr + " cannot be both encrypted and indexed")
 			}
 		}
@@ -1236,10 +1262,25 @@ func (c *Collection) Flatten(key []byte) (*classad.ClassAd, bool) {
 	return c.Get(key)
 }
 
-// Len returns the number of live keys across all shards. Note this includes structural
-// (parent-only) ads of a chained collection, which Scan/Query hide -- so Len equals the
-// number of rows a match-all query returns only when the collection is not Chained.
+// Len returns how many live keys a reader is shown. Records of the reserved system
+// keyspace (syskey.go) are not among them, as they are not in any other client-facing
+// path. Structural (parent-only) ads of a chained collection still are, though Scan/Query
+// hide those too -- so Len equals the number of rows a match-all query returns only when
+// the collection is not Chained. StoredLen is the count of everything the store holds.
 func (c *Collection) Len() int {
+	n := 0
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		n += sh.count - sh.sysCount
+		sh.mu.RUnlock()
+	}
+	return n
+}
+
+// StoredLen returns the number of live keys the store holds, system-keyed records
+// included. It is what Stats reports as Ads, and it is the right figure for accounting
+// what is on disk; Len is the right one for how many rows a reader sees.
+func (c *Collection) StoredLen() int {
 	n := 0
 	for _, sh := range c.shards {
 		sh.mu.RLock()

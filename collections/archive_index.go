@@ -27,6 +27,13 @@ import (
 //	         upto uint32; specGen uint64; allOff uint32
 //	         catN uint32; catN × { id uint32; attrOff uint32 }
 //	         valN uint32; valN × { id uint32; attrOff uint32 }
+//	         compN uint32; compN × { nAttrs uint32; nAttrs × id uint32; catMask uint32;
+//	         blockOff uint32 }  (v11) -- the composite (multi-column) indexes, LAST in the
+//	         directory so a v9/v10 reader stops before it. catMask bit i marks component i
+//	         categorical. A composite is identified by its ORDERED id tuple, which is what
+//	         the live spec keys its composites by too, so a sidecar built under a different
+//	         tuple set matches none of them and the segment falls back to intersecting the
+//	         components' own postings.
 //	  cat attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
 //	         keyOff [n+1] uint32 (delimit sorted folded keys in keysBlob); bmOff [n] uint32;
 //	         keysBlob;
@@ -45,6 +52,9 @@ import (
 //	         search, so the MPH is a fast path, never authoritative.
 //	  val attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
 //	         key [n] float64 (sorted asc); bmOff [n] uint32
+//	  comp block @blockOff: excOff uint32; excN uint64; n uint32;
+//	         keyOff [n+1] uint32 (delimit the byte-sorted encoded tuple keys in keysBlob);
+//	         bmOff [n] uint32; keysBlob
 //
 // postedOff is the bitmap of records that posted a literal value, for the presence
 // probes: present (isnt undefined) = posted OR exc, absent (is undefined) = all AND-NOT
@@ -53,7 +63,7 @@ import (
 // simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 10         // v10: value postings include negatives stored as unary minus over a literal
+	sidecarVersion = 11         // v11: composite (multi-column) index section
 
 	// sidecarMinVersion is the oldest layout still read. v9 is byte-for-byte v10; it differs only in
 	// what its value postings hold. A v9 builder put a negative number stored as unary minus over a
@@ -63,6 +73,12 @@ const (
 	// and keeps the segment from being skipped. So it is still read, and the index backfill rebuilds
 	// it when it has value exceptions that might be such records (see mmapSegIndex.stalePostings).
 	sidecarMinVersion = 9
+
+	// sidecarNegPostingVersion is the first version whose value postings hold negative
+	// numbers stored as unary minus over a literal; below it they are exceptions. It is
+	// pinned rather than tracking sidecarVersion, so a later format addition does not
+	// declare every correctly-posted sidecar stale (see mmapSegIndex.stalePostings).
+	sidecarNegPostingVersion = 10
 
 	// mphNDVThreshold gates the categorical minimal-perfect-hash: only an attribute with
 	// at least this many distinct values in a segment gets one. Below it, the sorted key
@@ -216,6 +232,38 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 	}
 	sort.Slice(valBlks, func(i, j int) bool { return valBlks[i].id < valBlks[j].id })
 
+	type compBlk struct {
+		spec   compositeSpec
+		excOff uint32
+		excN   uint64
+		keys   []string // encoded tuple keys, byte-sorted
+		bmOffs []uint32
+	}
+	var compBlks []compBlk
+	for _, cp := range si.comp {
+		keys := make([]string, 0, len(cp.post))
+		for k := range cp.post {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		bmOffs := make([]uint32, len(keys))
+		// Its own error variable, not the one the attribute blocks above assign: a later
+		// use of that one would make the shadowing declaration inside the value-block loop
+		// matter, which govet's shadow check reports and which this loop has no need of.
+		for i, k := range keys {
+			var emitErr error
+			if bmOffs[i], emitErr = emit(cp.post[k]); emitErr != nil {
+				return nil, emitErr
+			}
+		}
+		excOff, offErr := emit(cp.exc)
+		if offErr != nil {
+			return nil, offErr
+		}
+		compBlks = append(compBlks, compBlk{cp.spec, excOff, cp.excN, keys, bmOffs})
+	}
+	sort.Slice(compBlks, func(i, j int) bool { return compBlks[i].spec.key < compBlks[j].spec.key })
+
 	// Meta section: directory (with attrOff placeholders backpatched as each block is
 	// written) followed by the sorted-key attr blocks.
 	metaOff := uint32(len(b))
@@ -243,6 +291,26 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		valSlot[i] = len(b)
 		b = appendU32(b, 0)
 		valStatsSlot[i] = len(b)
+		b = appendU32(b, 0)
+	}
+	// Composite directory (v11), the last entry of the meta directory so that a v9/v10
+	// reader -- which stops after the value entries -- never reaches it.
+	b = appendU32(b, uint32(len(compBlks)))
+	compSlot := make([]int, len(compBlks))
+	for i := range compBlks {
+		cb := &compBlks[i]
+		b = appendU32(b, uint32(len(cb.spec.ids)))
+		for _, id := range cb.spec.ids {
+			b = appendU32(b, id)
+		}
+		var mask uint32
+		for j, isCat := range cb.spec.cats {
+			if isCat {
+				mask |= 1 << uint(j)
+			}
+		}
+		b = appendU32(b, mask)
+		compSlot[i] = len(b)
 		b = appendU32(b, 0)
 	}
 	for i, cb := range catBlks {
@@ -333,6 +401,27 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		}
 		binary.LittleEndian.PutUint32(b[valStatsSlot[i]:], uint32(len(b)))
 		b = appendSegStats(b, vb.stats)
+	}
+	for i := range compBlks {
+		cb := &compBlks[i]
+		binary.LittleEndian.PutUint32(b[compSlot[i]:], uint32(len(b)))
+		b = appendU32(b, cb.excOff)
+		b = appendU64(b, cb.excN)
+		b = appendU32(b, uint32(len(cb.keys)))
+		var blob []byte
+		keyOffs := make([]uint32, len(cb.keys)+1)
+		for j, k := range cb.keys {
+			keyOffs[j] = uint32(len(blob))
+			blob = append(blob, k...)
+		}
+		keyOffs[len(cb.keys)] = uint32(len(blob))
+		for _, o := range keyOffs {
+			b = appendU32(b, o)
+		}
+		for _, o := range cb.bmOffs {
+			b = appendU32(b, o)
+		}
+		b = append(b, blob...)
 	}
 
 	binary.LittleEndian.PutUint32(b[metaOffPos:], metaOff)

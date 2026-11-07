@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -8,14 +9,16 @@ import (
 )
 
 // Probe is an index-satisfiable constraint extracted from a query: a self-scoped
-// attribute Attr related by Op to one or more literal values. Op is one of
+// attribute -- or a self-scoped nested path, `Res.Mem` (see Path) -- named by Attr and
+// related by Op to one or more literal values. Op is one of
 // "==","!=","<","<=",">=",">" (a single Val), "!<","!<=","!>","!>=" (a NEGATED ordering
 // comparison, which is not the flipped one -- see negOrdering), "in" (a set of Vals: the
 // attribute is == to one of them, from an OR-of-equalities or a member() call over a
-// constant list), "is"/"isnt" (=?=/=!= exact identity), or "present"/"absent"
-// (is/isnt undefined). A store matches Probes against its configured indexes to
-// build a candidate set; because the store still re-verifies the full query, any
-// Probe the planner omits only costs selectivity, never correctness.
+// constant list), "is"/"isnt" (=?=/=!= exact identity), "prefix" (the attribute's string
+// value begins with the single Val, from an anchored regexp -- see regexpPrefixProbe), or
+// "present"/"absent" (is/isnt undefined). A store matches Probes against its configured
+// indexes to build a candidate set; because the store still re-verifies the full query,
+// any Probe the planner omits only costs selectivity, never correctness.
 //
 // A query that reads CurrentTime has its probes computed with CurrentTime folded to the
 // query's pinned time (see Compile), so `CompletionDate > CurrentTime - 86400` yields a
@@ -26,7 +29,22 @@ type Probe struct {
 	Attr string
 	Op   string
 	Vals []classad.Value
+	// Path is the components of a NESTED attribute path (`Res.Mem` -> {"Res","Mem"}), and is
+	// nil for a plain attribute. Attr is then the components joined with ".", which is how the
+	// query spells it and how an index on it is configured.
+	//
+	// It is a separate field rather than something a consumer could read off Attr because the
+	// two are not the same constraint: an ad may carry an attribute literally NAMED "Res.Mem"
+	// (nothing stops a writer setting one), and answering a path probe from that attribute's
+	// postings -- or the reverse -- would hand back a candidate set missing records that match.
+	// A consumer that cannot resolve a path must therefore decline on Nested() rather than fall
+	// through to its flat lookup, which costs selectivity and never correctness.
+	Path []string
 }
+
+// Nested reports whether the probe constrains a nested path (`Res.Mem`) rather than a
+// top-level attribute.
+func (p Probe) Nested() bool { return len(p.Path) > 0 }
 
 // Probes extracts the query's index-satisfiable conjuncts. It constant-folds the
 // source expression (so `Memory > 2048*1024` normalizes), then flattens the
@@ -43,14 +61,29 @@ func (q *Query) Probes() []Probe {
 }
 
 func (q *Query) computeProbes() []Probe {
+	pc := q.probeCtx()
 	conj := flattenAnd(q.foldedExpr(), nil)
 	var out []Probe
 	for _, c := range conj {
-		if p, ok := probeFrom(c); ok {
+		if p, ok := pc.probeFrom(c); ok {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// probeCtx is what probe extraction needs to know about the query beyond the expression
+// itself. Today that is only the join aliases, which decide whether `j.Owner` is a nested
+// path or the other side of a join (see probeTargetOf).
+type probeCtx struct {
+	aliases aliasIndex
+}
+
+func (q *Query) probeCtx() probeCtx {
+	if q == nil || q.prog == nil {
+		return probeCtx{}
+	}
+	return probeCtx{aliases: q.prog.aliases}
 }
 
 // ExactProbes returns the query's probes together with whether they are EXACTLY equivalent to the
@@ -68,11 +101,12 @@ func (q *Query) ExactProbes() (probes []Probe, exact bool) {
 	if q == nil || q.prog == nil || q.prog.expr == nil {
 		return nil, false
 	}
+	pc := q.probeCtx()
 	conj := flattenAnd(q.foldedExpr(), nil)
 	out := make([]Probe, 0, len(conj))
 	allExact := true
 	for _, c := range conj {
-		p, ok := probeFrom(c)
+		p, ok := pc.probeFrom(c)
 		if !ok {
 			return out, false // an unrecognized conjunct: the probe set does not cover the query
 		}
@@ -102,6 +136,12 @@ func (q *Query) ExactProbes() (probes []Probe, exact bool) {
 // because the reference skips an element whose comparison is ERROR or UNDEFINED rather than
 // propagating it.
 func probeIsExact(c ast.Expr, p Probe) bool {
+	if p.Op == "prefix" {
+		// The literal prefix of an anchored pattern is a necessary condition for the match,
+		// never a sufficient one: `regexp("^ap40.*gpu", x)` probes "ap40" and the rest of the
+		// pattern is left to the re-verification a candidate filter always gets.
+		return false
+	}
 	switch v := unparen(c).(type) {
 	case *ast.FunctionCall:
 		identical, isMember := isMemberFunc(v.Name)
@@ -142,12 +182,13 @@ func (q *Query) ProbePlan() []ProbeGroup {
 	if q == nil || q.prog == nil || q.prog.expr == nil {
 		return nil
 	}
-	exprGroups := distributeDNF(q.foldedExpr())
+	pc := q.probeCtx()
+	exprGroups := pc.distributeDNF(q.foldedExpr())
 	groups := make([]ProbeGroup, 0, len(exprGroups))
 	for _, g := range exprGroups {
 		var probes []Probe
 		for _, c := range g {
-			if p, ok := probeFrom(c); ok {
+			if p, ok := pc.probeFrom(c); ok {
 				probes = append(probes, p)
 			}
 		}
@@ -167,8 +208,8 @@ const maxDNFGroups = 16
 // predicate -- distributing nested ORs (`A && (B || C)` -> `(A && B) || (A && C)`) up
 // to maxDNFGroups. Beyond the bound it falls back to splitting only the top-level OR
 // spine, leaving nested ORs intact.
-func distributeDNF(e ast.Expr) [][]ast.Expr {
-	if groups, ok := tryDNF(e); ok {
+func (pc probeCtx) distributeDNF(e ast.Expr) [][]ast.Expr {
+	if groups, ok := pc.tryDNF(e); ok {
 		return groups
 	}
 	var out [][]ast.Expr
@@ -181,25 +222,25 @@ func distributeDNF(e ast.Expr) [][]ast.Expr {
 // tryDNF recursively builds the bounded DNF: OR concatenates disjunct groups, AND takes
 // the cross-product of its operands' groups. ok is false if the group count would
 // exceed maxDNFGroups.
-func tryDNF(e ast.Expr) ([][]ast.Expr, bool) {
+func (pc probeCtx) tryDNF(e ast.Expr) ([][]ast.Expr, bool) {
 	e = unparen(e)
 	if b, ok := e.(*ast.BinaryOp); ok {
 		switch b.Op {
 		case "||":
 			// An OR-of-equalities on one attribute is a single `in` probe -- keep it as
 			// a leaf rather than splitting it into a group per value.
-			if _, ok := orEqProbe(b); ok {
+			if _, ok := pc.orEqProbe(b); ok {
 				return [][]ast.Expr{{e}}, true
 			}
-			l, ok1 := tryDNF(b.Left)
-			r, ok2 := tryDNF(b.Right)
+			l, ok1 := pc.tryDNF(b.Left)
+			r, ok2 := pc.tryDNF(b.Right)
 			if !ok1 || !ok2 || len(l)+len(r) > maxDNFGroups {
 				return nil, false
 			}
 			return append(l, r...), true
 		case "&&":
-			l, ok1 := tryDNF(b.Left)
-			r, ok2 := tryDNF(b.Right)
+			l, ok1 := pc.tryDNF(b.Left)
+			r, ok2 := pc.tryDNF(b.Right)
 			if !ok1 || !ok2 || len(l)*len(r) > maxDNFGroups {
 				return nil, false
 			}
@@ -288,55 +329,62 @@ var operandFlip = map[string]string{
 // or ok=false if it is not a recognizable Attr-OP-literal / presence / OR-of-equalities.
 // Callers use it to tell an already-probeable leaf from an opaque one (e.g. before
 // finite-domain materialization).
-func ProbeOf(e ast.Expr) (Probe, bool) { return probeFrom(e) }
+//
+// It carries no join aliases, so `a.b` reads as a select into a nested record. The expression
+// a caller hands it is one leaf of a predicate already rewritten into a single ad's frame,
+// where that is what a select means.
+func ProbeOf(e ast.Expr) (Probe, bool) { return probeCtx{}.probeFrom(e) }
 
 // probeFrom classifies a single conjunct into a Probe.
-func probeFrom(c ast.Expr) (Probe, bool) {
+func (pc probeCtx) probeFrom(c ast.Expr) (Probe, bool) {
 	c = unparen(c)
 	// !X -> handle the negatable forms: a flipped comparison, a negated presence
 	// test (!(attr is undefined) is presence), or !isUndefined(attr) (presence).
 	if u, ok := c.(*ast.UnaryOp); ok && u.Op == "!" {
 		inner := unparen(u.Expr)
 		if fc, ok := inner.(*ast.FunctionCall); ok {
-			return undefinedFuncProbe(fc, true)
+			return pc.undefinedFuncProbe(fc, true)
 		}
 		if b, ok := inner.(*ast.BinaryOp); ok {
 			if fl, ok := negFlip[b.Op]; ok {
-				return cmpProbe(fl, b.Left, b.Right)
+				return pc.cmpProbe(fl, b.Left, b.Right)
 			}
 			// A negated ordering comparison keeps the negation in its operator rather than
 			// flipping it away: the two are not the same predicate over a NaN (see negOrdering).
 			if nf, ok := negOrdering[b.Op]; ok {
-				return cmpProbe(nf, b.Left, b.Right)
+				return pc.cmpProbe(nf, b.Left, b.Right)
 			}
 			if b.Op == "is" || b.Op == "isnt" {
-				if name, ok := refVsUndefined(b.Left, b.Right); ok {
+				if t, ok := pc.refVsUndefined(b.Left, b.Right); ok {
 					if b.Op == "is" { // !(attr is undefined) -> present
-						return Probe{Attr: name, Op: "present"}, true
+						return t.probe("present", nil), true
 					}
-					return Probe{Attr: name, Op: "absent"}, true // !(attr isnt undefined) -> absent
+					return t.probe("absent", nil), true // !(attr isnt undefined) -> absent
 				}
 			}
 		}
-		// !attr -> a falsy truthiness test on a bare attribute.
-		if name, ok := indexableRef(inner); ok {
-			return Probe{Attr: name, Op: "untruthy"}, true
+		// !attr -> a falsy truthiness test on a bare attribute (or path).
+		if t, ok := pc.probeTargetOf(inner); ok {
+			return t.probe("untruthy", nil), true
 		}
 		return Probe{}, false
 	}
 	// isUndefined(attr) is a presence probe (matches when attr is absent/undefined);
 	// member(attr, {constants}) is set membership.
 	if fc, ok := c.(*ast.FunctionCall); ok {
-		if p, ok := memberProbe(fc); ok {
+		if p, ok := pc.memberProbe(fc); ok {
 			return p, true
 		}
-		return undefinedFuncProbe(fc, false)
+		if p, ok := pc.regexpPrefixProbe(fc); ok {
+			return p, true
+		}
+		return pc.undefinedFuncProbe(fc, false)
 	}
-	// A bare attribute reference (`HAS_CVMFS`) is a truthiness test. Only a categorical
+	// A bare attribute reference (`HAS_CVMFS`) or path is a truthiness test. Only a categorical
 	// index can answer it soundly (its exception set catches non-boolean values, so the
 	// candidate set stays a superset the store re-verifies); catUsable maps it to == true.
-	if name, ok := indexableRef(c); ok {
-		return Probe{Attr: name, Op: "truthy"}, true
+	if t, ok := pc.probeTargetOf(c); ok {
+		return t.probe("truthy", nil), true
 	}
 	b, ok := c.(*ast.BinaryOp)
 	if !ok {
@@ -344,43 +392,44 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 	}
 	switch b.Op {
 	case "==", "!=", "<", "<=", ">", ">=":
-		return cmpProbe(b.Op, b.Left, b.Right)
+		return pc.cmpProbe(b.Op, b.Left, b.Right)
 	case "is":
 		// `attr =?= undefined` is a presence probe (matches when attr is absent /
 		// evaluates undefined); the index answers it from its posted set.
-		if name, ok := refVsUndefined(b.Left, b.Right); ok {
-			return Probe{Attr: name, Op: "absent"}, true
+		if t, ok := pc.refVsUndefined(b.Left, b.Right); ok {
+			return t.probe("absent", nil), true
 		}
 		// `attr =?= literal` is exact (case-sensitive) identity: the "is" op reads the
 		// index's exact-case postings (categorical) or the value posting (numeric, a
 		// superset the store re-verifies).
-		return cmpProbe("is", b.Left, b.Right)
+		return pc.cmpProbe("is", b.Left, b.Right)
 	case "isnt":
 		// `attr =!= undefined` is a presence probe (matches when attr is defined).
-		if name, ok := refVsUndefined(b.Left, b.Right); ok {
-			return Probe{Attr: name, Op: "present"}, true
+		if t, ok := pc.refVsUndefined(b.Left, b.Right); ok {
+			return t.probe("present", nil), true
 		}
 		// `attr =!= literal` = everything but the exact-case matches. Indexable for
 		// categoricals via the exact-case postings (all-but-exact); for values it is
 		// dropped in valUsable (int/real type-strictness makes the folded != path drop
 		// records =!= should keep), falling back to a scan.
-		return cmpProbe("isnt", b.Left, b.Right)
+		return pc.cmpProbe("isnt", b.Left, b.Right)
 	case "||":
-		return orEqProbe(b)
+		return pc.orEqProbe(b)
 	}
 	return Probe{}, false
 }
 
-// cmpProbe builds a probe from `AttrRef OP literal` or `literal OP AttrRef`.
-func cmpProbe(op string, left, right ast.Expr) (Probe, bool) {
-	if name, ok := indexableRef(left); ok {
+// cmpProbe builds a probe from `Attr OP literal` or `literal OP Attr`, where Attr is a
+// self-scoped reference or a path (see probeTargetOf).
+func (pc probeCtx) cmpProbe(op string, left, right ast.Expr) (Probe, bool) {
+	if t, ok := pc.probeTargetOf(left); ok {
 		if v, ok := literalVal(right); ok {
-			return Probe{Attr: name, Op: op, Vals: []classad.Value{v}}, true
+			return t.probe(op, []classad.Value{v}), true
 		}
 	}
-	if name, ok := indexableRef(right); ok {
+	if t, ok := pc.probeTargetOf(right); ok {
 		if v, ok := literalVal(left); ok {
-			return Probe{Attr: name, Op: operandFlip[op], Vals: []classad.Value{v}}, true
+			return t.probe(operandFlip[op], []classad.Value{v}), true
 		}
 	}
 	return Probe{}, false
@@ -388,26 +437,44 @@ func cmpProbe(op string, left, right ast.Expr) (Probe, bool) {
 
 // orEqProbe builds a set-membership probe from a `||`-chain in which every
 // disjunct is `SameAttr == literal`.
-func orEqProbe(b *ast.BinaryOp) (Probe, bool) {
+func (pc probeCtx) orEqProbe(b *ast.BinaryOp) (Probe, bool) {
 	disj := flattenOr(b, nil)
-	attr := ""
+	var on Probe
+	have := false
 	vals := make([]classad.Value, 0, len(disj))
 	for _, d := range disj {
-		p, ok := probeFrom(d)
+		p, ok := pc.probeFrom(d)
 		if !ok || p.Op != "==" || len(p.Vals) != 1 {
 			return Probe{}, false
 		}
-		if attr == "" {
-			attr = p.Attr
-		} else if !strings.EqualFold(attr, p.Attr) {
+		if !have {
+			on, have = p, true
+		} else if !sameProbeAttr(on, p) {
 			return Probe{}, false
 		}
 		vals = append(vals, p.Vals[0])
 	}
-	if attr == "" {
+	if !have {
 		return Probe{}, false
 	}
-	return Probe{Attr: attr, Op: "in", Vals: vals}, true
+	return Probe{Attr: on.Attr, Op: "in", Vals: vals, Path: on.Path}, true
+}
+
+// sameProbeAttr reports whether two probes constrain the same attribute. The names alone do
+// not say: a path probe on `Res.Mem` and a probe on an attribute literally NAMED "Res.Mem"
+// spell Attr identically, and so would a path {"a.b","c"} and a path {"a","b.c"} if a writer
+// ever used a dotted attribute name. So the shape is compared component by component, and an
+// OR over two different attributes stays unprobed rather than folding into one "in".
+func sameProbeAttr(a, b Probe) bool {
+	if len(a.Path) != len(b.Path) {
+		return false
+	}
+	for i := range a.Path {
+		if !strings.EqualFold(a.Path[i], b.Path[i]) {
+			return false
+		}
+	}
+	return strings.EqualFold(a.Attr, b.Attr)
 }
 
 // memberProbe builds a set-membership probe from member(attr, {c1, c2, ...}) or
@@ -423,12 +490,12 @@ func orEqProbe(b *ast.BinaryOp) (Probe, bool) {
 // A list with no element left (`member(attr, {})`) can never be TRUE, but it is not probed:
 // an empty "in" is not a shape the probe consumers are written for, and declining costs only
 // selectivity.
-func memberProbe(fc *ast.FunctionCall) (Probe, bool) {
+func (pc probeCtx) memberProbe(fc *ast.FunctionCall) (Probe, bool) {
 	identical, ok := isMemberFunc(fc.Name)
 	if !ok || len(fc.Args) != 2 {
 		return Probe{}, false
 	}
-	name, ok := indexableRef(fc.Args[0])
+	t, ok := pc.probeTargetOf(fc.Args[0])
 	if !ok {
 		return Probe{}, false
 	}
@@ -449,30 +516,76 @@ func memberProbe(fc *ast.FunctionCall) (Probe, bool) {
 	if len(vals) == 0 {
 		return Probe{}, false
 	}
-	return Probe{Attr: name, Op: "in", Vals: vals}, true
+	return t.probe("in", vals), true
 }
 
-// indexableRef returns the name of a self-scoped (unscoped or MY) attribute
-// reference — the only references an index over the current ad can satisfy.
-func indexableRef(e ast.Expr) (string, bool) {
-	if r, ok := unparen(e).(*ast.AttributeReference); ok {
-		if r.Scope == ast.NoScope || r.Scope == ast.MyScope {
-			return r.Name, true
+// probeTarget is the attribute a probe constrains: a top-level attribute, or a nested path.
+type probeTarget struct {
+	name string   // as the query spells it; a path is its components joined with "."
+	path []string // nil for a top-level attribute, the components for a path
+}
+
+// probe builds a probe on this target. vals may be nil (a presence or truthiness probe).
+func (t probeTarget) probe(op string, vals []classad.Value) Probe {
+	return Probe{Attr: t.name, Op: op, Vals: vals, Path: t.path}
+}
+
+// probeTargetOf returns the attribute an expression probes: a self-scoped (unscoped or MY)
+// attribute reference — the only references an index over the current ad can satisfy — or a
+// SELECT chain rooted at one, `Res.Mem`, which an index on that path can satisfy.
+//
+// A chain rooted at a join ALIAS is deliberately NOT one: `j.Owner` is the other side of a
+// join, an ad this collection's index says nothing about, and probing its own `j.Owner` path
+// for it would hand back a candidate set filtered on a constraint the query never made. The
+// aliases are the ones the program was compiled with; with none declared every select is a
+// select into a nested record, which is what the compiler assumes about it too.
+func (pc probeCtx) probeTargetOf(e ast.Expr) (probeTarget, bool) {
+	switch v := unparen(e).(type) {
+	case *ast.AttributeReference:
+		if v.Scope == ast.NoScope || v.Scope == ast.MyScope {
+			return probeTarget{name: v.Name}, true
 		}
+	case *ast.SelectExpr:
+		return pc.selectTarget(v)
 	}
-	return "", false
+	return probeTarget{}, false
+}
+
+// selectTarget turns a select chain into a path target. `a.b.c` parses as
+// Select(Select(a, b), c), so the components come off root-last and are reversed.
+func (pc probeCtx) selectTarget(sel *ast.SelectExpr) (probeTarget, bool) {
+	comps := []string{sel.Attr}
+	cur := unparen(sel.Record)
+	for {
+		s, ok := cur.(*ast.SelectExpr)
+		if !ok {
+			break
+		}
+		comps = append(comps, s.Attr)
+		cur = unparen(s.Record)
+	}
+	root, ok := cur.(*ast.AttributeReference)
+	if !ok || (root.Scope != ast.NoScope && root.Scope != ast.MyScope) {
+		return probeTarget{}, false
+	}
+	if _, isAlias := pc.aliases[strings.ToLower(root.Name)]; isAlias {
+		return probeTarget{}, false
+	}
+	comps = append(comps, root.Name)
+	slices.Reverse(comps)
+	return probeTarget{name: strings.Join(comps, "."), path: comps}, true
 }
 
 // refVsUndefined recognizes `attr is/isnt undefined` in either operand order,
-// returning the self-scoped attribute name.
-func refVsUndefined(left, right ast.Expr) (string, bool) {
+// returning the self-scoped attribute (or path) it tests.
+func (pc probeCtx) refVsUndefined(left, right ast.Expr) (probeTarget, bool) {
 	if isUndefinedLit(right) {
-		return indexableRef(left)
+		return pc.probeTargetOf(left)
 	}
 	if isUndefinedLit(left) {
-		return indexableRef(right)
+		return pc.probeTargetOf(right)
 	}
-	return "", false
+	return probeTarget{}, false
 }
 
 func isUndefinedLit(e ast.Expr) bool {
@@ -483,11 +596,11 @@ func isUndefinedLit(e ast.Expr) bool {
 // undefinedFuncProbe classifies isUndefined(attr) as a presence probe: bare it is
 // "absent" (true when attr is undefined); negated (!isUndefined(attr)) it is
 // "present". Any other function is not an index probe.
-func undefinedFuncProbe(fc *ast.FunctionCall, negated bool) (Probe, bool) {
+func (pc probeCtx) undefinedFuncProbe(fc *ast.FunctionCall, negated bool) (Probe, bool) {
 	if !strings.EqualFold(fc.Name, "isUndefined") || len(fc.Args) != 1 {
 		return Probe{}, false
 	}
-	name, ok := indexableRef(fc.Args[0])
+	t, ok := pc.probeTargetOf(fc.Args[0])
 	if !ok {
 		return Probe{}, false
 	}
@@ -495,7 +608,7 @@ func undefinedFuncProbe(fc *ast.FunctionCall, negated bool) (Probe, bool) {
 	if negated {
 		op = "present"
 	}
-	return Probe{Attr: name, Op: op}, true
+	return t.probe(op, nil), true
 }
 
 // literalVal converts a literal AST node to a classad.Value. Undefined/error

@@ -40,9 +40,13 @@ func TestSystemKeyHiddenFromScansButRetrievable(t *testing.T) {
 	if _, ok := c.Get([]byte(sysKey)); !ok {
 		t.Fatal("Get(systemKey) did not find the system record")
 	}
-	// Len counts every stored record, including the system one.
-	if got := c.Len(); got != n+1 {
-		t.Fatalf("Len = %d, want %d", got, n+1)
+	// Len reports the rows a reader is shown, so the system record is not among them;
+	// StoredLen is the count of everything the store holds.
+	if got := c.Len(); got != n {
+		t.Fatalf("Len = %d, want %d (the system record is not a row)", got, n)
+	}
+	if got := c.StoredLen(); got != n+1 {
+		t.Fatalf("StoredLen = %d, want %d (the system record is still stored)", got, n+1)
 	}
 
 	hasMarker := func(ad *classad.ClassAd) bool {
