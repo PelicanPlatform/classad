@@ -77,6 +77,11 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 			}
 			removeID(&next.valIDs, next.val, id) // categorical wins if it was a value index
 			addID(&next.catIDs, next.cat, id)
+			// The attribute now has an index of its own, which settles its kind; a
+			// component-only declaration alongside it would be a second answer to the
+			// question componentKind asks. pruneComposites below then drops any composite
+			// whose component this just re-kinded.
+			next.dropCompOnly(id)
 			mark(id)
 		}
 		for _, name := range value {
@@ -88,6 +93,7 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 				continue // already categorical; do not double-index
 			}
 			addID(&next.valIDs, next.val, id)
+			next.dropCompOnly(id) // an index of its own settles the kind (see above)
 			mark(id)
 		}
 		next.pruneComposites() // a composite whose component changed kind no longer describes the data
@@ -148,6 +154,10 @@ func (c *Collection) DropIndex(names ...string) bool {
 			}
 			removeID(&next.catIDs, next.cat, id)
 			removeID(&next.valIDs, next.val, id)
+			// A component-only declaration is dropped by name too: the attribute stops
+			// being anything to this spec, and pruneComposites then takes the composites
+			// that named it, exactly as it does for a dropped real index.
+			next.dropCompOnly(id)
 			// The id stops meaning anything, so it stops meaning a path too: a later AddIndex
 			// on the plain attribute of that name must not be refused by a shape this spec no
 			// longer indexes.
@@ -223,6 +233,12 @@ func (c *Collection) staleIndexCounts() (pending, byPolicy, sealed int) {
 
 // IndexedAttrs returns the currently-indexed attribute names, split by kind, in the
 // collection's canonical (interned) casing.
+//
+// Component-only attributes (Options.CategoricalComponentAttrs / ValueComponentAttrs) are
+// NOT reported, and that is the contract callers want: they ask this to decide whether a
+// constraint on an attribute can be answered from an index, and a component-only attribute
+// has no index of its own to answer one with. Nothing else reports them -- they are a
+// property of the composites that use them, which IndexSizes already names.
 func (c *Collection) IndexedAttrs() (categorical, value []string) {
 	spec := c.spec.Load()
 	name := func(id uint32) (string, bool) {

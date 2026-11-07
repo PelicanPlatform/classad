@@ -254,6 +254,28 @@ type Options struct {
 	// ignored. Order matters for identity: {"ClusterId","ProcId"} and {"ProcId","ClusterId"}
 	// are two composites, and either answers the same conjunctions. Optional.
 	CompositeAttrs [][]string
+	// CategoricalComponentAttrs / ValueComponentAttrs name attributes that are indexed ONLY
+	// as composite components: they may appear in a CompositeAttrs tuple, and they get no
+	// index of their own. Which list a name is in fixes its KIND, exactly as
+	// CategoricalAttrs / ValueAttrs does for a real index -- a component's kind has to be
+	// settled at configuration time so that the record side and the probe side fold its
+	// values identically, and an attribute with no index of its own has nowhere else to get
+	// one from. A name in both lists is categorical; a name that is also in CategoricalAttrs
+	// or ValueAttrs is ignored here, since its own index already settles its kind.
+	//
+	// WHAT THIS GIVES UP, which is the whole point of the setting: a composite answers a
+	// conjunction pinning EVERY one of its components and nothing else, so a constraint that
+	// names a component-only attribute alone -- `ProcId == 5`, `ProcId >= 2`, `ProcId !=
+	// 1` -- gets no index at all and scans. IndexedAttrs does not report these attributes,
+	// because callers use it to decide whether a constraint can be index-answered and for
+	// these the answer is no.
+	//
+	// It is worth it when nothing queries the attribute by itself and its standalone index
+	// would be large: a history archive asking only `ClusterId == c && ProcId == p` per
+	// record gets nothing from a ProcId index, and on a real pool one cluster carries nearly
+	// three million distinct ProcIds to key. Optional.
+	CategoricalComponentAttrs []string
+	ValueComponentAttrs       []string
 	// Ordered configures maintained, filtered, ordered indexes -- the schedd
 	// priority-queue pattern (see docs/MATCH.md §3 and Collection.Ordered). Each
 	// spec groups members into partitions and keeps them sorted on the write path,
@@ -912,6 +934,7 @@ func New(opts Options) *Collection {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
 	baseSpec := newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs)
+	baseSpec.setComponentAttrs(c.intern, opts.CategoricalComponentAttrs, opts.ValueComponentAttrs)
 	baseSpec.setComposites(c.intern, opts.CompositeAttrs, false)
 	c.spec.Store(baseSpec)
 	// Zone maps (append-only only): cover the explicit ZoneAttrs plus every value-indexed

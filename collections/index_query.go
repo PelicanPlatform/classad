@@ -189,6 +189,22 @@ type usableProbe struct {
 	// inexact marks a value probe on an integer float64 cannot represent exactly, whose op
 	// floatKeyOp widened. Its candidates are a superset; see floatKeyOp.
 	inexact bool
+
+	// compOnly marks a probe on an attribute that exists in the spec only as a composite
+	// COMPONENT (indexSpec.compOnly). It has no postings of its own anywhere -- not in a
+	// segment's maps, not in a sidecar's attribute directory -- so the only thing that may
+	// read it is the composite path, and every single-attribute path must treat it as a
+	// probe on an unindexed attribute.
+	//
+	// That distinction cannot be left to a missing map entry. The single-attribute paths are
+	// written against structures that answer an absent attribute with an EMPTY posting
+	// (mmapSegIndex.probeOffsets returns a fresh empty bitmap for an id its directory does
+	// not hold), and an empty posting intersected into a candidate set says "no record
+	// matches" -- which, for an attribute that is simply not indexed, drops every row the
+	// query should have returned. So the flag is checked explicitly at each of those paths,
+	// and planIndex drops a component-only probe no configured composite can consume, so the
+	// flag never travels further than the composite that justifies it.
+	compOnly bool
 }
 
 // twoSided reports whether up carries both bounds of a numeric band.
@@ -1166,9 +1182,70 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 			if up, ok := valUsable(id, p); ok {
 				out = append(out, up)
 			}
+			continue
+		}
+		if up, ok := compOnlyUsable(spec, id, p); ok {
+			out = append(out, up)
 		}
 	}
-	return foldEqualities(coalesceRanges(out))
+	return dropLooseComponents(spec, foldEqualities(coalesceRanges(out)))
+}
+
+// compOnlyUsable plans a probe on a component-only attribute, in the kind its declaration
+// fixed. Only a probe pinning the attribute to ONE value is planned: a composite answers the
+// full tuple and nothing else, and a range or a `!=` on a component-only attribute has no
+// posting list to fall back to, so carrying one into the plan could only mislead.
+func compOnlyUsable(spec *indexSpec, id uint32, p vm.Probe) (usableProbe, bool) {
+	cat, ok := spec.compOnlyHas(id)
+	if !ok {
+		return usableProbe{}, false
+	}
+	var up usableProbe
+	if cat {
+		up, ok = catUsable(id, p)
+	} else {
+		up, ok = valUsable(id, p)
+	}
+	if !ok || !compositeEqProbe(up) {
+		return usableProbe{}, false
+	}
+	up.compOnly = true
+	return up, true
+}
+
+// dropLooseComponents removes the component-only probes no configured composite can consume,
+// after folding has settled what each probe pins. A component-only attribute has no postings
+// of its own, so a probe on one that reaches the single-attribute paths would be answered
+// from an empty posting map -- "no record matches" for an attribute that is simply not
+// indexed, which drops rows. Dropping it instead only widens the candidate superset, which
+// the store re-verifies.
+//
+// It also keeps `ProcId == 5` on its own out of the plan entirely: no composite is pinned, so
+// nothing is left to narrow with and the query scans, which is what a component-only
+// declaration buys the tuple at.
+func dropLooseComponents(spec *indexSpec, out []usableProbe) []usableProbe {
+	loose := false
+	for _, up := range out {
+		if up.compOnly {
+			loose = true
+			break
+		}
+	}
+	if !loose {
+		return out
+	}
+	pinned := map[uint32]struct{}{}
+	spec.compositePinned(out, pinned)
+	kept := out[:0:0]
+	for _, up := range out {
+		if up.compOnly {
+			if _, ok := pinned[up.attrID]; !ok {
+				continue
+			}
+		}
+		kept = append(kept, up)
+	}
+	return kept
 }
 
 func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
@@ -1411,13 +1488,22 @@ func (si *segIndex) candidateOffsetsGroups(groups [][]usableProbe) *roaring.Bitm
 // attribute (a segment indexed before an attribute was added would not).
 func (si *segIndex) covers(usable []usableProbe) bool { return indexCovers(si, usable) }
 
-// coversProbe reports whether this segment indexes one probe's attribute.
+// coversProbe reports whether this segment indexes one probe's attribute. A component-only
+// attribute is never indexed on its own, so it is never covered -- the composite path reaches
+// its postings through compositeMatch, and nothing else may.
 func (si *segIndex) coversProbe(up usableProbe) bool {
+	if up.compOnly {
+		return false
+	}
 	if up.cat {
 		return si.cat[up.attrID] != nil
 	}
 	return si.val[up.attrID] != nil
 }
+
+// allOffsets is a fresh copy of every record this index covers -- the candidate set that
+// narrows nothing. See indexCandidateOffsets for the one case that needs it.
+func (si *segIndex) allOffsets() *roaring.Bitmap { return si.all.Clone() }
 
 // candidateOffsets returns the segment-record offsets satisfying every usable
 // probe (a superset; the store re-verifies). Probes are applied most-selective
@@ -1432,6 +1518,9 @@ func (si *segIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
 // does not index it (covers() has already been checked in the query path, so this
 // is non-nil there; the guard keeps the estimators safe in isolation).
 func (si *segIndex) statsFor(up usableProbe) *segStats {
+	if up.compOnly {
+		return nil // no standalone postings, so no summary of them
+	}
 	if up.cat {
 		if cp := si.cat[up.attrID]; cp != nil {
 			return &cp.stats
@@ -1455,7 +1544,7 @@ func (si *segIndex) canSkip(up usableProbe) bool { return indexCanSkip(si, up) }
 // bloomAbsent reports whether a categorical ==/in probe's values are all provably absent
 // via the in-RAM per-segment bloom.
 func (si *segIndex) bloomAbsent(up usableProbe) bool {
-	if !up.cat || (up.op != "==" && up.op != "in") {
+	if up.compOnly || !up.cat || (up.op != "==" && up.op != "in") {
 		return false
 	}
 	s := si.statsFor(up)
@@ -1558,7 +1647,15 @@ func (s *segStats) estRange(op string, t float64) float64 {
 func (si *segIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
 func (si *segIndex) coveredUpto() uint32                   { return si.upto }
 
+// probeOffsets reads one probe's postings. It must never be asked for a component-only
+// probe: there are no postings to read, and the empty bitmap the lookup would produce reads
+// as "no record matches". indexCandidateOffsets is where that is enforced; the check here
+// says so where the postings are, and answers with the whole covered prefix -- a candidate
+// set that narrows nothing is slow, and the alternative is wrong.
 func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
+	if up.compOnly {
+		return si.allOffsets()
+	}
 	if up.cat {
 		cp := si.cat[up.attrID]
 		switch up.op {

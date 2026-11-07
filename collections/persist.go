@@ -283,6 +283,7 @@ func Open(opts Options) (*Collection, error) {
 	// below). Replace the interned spec New built with an inline one that extracts
 	// values by name (records carry no intern ids).
 	inlineSpec := newInlineIndexSpec(opts.CategoricalAttrs, opts.ValueAttrs)
+	inlineSpec.setComponentAttrs(nil, opts.CategoricalComponentAttrs, opts.ValueComponentAttrs)
 	inlineSpec.setComposites(nil, opts.CompositeAttrs, false)
 	c.spec.Store(inlineSpec)
 	// Inline mode keys the hot header by (folded) name; install the configured HotAttrs

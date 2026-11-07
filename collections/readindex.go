@@ -47,6 +47,11 @@ type indexPrimitives interface {
 	probeOffsets(up usableProbe) *roaring.Bitmap
 	// coversProbe reports whether this segment indexes the probe's attribute.
 	coversProbe(up usableProbe) bool
+	// allOffsets is a fresh, mutable bitmap of every record the index covers: the candidate
+	// set that rules nothing out. The planner needs it in exactly one place (see
+	// indexCandidateOffsets), where the alternative to "every covered record" is a bitmap
+	// that reads as "no covered record".
+	allOffsets() *roaring.Bitmap
 	// recordCount is how many records this segment's index covers -- the size of the set an
 	// `absent` probe subtracts from. Called ONLY for present/absent estimates: on the mmap
 	// tier it reads the all-records bitmap, which the planner otherwise deliberately avoids
@@ -130,13 +135,34 @@ func runningOr(n int, at func(i int) *roaring.Bitmap) *roaring.Bitmap {
 	return bm
 }
 
+// indexCovers reports whether this index can serve every probe of a conjunction.
+//
+// A COMPONENT-ONLY probe is not asked about: its attribute has no postings of its own here
+// or anywhere, so coversProbe is false for it by construction and asking would decline every
+// window. It is instead the composite's to answer, and indexCandidateOffsets leaves it out
+// of the intersection when no composite takes it -- which only widens the candidate set.
+//
+// The exception is a conjunction whose probes are ALL component-only, which this index can
+// narrow only if it actually holds a composite over them. Without one there is nothing left
+// to intersect, and saying "covered" would commit the walk to an index that rules nothing
+// out; declining sends the window to the full scan it would have taken anyway, without the
+// bitmap in between.
 func indexCovers(ix indexPrimitives, usable []usableProbe) bool {
+	narrowing := false
 	for _, up := range usable {
+		if up.compOnly {
+			continue
+		}
 		if !ix.coversProbe(up) {
 			return false
 		}
+		narrowing = true
 	}
-	return true
+	if narrowing || len(usable) == 0 {
+		return true
+	}
+	_, ok := ix.compositeMatch(usable)
+	return ok
 }
 
 func indexCoversGroups(ix indexPrimitives, groups [][]usableProbe) bool {
@@ -160,6 +186,12 @@ func indexCanSkip(ix indexPrimitives, up usableProbe) bool {
 	// value of any type can satisfy the constraint. See usableProbe.neverMatches.
 	if up.neverMatches() {
 		return true
+	}
+	if up.compOnly {
+		// No postings, no stats, no bloom: this index knows nothing about the attribute on
+		// its own and can prove nothing about it. The composite's joint skip (below, in
+		// indexSkipsPrefix) is the only thing that can.
+		return false
 	}
 	s := ix.statsFor(up)
 	if s == nil || s.exc > 0 {
@@ -243,6 +275,13 @@ func indexSkipsPrefix(ix indexPrimitives, usable []usableProbe) bool {
 // indexEstCandidates estimates how many records a probe admits, for ordering only (never
 // correctness). estCandidatesFromStats holds the logic so it is testable on a bare segStats.
 func indexEstCandidates(ix indexPrimitives, up usableProbe) float64 {
+	if up.compOnly {
+		// Nothing to estimate from, so it sorts last among the probes -- which is where it
+		// belongs, since it is never applied on its own. compositeWins reads these estimates
+		// too: a composite every one of whose components is component-only is priced against
+		// nothing and taken, which is right, because there is no intersection to beat.
+		return math.MaxFloat64
+	}
 	if up.op == "prefix" {
 		// Needs the key run as well as the stats, so it cannot be expressed on a bare
 		// segStats the way the other operators are.
@@ -364,6 +403,13 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 	case 0:
 		return nil
 	case 1:
+		// A lone component-only probe cannot be answered: there is no composite to pin with
+		// one probe (a tuple is at least two attributes wide), and probeOffsets would read
+		// postings that do not exist. planIndex drops such a probe before it gets here, so
+		// this is the shared logic refusing to depend on that.
+		if usable[0].compOnly {
+			return ix.allOffsets()
+		}
 		return ix.probeOffsets(usable[0])
 	}
 	// A composite over the tuple the conjunction pins replaces that whole group of probes
@@ -390,9 +436,20 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 			covered[i] = true
 		}
 	}
+	loose := false
 	for _, i := range order {
 		if len(covered) > 0 && covered[i] {
 			continue // already answered, exactly, by the composite
+		}
+		if usable[i].compOnly {
+			// A component-only probe the composite did not take -- because this segment's
+			// index predates the composite, or because compositeWins declined it. There are
+			// no postings for it, so it drops out of the intersection and the candidate set
+			// is that much wider; the store re-verifies every candidate, so wider is only
+			// slower. Reading its absent postings instead would intersect an empty bitmap in
+			// and answer "no records".
+			loose = true
+			continue
 		}
 		if acc != nil && !worthProbing(est[i], acc.GetCardinality()) {
 			continue
@@ -406,6 +463,13 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 		if acc.IsEmpty() {
 			return acc
 		}
+	}
+	if acc == nil && loose {
+		// Every probe was dropped and the only ones there were were component-only: nothing
+		// narrowed anything. nil here would mean "no candidates" to the caller (which is how
+		// a proven-empty prefix is reported), and the rows would be gone. indexCovers keeps
+		// a window out of the indexed walk in this shape, so this is the belt to its braces.
+		return ix.allOffsets()
 	}
 	return acc
 }
