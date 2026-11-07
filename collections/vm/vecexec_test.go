@@ -224,6 +224,18 @@ var vecExprs = []string{
 	"ifThenElse(F, ifThenElse(A > 4, 1, 2), ifThenElse(B > 2, 3, 4))",
 	"A ?: ifThenElse(F, 1, 2)", "ifThenElse(F, A ?: 1, B ?: 2)",
 	"ifThenElse(A > 4, 1, 2) ?: 99", "(A ?: 1) ?: 2",
+	// TERNARIES, a blend of two arms rather than four paths: an undefined condition runs both arms
+	// and takes neither value, so the arm masks overlap where a conditional's do not. Every
+	// condition state is present in the corpus -- true/false, a number, undefined, a string.
+	"A > 4 ? 1 : 2", "F ? A : B", "A ? 1 : 2", "S ? 1 : 2", "A ? A : B", "B ? 1 : 2",
+	`A > 4 ? S : "none"`, "(A > 4 ? 1 : 2) + 1", "A > 4 ? A + B : A - B", "-(F ? 1 : 2)",
+	"(A > 4 ? 1 : 2) == 1", "(F ? 1 : 2) && A > 0",
+	// Nested ternaries, a ternary in each arm, and a ternary sharing a join with the other two
+	// branching constructs.
+	"A > 4 ? (F ? 1 : 2) : 3",
+	"F ? (A > 4 ? 1 : 2) : (B > 2 ? 3 : 4)",
+	"A ?: (F ? 1 : 2)", "F ? (A ?: 1) : (B ?: 2)", "(A > 4 ? 1 : 2) ?: 99",
+	"ifThenElse(A > 4, F ? 1 : 2, 3)", "A > 4 ? ifThenElse(F, 1, 2) : 3",
 	// stringListMember over a literal list, against a string column.
 	`stringListMember(S, "user3,user10")`, `stringListMember(S, "user10")`,
 	`stringListMember(S, "")`, `stringListMember(S, "user3;user10", ";")`,

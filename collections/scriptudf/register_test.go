@@ -241,3 +241,48 @@ func TestRegisteredFunctionIsCalledConcurrently(t *testing.T) {
 		}
 	}
 }
+
+// TestRegisterAcceptsATernary pins that `? :` is compilable, not merely parseable, inside a
+// registered function.
+//
+// The purity gate refuses any function containing a subtree the compiler handed to the tree-walking
+// evaluator, because that evaluator resolves names against an ad a registered function does not have
+// and need not be deterministic. So a function whose body uses a ternary registers exactly when the
+// ternary compiles natively, and this test fails outright if it ever stops doing so -- there is no
+// way for it to pass by halves.
+func TestRegisterAcceptsATernary(t *testing.T) {
+	const src = `
+def clamp(v, lo, hi):
+    return (v < lo ? lo : (v > hi ? hi : v))
+`
+	reg := &fakeRegistry{}
+	f, err := scriptudf.Register(mustParse(t, src), reg, "clamp")
+	if err != nil {
+		t.Fatalf("Register: %v; a ternary over parameters reaches no ad", err)
+	}
+	if f.Arity() != 3 {
+		t.Fatalf("Arity() = %d, want 3", f.Arity())
+	}
+	if len(reg.seen) != 1 || reg.seen[0] != "clamp" {
+		t.Fatalf("registered %v, want [clamp]", reg.seen)
+	}
+	fn := f.Func()
+	cases := []struct {
+		v, want int64
+	}{{-5, 0}, {4, 4}, {17, 10}}
+	for _, tc := range cases {
+		got := fn([]classad.Value{classad.NewIntValue(tc.v), classad.NewIntValue(0),
+			classad.NewIntValue(10)})
+		n, nerr := got.IntValue()
+		if nerr != nil || n != tc.want {
+			t.Errorf("clamp(%d, 0, 10) = %s, want %d", tc.v, got, tc.want)
+		}
+	}
+	// An undefined bound makes the comparison undefined, so both arms are evaluated and the result
+	// is undefined -- the ternary's own rule, carried into the function.
+	got := fn([]classad.Value{classad.NewIntValue(4), classad.NewUndefinedValue(),
+		classad.NewIntValue(10)})
+	if !got.IsUndefined() {
+		t.Errorf("clamp(4, undefined, 10) = %s, want undefined", got)
+	}
+}

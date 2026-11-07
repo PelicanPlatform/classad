@@ -196,7 +196,7 @@ func TestExpressionsHaveNoFaultSites(t *testing.T) {
 func TestFaultAtRejectsAnUnknownSite(t *testing.T) {
 	p := &Program{}
 	for _, site := range []int32{-1, 0, 7} {
-		f := p.faultAt(site)
+		f := p.faultAt(site, classad.NewUndefinedValue())
 		if f == nil {
 			t.Errorf("faultAt(%d) = nil on an empty site table; a fault would be reported as success", site)
 			continue
@@ -210,7 +210,7 @@ func TestFaultAtRejectsAnUnknownSite(t *testing.T) {
 	if idx := q.addFaultSite(FaultCondition, "if"); idx != 0 {
 		t.Fatalf("first site index = %d, want 0", idx)
 	}
-	if got := q.faultAt(0).Where; got != "if #1 condition" {
+	if got := q.faultAt(0, classad.NewUndefinedValue()).Where; got != "if #1 condition" {
 		t.Errorf("Where = %q, want %q", got, "if #1 condition")
 	}
 }

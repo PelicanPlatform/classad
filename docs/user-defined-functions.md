@@ -457,13 +457,13 @@ engine's answer, so `?:` — which defaults only an `undefined` — does not cat
 it.
 
 **A local reads the same everywhere it appears.** A few constructs are handed to
-the tree-walking evaluator rather than compiled — a ternary, a selection, a lazy
-built-in such as `strcat` or `ifThenElse` — and they run with the script's locals
-overlaid on the ad, so a bare bound name there is the local:
+the tree-walking evaluator rather than compiled — a selection, a lazy built-in
+such as `strcat` — and they run with the script's locals overlaid on the ad, so a
+bare bound name there is the local:
 
 ```
 x = Cpus + 1
-result = x ? 2 : 3      # the ternary reads the LOCAL x
+result = strcat(x, " cpus")     # the lazy call reads the LOCAL x
 ```
 
 `MY.x` is the attribute there as everywhere, which is how you say you meant the
@@ -564,11 +564,11 @@ Three things a script function will not do:
   registered; whether the name is free is answered by the registry, as
   `ErrFunctionExists`.
 - **Being called from a construct that is evaluated rather than compiled** — a
-  ternary, a list or ad literal, a selection. That evaluator resolves a function
-  name against the built-ins and the registered functions, and a script's own
-  function is in neither, so the call would be `error`. The refusal carries a
-  line and column. Call the function from a statement and use the local, which a
-  ternary can read.
+  list or ad literal, a selection, a lazy built-in. That evaluator resolves a
+  function name against the built-ins and the registered functions, and a
+  script's own function is in neither, so the call would be `error`. The refusal
+  carries a line and column. Call the function from a statement and use the
+  local, which a ternary or a subscript can read.
 
 A function defined inside a script belongs to that script, and nothing outside it
 can call one. A script can also *call* a UDF, which is how one rule is shared
@@ -610,8 +610,12 @@ examplePct(Used, Label)     error
 the body does not bind is an attribute of the subject ad, and that is most of what
 makes a script function useful there. A registration has no subject ad, so
 `def fits(requested, cap): return Optimistic` is refused rather than registered —
-along with `MY.RequestMemory`, a call to `random()`, a ternary and a subscript.
-Pass what the function needs as a parameter. The error says which rule refused it
+along with `MY.RequestMemory`, a call to `random()`, a list literal and a
+selection. Pass what the function needs as a parameter.
+
+A body may use the operators and constructs the compiler lowers natively, over
+its parameters: arithmetic and comparison, `&&` and `||`, `?:`, a ternary
+`c ? t : f`, a subscript, `ifThenElse` and the strict built-ins. The error says which rule refused it
 and what to write instead, and `errors.Is(err, vm.ErrReadsAd)` tells that refusal
 apart from a function that simply does not compile.
 

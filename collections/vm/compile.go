@@ -10,9 +10,9 @@ import (
 )
 
 // CompileProgram lowers a ClassAd expression to a Program. Node types with
-// subtle scope/short-circuit/laziness semantics (conditional, list, record,
-// select) are emitted as OpEvalNode and delegated to the tree-walking
-// evaluator at run time; the rest are native instructions.
+// subtle scope/laziness semantics (list, record, select) are emitted as
+// OpEvalNode and delegated to the tree-walking evaluator at run time; the rest
+// are native instructions.
 //
 // A function call is native when classad.StrictFunction accepts it -- the
 // built-in is a pure function of its argument values -- and delegated otherwise.
@@ -268,10 +268,12 @@ func (c *compiler) emit(expr ast.Expr) {
 		c.delegate(expr)
 	case *ast.SubscriptExpr:
 		c.emitSubscript(v)
+	case *ast.ConditionalExpr:
+		c.emitTernary(v)
 	default:
-		// ConditionalExpr, ListLiteral, RecordLiteral, or any future node: delegate to
-		// the evaluator. (A FunctionCall reaches the evaluator too, but only the ones
-		// StrictFunction refuses; the case above compiles the rest.)
+		// ListLiteral, RecordLiteral, or any future node: delegate to the evaluator.
+		// (A FunctionCall reaches the evaluator too, but only the ones StrictFunction
+		// refuses; the case above compiles the rest.)
 		c.delegate(expr)
 	}
 }
@@ -286,7 +288,7 @@ func (c *compiler) emit(expr ast.Expr) {
 // else -- MY.x included -- is resolved against the ad as it always was. See evalDelegated.
 //
 //	x = Cpus + 1
-//	result = x ? 2 : 3      -- the ternary is delegated, and reads the LOCAL x
+//	result = strcat(x, "!") -- the lazy call is delegated, and reads the LOCAL x
 //
 // THREE POSITIONS STILL CANNOT READ A LOCAL, because they are evaluated by an evaluator of their
 // own that the overlay does not reach: a list literal's elements (lazy -- materialized later, from
@@ -405,6 +407,55 @@ func (c *compiler) emitIfThenElse(v *ast.FunctionCall) bool {
 	c.patch(jFalse, end)
 	c.patch(jUndef, end)
 	return true
+}
+
+// emitTernary compiles the ternary `cond ? t : f`.
+//
+// The condition is left on the stack for the whole construct, because all three instructions
+// dispatch on it and nothing else can carry a decision across a join here:
+//
+//	  <cond>
+//	  ternBranch        ; true/undefined fall through; false jumps to onFalse; anything else
+//	                    ; replaces the condition with ERROR and jumps to end, running no arm
+//	  <t>
+//	  ternTrue          ; true: <t> is the result, jump to end
+//	                    ; undefined: discard <t> and fall through -- the false arm runs too
+//	onFalse:
+//	  <f>
+//	  ternFalse         ; false: <f> is the result. undefined: UNDEFINED, both arms having run
+//	end:
+//
+// THE UNDEFINED PATH WALKS BOTH ARMS, which is the reference engine's rule and not an accident of
+// this layout: an undefined condition evaluates the true arm and then the false arm, discards both
+// values and yields UNDEFINED. The values being discarded does not make the evaluation
+// unobservable, because evaluating an arm can fail outright -- a cyclic self-reference panics,
+// which the interpreter turns into ERROR for the whole program -- while an error VALUE in an arm is
+// simply absorbed.
+//
+// Sharing the two arm blocks between three outcomes is what keeps this linear. A lowering with one
+// block per outcome would emit each arm twice, and `a ? 1 : (b ? 2 : (c ? 3 : 4))` -- the shape a
+// lookup table takes in ClassAd -- would double with every level.
+func (c *compiler) emitTernary(v *ast.ConditionalExpr) {
+	c.emit(v.Condition)
+	c.p.conds = append(c.p.conds, condTargets{})
+	k := int32(len(c.p.conds) - 1)
+	br := c.ins(OpTernBranch, k)
+
+	c.emit(v.TrueExpr) // the true arm falls through
+	trueEnd := c.ins(OpTernTrue, k)
+
+	onFalse := len(c.p.code)
+	c.emit(v.FalseExpr)
+	c.ins(OpTernFalse, k)
+	end := len(c.p.code)
+
+	// onUndef and onError name where each of those two outcomes goes, which is what the control-flow
+	// graph reads them as: an undefined condition continues into the true arm, and a condition with
+	// no truthiness at all leaves for the join without touching either arm.
+	c.p.conds[k] = condTargets{
+		onFalse: int32(onFalse), onUndef: int32(br + 1), onError: int32(end),
+		end: int32(end), trueEnd: int32(trueEnd),
+	}
 }
 
 // emitLogical compiles a short-circuiting logical operator (&& or ||):

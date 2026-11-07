@@ -9,8 +9,8 @@ import (
 
 // A DELEGATED SUBTREE READS THE SCRIPT'S LOCALS.
 //
-// Some expressions are handed to the tree-walking evaluator rather than lowered natively: a
-// ternary, a list literal, an ad literal, a select, a lazy built-in (see compiler.delegate). That
+// Some expressions are handed to the tree-walking evaluator rather than lowered natively: a list
+// literal, an ad literal, a select, a lazy built-in (see compiler.delegate). That
 // evaluator resolves a bare name against the AD, and a script's locals live in registers it has
 // never heard of. The bridge is classad's partial resolver: before running such a subtree the
 // interpreter installs one backed by the current register file, so a name the compiler resolved to

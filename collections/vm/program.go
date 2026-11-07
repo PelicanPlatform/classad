@@ -39,6 +39,13 @@ type condTargets struct {
 	// header is the instruction a loop's condition starts at, which is where its back edge lands.
 	// Zero for an If.
 	header int32
+
+	// trueEnd is the instruction that closes a TERNARY's true arm -- its OpTernTrue -- and so the
+	// end of the region that arm occupies. The ternary is the one construct here whose arms are not
+	// delimited by the other targets: its false arm begins at onFalse and ends one before end, but
+	// the true arm's extent is visible nowhere else, and the vector executor needs it to know which
+	// records to run that arm for. Zero for an If or a While, neither of which has one.
+	trueEnd int32
 }
 
 // refInfo is a pooled attribute reference (name + scope) targeted by OpLoadRef.

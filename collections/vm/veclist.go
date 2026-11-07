@@ -133,7 +133,7 @@ func isJumpTarget(p *Program, t int) bool {
 			if int(in.A) == t {
 				return true
 			}
-		case OpBranchCond, OpBranchVoid:
+		case OpBranchCond, OpBranchVoid, OpTernBranch, OpTernTrue, OpTernFalse:
 			ct := p.conds[in.A]
 			if int(ct.onFalse) == t || int(ct.onUndef) == t || int(ct.onError) == t || int(ct.end) == t || int(ct.header) == t {
 				return true

@@ -52,10 +52,11 @@ const regValueOps = 1<<RConst | 1<<RTrue | 1<<RFalse | 1<<RUndef | 1<<RError |
 // loop body is an execution that does not terminate.
 const nonValueOps = 1<<OpShortAnd | 1<<OpShortOr | 1<<OpJmpIfNotUndef | 1<<OpJmp | 1<<OpBranchCond |
 	1<<OpLoadLocal | 1<<OpStoreLocal | 1<<OpBranchVoid | 1<<OpJmpVoid | 1<<OpFault |
-	1<<OpShortSubscript
+	1<<OpShortSubscript | 1<<OpTernBranch | 1<<OpTernTrue | 1<<OpTernFalse
 
 const regNonValueOps = 1<<RNop | 1<<RMove | 1<<RShortAnd | 1<<RShortOr | 1<<RJump | 1<<RFault |
-	1<<RBranchCond | 1<<RJmpIfDefined | 1<<RShortSubscript
+	1<<RBranchCond | 1<<RJmpIfDefined | 1<<RShortSubscript |
+	1<<RTernBranch | 1<<RTernTrue | 1<<RTernFalse
 
 // isValueOp reports whether a stack-form instruction is charged.
 func isValueOp(op Opcode) bool { return op < 64 && uint64(valueOps)>>op&1 != 0 }
