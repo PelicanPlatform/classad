@@ -166,3 +166,43 @@ func TestPartialResolverSurvivesCyclic(t *testing.T) {
 		t.Errorf("x after a cyclic unwind = %s, want 50", v)
 	}
 }
+
+// TestPartialResolverThroughAComparison puts the overlay through the shape the predicate fast
+// path handles: an attribute compared against a literal, which it decides without building a
+// Value. That path does its own scope resolution, so it has to offer the reference to the
+// overlay the way the ordinary path does -- otherwise it reads the ad's attribute and the
+// overlay silently does not apply to exactly the expressions a script compares on.
+func TestPartialResolverThroughAComparison(t *testing.T) {
+	// Every name below is in the ad too, with a value that compares the OTHER way, so a result
+	// that ignores the overlay is a wrong answer rather than a coincidence.
+	const ad = `[ x = 0; s = "aaa"; r = 0.5 ]`
+	vals := map[string]Value{
+		"x": NewIntValue(3),
+		"s": NewStringValue("zzz"),
+		"r": NewRealValue(9.5),
+	}
+
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{"x > 2", "true"}, // the overlay's 3, not the ad's 0
+		{"x < 2", "false"},
+		{"x == 0", "false"},   // the ad's value, had it won, would make this true
+		{`s > "mmm"`, "true"}, // the overlay's "zzz", not the ad's "aaa"
+		{"r > 1.0", "true"},   // reals take the same path
+		{"absent > 2", "undefined"},
+		// A scoped reference is declined by this overlay, so the ad wins and the fast path
+		// is free to decide it from the ad -- which is the point of a decline.
+		{"MY.x > 2", "false"},
+		// The conditional is where this first showed up: the comparison decides which arm runs.
+		{`x > 2 ? "hi" : "lo"`, `"hi"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.expr, func(t *testing.T) {
+			if got := evalWithOverlay(t, ad, tc.expr, vals).String(); got != tc.want {
+				t.Errorf("%s = %s, want %s", tc.expr, got, tc.want)
+			}
+		})
+	}
+}
