@@ -324,6 +324,118 @@ func (c *Collection) AutoIndexNames() []string {
 	return out
 }
 
+// --- composite provenance ------------------------------------------------------------
+//
+// The composite counterparts of AddAutoIndex / MarkAutoIndexes / AutoIndexNames, and for
+// the same reason: a composite the tuner created is trimmable by the memory budget and
+// droppable when nothing demands its tuple, and a human-configured one is neither. Reopen
+// without the mark and the tuner's own composite comes back exempt from both, permanently,
+// on the strength of nothing -- which is the shape of mistake the single-attribute Auto
+// field already exists to avoid.
+//
+// There are two restore paths here as well, for the same reason there are two there. A store
+// that opens with no composite configured -- which is every store whose caller configures
+// none, so the tuner's are all it has -- ADDS its auto set back, and the add carries the
+// mark. A store that rebuilds its whole index set from a saved configuration at open (an
+// archive does) has its composites back already, as configured ones, by the time anything
+// could mark them: adding them again would be refused as a tuple already covered, and
+// configuring them as auto in the first place would leave the saved configuration unable to
+// say which tuples a human asked for. So that one MARKS.
+
+// CompositeAttrs returns the attribute tuples the collection indexes together, in the
+// spelling each was configured with and in tuple-identity order. The composite counterpart
+// of IndexedAttrs: what a store persists so a reopen rebuilds the same composites.
+func (c *Collection) CompositeAttrs() [][]string {
+	spec := c.spec.Load()
+	if spec == nil || len(spec.comps) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(spec.comps))
+	for _, cs := range spec.comps {
+		out = append(out, append([]string(nil), cs.names...))
+	}
+	return out
+}
+
+// AutoCompositeNames returns the tuples of the composites the auto-tuner created, a subset
+// of CompositeAttrs. The composite counterpart of AutoIndexNames.
+func (c *Collection) AutoCompositeNames() [][]string {
+	spec := c.spec.Load()
+	if spec == nil {
+		return nil
+	}
+	var out [][]string
+	for _, cs := range spec.comps {
+		if cs.auto {
+			out = append(out, append([]string(nil), cs.names...))
+		}
+	}
+	return out
+}
+
+// AddAutoComposites installs composites over these tuples, marked auto, and reports whether
+// any was installed. The composite counterpart of AddAutoIndex, and the restore path for a
+// store whose composites are not re-derived from a saved configuration at open.
+//
+// Fewer tuples may be installed than were asked for, silently: a tuple whose component is
+// not indexed in its own right is refused (newCompositeSpecs), as is one some composite
+// already covers in any order. Both are the right answer for a restore -- the first says the
+// component index did not come back, which leaves the composite nothing to fall back to for
+// the conjunctions it cannot answer; the second says the tuple is already configured, and a
+// configured composite is not the tuner's to claim.
+func (c *Collection) AddAutoComposites(tuples [][]string) bool {
+	return len(c.addCompositesAuto(tuples)) > 0
+}
+
+// MarkAutoComposites records the named EXISTING composites as auto-created. It changes only
+// provenance: no composite is added, dropped or rebuilt, the index generation does not move,
+// and a tuple no current composite covers is ignored.
+//
+// Tuples are matched as SETS of folded component names, not as ordered keys. Order is part
+// of a composite's identity but not of what it answers, and two orders of one set cannot
+// both be configured (coversTupleIDs refuses the second), so a set names at most one
+// composite and matching this way survives a saved tuple being written back in a different
+// order than the live composite carries.
+func (c *Collection) MarkAutoComposites(tuples [][]string) {
+	want := make(map[string]struct{}, len(tuples))
+	for _, t := range tuples {
+		if len(t) < 2 {
+			continue
+		}
+		want[strings.Join(foldedSorted(t), tupleKeySep)] = struct{}{}
+	}
+	if len(want) == 0 {
+		return
+	}
+	for {
+		cur := c.spec.Load()
+		if cur == nil {
+			return
+		}
+		next := cur.clone()
+		changed := false
+		for i := range next.comps {
+			if next.comps[i].auto {
+				continue
+			}
+			if _, ok := want[strings.Join(foldedSorted(next.comps[i].names), tupleKeySep)]; !ok {
+				continue
+			}
+			next.comps[i].auto = true
+			changed = true
+		}
+		if !changed {
+			return
+		}
+		// No signature bump: provenance is not part of what a sidecar was built under, and
+		// moving the generation here would make every sealed segment stale at every open --
+		// an archive-wide reindex to record who asked for an index.
+		if c.spec.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
 // addID appends id to ids/set if not already present.
 func addID(ids *[]uint32, set map[uint32]struct{}, id uint32) {
 	if _, dup := set[id]; dup {
