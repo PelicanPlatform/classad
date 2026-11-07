@@ -1102,7 +1102,7 @@ func (c *Collection) rebuildDir(sh *shard) {
 	if n := len(sh.segs); n > 0 && sh.segs[n-1] != nil {
 		actID = sh.segs[n-1].id
 	}
-	count := 0
+	count, sysCount := 0, 0
 	// The hash is the map key now, so no entry has to be re-hashed on the way into sh.dir --
 	// which is keyed by the same hash.
 	addDir := func(h uint64, b best) {
@@ -1110,6 +1110,9 @@ func (c *Collection) rebuildDir(sh *shard) {
 			return // latest version was superseded (deleted) -> key absent
 		}
 		count++
+		if isSystemKeyBytes(recKey(sh.segs[b.loc.seg].data, b.loc.off)) {
+			sysCount++
+		}
 		if b.loc.seg == actID {
 			return
 		}
@@ -1123,6 +1126,7 @@ func (c *Collection) rebuildDir(sh *shard) {
 		addDir(c.h.Hash([]byte(keyStr)), b) // empty on a store with no hash collision
 	}
 	sh.count = count
+	sh.sysCount = sysCount
 	if len(sh.segs) > 0 {
 		sh.act = sh.segs[len(sh.segs)-1]
 	}
@@ -1256,6 +1260,34 @@ func walkSegBounds(seg *segment, appendOnly bool) {
 	}
 }
 
+// countSystemRecords counts the segment's live system-keyed records (syskey.go) by the same
+// header-only walk walkSegBounds makes, for a shard whose directory came from a snapshot of a
+// version that does not carry that count. A mutable shard's live records are the unsuperseded
+// ones, exactly as compaction's recount treats them; every data record of an append log is
+// live. Only the key's first byte is read, so no record body is decompressed.
+func countSystemRecords(seg *segment, appendOnly bool) int {
+	n := 0
+	dm := seg.damaged()
+	for off := 0; off < seg.used; {
+		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
+		total := recTotalLen(seg.data, o)
+		if total == 0 || total%8 != 0 || off+int(total) > seg.used {
+			break
+		}
+		if !recIsMarker(seg.data, o) && (appendOnly || recSuperseded(seg.data, o) == seqMax) {
+			if isSystemKeyBytes(recKey(seg.data, o)) {
+				n++
+			}
+		}
+		off += int(total)
+	}
+	return n
+}
+
 // noteDamagedRecord adds the record at off, found failing its checksum, to its segment's damage set.
 // The span ends where the record's own totalLen says: the caller has walked the segment by those
 // lengths to its extent (or will, and reframes it if not), which is how every other walk steps too.
@@ -1311,7 +1343,7 @@ func (c *Collection) reframeSegment(seg *segment, last bool) {
 // and walked again, as in rebuildDir.
 func (c *Collection) rebuildAppendLog(sh *shard) {
 	var maxSeq uint64
-	count := 0
+	count, sysCount := 0, 0
 	walked := 0
 	defer func() { c.recWalked.Add(int64(walked)) }()
 	for _, seg := range sh.segs {
@@ -1319,7 +1351,7 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 			continue
 		}
 		for attempt := 1; ; attempt++ {
-			segMax, segCount := maxSeq, 0
+			segMax, segCount, segSys := maxSeq, 0, 0
 			seg.minSeq, seg.maxSeq = 0, 0
 			dm := seg.damaged()
 			off := 0
@@ -1340,6 +1372,9 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 				seg.noteWalkedRec(o, total, true) // this segment's bounds, for resume-from-sequence pruning
 				if !recIsMarker(seg.data, o) {
 					segCount++ // append-only records are never superseded, so all are live
+					if isSystemKeyBytes(recKey(seg.data, o)) {
+						segSys++
+					}
 				}
 				walked++
 				off += int(total)
@@ -1350,11 +1385,13 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 			}
 			maxSeq = segMax
 			count += segCount
+			sysCount += segSys
 			break
 		}
 	}
 	sh.commitSeq = maxSeq
 	sh.count = count
+	sh.sysCount = sysCount
 	if len(sh.segs) > 0 {
 		sh.act = sh.segs[len(sh.segs)-1]
 	}
@@ -1476,6 +1513,7 @@ func (c *Collection) teardown(discard bool) error {
 		sh.act = nil
 		sh.pendingSeal = nil
 		sh.count = 0
+		sh.sysCount = 0
 		sh.mu.Unlock()
 	}
 	// Only now, with every segment flushed, may the epoch be vouched for across a restart.

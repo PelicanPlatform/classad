@@ -192,11 +192,15 @@ func TestScriptFuncPurityGate(t *testing.T) {
 		{"nondeterministic_builtin", "def f():\n    return random(10)\n", "random(10)"},
 		// A ternary over no local at all is delegated too, which is rule 4 again.
 		{"constant_ternary", "def f():\n    return (1 ? 2 : 3)\n", "(1 ? 2 : 3)"},
-		// A delegated construct over a parameter does not reach the gate: the compiler refuses it
-		// first, because the subtree would read an ATTRIBUTE of that name rather than the
-		// parameter. Different rule, same outcome, and worth pinning so a change that moved the
-		// refusal shows up here.
-		{"ternary_over_param", "def f(x):\n    return (x ? 1 : 0)\n", `reads the local "x"`},
+		// A delegated construct over a parameter compiles -- the ternary reads the parameter's
+		// register -- and is refused HERE, by rule 4, because a registered function has no ad for
+		// the tree-walker to evaluate the rest of that subtree against and that evaluator need not
+		// be deterministic. Pinned because it is the one case where the overlay makes a function
+		// compile that used to be refused earlier, and the gate has to catch it either way.
+		{"ternary_over_param", "def f(x):\n    return (x ? 1 : 0)\n", "(x ? 1 : 0)"},
+		// A list literal over a parameter is still refused by the COMPILER, before the gate: the
+		// elements are evaluated later, from a captured scope, where the register does not exist.
+		{"list_over_param", "def f(x):\n    return {x, 1}\n", `reads the local "x"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -223,6 +227,13 @@ func TestScriptFuncPurityGateSentinel(t *testing.T) {
 		"def f():\n    return Optimistic\n",
 		"def f():\n    return MY.RequestMemory\n",
 		"def f():\n    return random(10)\n",
+		// A select reaches the ad through the SCOPING RULE rather than by naming an
+		// attribute: a member the record does not define chains out to the subject ad,
+		// so this reads the ad's Mem. The read set rule 1 works from holds only names
+		// the expression writes down and cannot see that; rule 4 is what refuses it,
+		// because a select compiles to a subtree delegated to an evaluator this
+		// function has no ad for.
+		"def f():\n    return [ a = 1 ].Mem\n",
 	} {
 		m, err := ParseScriptModule(src)
 		if err != nil {

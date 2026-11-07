@@ -498,7 +498,7 @@ func (e *Evaluator) operandLiteral(expr ast.Expr, lit *litOperand, val *Value) b
 // non-literal expression.
 func (e *Evaluator) refOperand(ref *ast.AttributeReference, lit *litOperand, val *Value) bool {
 	norm := ref.NormalizedName()
-	if e.resolver != nil || norm == currentTimeAttr {
+	if e.resolver != nil || e.partial != nil || norm == currentTimeAttr {
 		// A custom resolver replaces scope resolution entirely and speaks only in
 		// Values (see SetResolver, whose CurrentTime contract in particular has no
 		// expression-level form). CurrentTime has the separate problem that whether

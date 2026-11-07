@@ -58,7 +58,13 @@ type shard struct {
 	sealsName func(string) bool
 
 	commitSeq uint64 // bumped once per committed batch; scan snapshots capture it
-	count     int    // number of live keys
+	count     int    // number of live keys, system-keyed ones included
+	// sysCount is how many of count are system-keyed (a leading NUL; see syskey.go).
+	// Maintained in step with count everywhere count is, so the client-visible row
+	// count -- what Len reports and what a match-all query returns -- is count-sysCount
+	// without a scan. The reserved keyspace is stored and compacted like any other
+	// record, so nothing else distinguishes those records here.
+	sysCount int
 
 	// gcFloor is the retain floor of the most recent reclamation: superseded/delete
 	// evidence at or below it may have been reclaimed. A transaction whose snapshot
@@ -412,6 +418,9 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags
 		// version or directory (Get/Delete-by-key are inert), and Scan/Query see them all.
 		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec, hdrFlags, ct); ok {
 			sh.count++
+			if isSystemKeyBytes(key) {
+				sh.sysCount++
+			}
 		}
 		return
 	}
@@ -435,6 +444,9 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags
 		}
 	} else {
 		sh.count++
+		if isSystemKeyBytes(key) {
+			sh.sysCount++
+		}
 		// A newly-inserted chained child bumps its parent's live-child count. Re-puts
 		// (updates) take the branch above and do not double-count.
 		if sh.childParentHash != nil {
@@ -479,6 +491,9 @@ func (sh *shard) del(h uint64, key []byte, seq uint64, codec Codec) (removed, pa
 		sh.dirtySup = append(sh.dirtySup, supRef{seg, old.off}) // flush the tombstone
 	}
 	sh.count--
+	if isSystemKeyBytes(key) {
+		sh.sysCount--
+	}
 	if sh.childParentHash != nil {
 		if ph, isChild := sh.childParentHash(key); isChild {
 			if n := sh.childCount[ph] - 1; n <= 0 {

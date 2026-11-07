@@ -253,10 +253,10 @@ func unparseValueNested(v Value) (string, bool) {
 // built programmatically (e.g. by split()) has no source expressions, so its
 // already-evaluated element values are unparsed instead.
 func unparseList(v Value) (string, bool) {
-	if v.list.exprs != nil {
+	if exprs := v.list().exprs; exprs != nil {
 		var b strings.Builder
 		b.WriteString("{ ")
-		for i, e := range v.list.exprs {
+		for i, e := range exprs {
 			if i > 0 {
 				b.WriteByte(',')
 			}
