@@ -915,6 +915,10 @@ func (a *Archive) IndexSizes() IndexSizes { return a.c.IndexSizes() }
 // IndexedAttrs returns the categorical and value attributes the archive indexes.
 func (a *Archive) IndexedAttrs() (categorical, value []string) { return a.c.IndexedAttrs() }
 
+// AttrNDV reports how many distinct values attr takes, from the sealed segments' index
+// summaries alone -- no record is read. ok is false when no segment indexes attr.
+func (a *Archive) AttrNDV(attr string) (NDVEstimate, bool) { return a.c.AttrNDV(attr) }
+
 // ZoneAttrs returns the attributes carrying per-segment [min,max] zone maps -- the ones a
 // range query prunes whole segments on, not just postings.
 func (a *Archive) ZoneAttrs() []string { return a.c.ZoneAttrs() }

@@ -740,6 +740,9 @@ type (
 	SchemaScanGroup   = collections.SchemaScanGroup
 	SchemaFieldFit    = collections.SchemaFieldFit
 	QueryExplain      = collections.QueryExplain
+	NDVEstimate       = collections.NDVEstimate
+	NDVAccuracy       = collections.NDVAccuracy
+	NDVErr            = collections.NDVErr
 	ProbeExplain      = collections.ProbeExplain
 	MatchExplain      = collections.MatchExplain
 )
