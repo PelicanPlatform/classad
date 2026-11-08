@@ -1123,10 +1123,13 @@ type AttrTypeOptions = collections.AttrTypeOptions
 
 type MergeOptions = collections.MergeOptions
 
-// AutoTuneOptions and AutoTuneResult are re-exported so a caller can tune an archive's
-// indexes without importing collections directly.
+// AutoTuneOptions, AutoTuneResult and AutoTuneChange are re-exported so a caller can tune an
+// archive's indexes, and read back what a pass changed, without importing collections
+// directly. AutoTuneChange is what a result's Changes hold, so a caller handed one by
+// MaintainOptions.OnAutoTune needs it to say anything about them.
 type AutoTuneOptions = collections.AutoTuneOptions
 type AutoTuneResult = collections.AutoTuneResult
+type AutoTuneChange = collections.AutoTuneChange
 
 // IndexBackfillResult reports one index backfill pass (see collections.IndexBackfillResult).
 type IndexBackfillResult = collections.IndexBackfillResult

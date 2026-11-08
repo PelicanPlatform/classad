@@ -5,10 +5,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -114,4 +117,87 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
+}
+
+// TestStartMaintenanceReportsWhatTheTickTuned drives the real loop rather than one pass of
+// it: StartMaintenance enumerates the catalog each tick, and the per-table hook it installs
+// is what carries a mutable table's tuning out to the log. A pass called directly would not
+// exercise that wiring, which is the part that can be wrong.
+func TestStartMaintenanceReportsWhatTheTickTuned(t *testing.T) {
+	_, srv, cleanup := catServerPairWithServer(t)
+	defer cleanup()
+	d, err := srv.cat.CreateTable("jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 400 {
+		ad := classad.New()
+		ad.Set("ClusterId", int64(i))
+		ad.Set("Owner", fmt.Sprintf("u%d", i%7))
+		if err := d.Put(fmt.Sprintf("k%d", i), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 20 {
+		seq, qerr := d.Query(`Owner == "u3"`)
+		if qerr != nil {
+			t.Fatal(qerr)
+		}
+		for range seq {
+		}
+	}
+
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	srv.Logger = slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: &buf}, nil))
+	srv.StartMaintenance(50*time.Millisecond, db.MaintainOptions{
+		MinIndexDemand:       5,
+		ArchiveMergeDisabled: true,
+	})
+
+	deadline := time.Now().Add(30 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got = buf.String()
+		mu.Unlock()
+		if strings.Contains(got, "maintenance added an index") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if cat, _ := d.IndexedAttrs(); !slices.Contains(cat, "Owner") {
+		t.Fatalf("the tick's tuner indexed %v, not Owner: there is nothing for it to report", cat)
+	}
+	if !strings.Contains(got, "maintenance added an index") || !strings.Contains(got, "attr=Owner") {
+		t.Errorf("a maintenance tick indexed Owner and did not report it; logged: %q", got)
+	}
+	if !strings.Contains(got, "table=jobs") {
+		t.Errorf("the report does not name the table it fired for; logged: %q", got)
+	}
+}
+
+// TestLogAutoTuneNamesADrop: a dropped index says so. The budget trimmer and the unused-drop
+// both emit "drop" changes, and reporting one as an add would read as the opposite of what
+// happened -- an index appearing where one had just been reclaimed.
+func TestLogAutoTuneNamesADrop(t *testing.T) {
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	s := &Server{Logger: slog.New(slog.NewTextHandler(&lockedWriter{mu: &mu, w: &buf}, nil))}
+	s.logAutoTune("history", "archive", db.AutoTuneResult{
+		Changed: true,
+		Changes: []db.AutoTuneChange{
+			{Attr: "ClusterId+ProcId", Kind: "composite", Action: "drop", Reason: "over-budget"},
+			{Attr: "Owner", Kind: "categorical", Action: "add", Reason: "demand"},
+		},
+	})
+	mu.Lock()
+	got := buf.String()
+	mu.Unlock()
+	if !strings.Contains(got, "maintenance dropped an index") || !strings.Contains(got, "attr=ClusterId+ProcId") {
+		t.Errorf("the drop was not reported as a drop; logged: %q", got)
+	}
+	if !strings.Contains(got, "maintenance added an index") || !strings.Contains(got, "attr=Owner") {
+		t.Errorf("the add alongside it was lost; logged: %q", got)
+	}
 }
