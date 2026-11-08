@@ -139,6 +139,22 @@ type joinProbes struct {
 	cons map[int]string
 }
 
+// stepKey is a step's WHOLE probeable key: every equality naming a bare attribute of the
+// step's table whose row half a scan of the FROM side yields, whether or not that attribute
+// carries an index of its own.
+//
+// It exists because the per-attribute form and the tuple form want different sets. A
+// constraint on one unindexed attribute filters a full scan and is worth nothing; the same
+// attribute as a COMPONENT of a composite costs no extra lookup and narrows the scan
+// exactly. So the candidates below are the indexed subset, and this is what the tuple
+// planner is offered.
+type stepKey struct {
+	step     int
+	attrs    []probeAttr
+	rows     int
+	segments int
+}
+
 // probeCandidate is one step that passed every gate a scan is not needed for.
 type probeCandidate struct {
 	step int
@@ -177,19 +193,28 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	out := &joinProbes{cons: map[int]string{}}
 	stats.ProbeSteps = make([]JoinProbeStat, len(p.steps))
 	var cands []*probeCandidate
+	stepKeys := map[int]*stepKey{}
 	for i, sp := range p.steps {
-		attrs, rows, segments, why := cat.probeGateAll(sp, sides[sp.side])
+		attrs, all, rows, segments, why := cat.probeGateAll(sp, sides[sp.side])
 		// EstRecords is recorded even when the gate declines, because the decline that
 		// reads on the size is the one a reader most needs the size for.
 		stats.ProbeSteps[i] = JoinProbeStat{Alias: p.aliases[sp.side], Why: why, EstRecords: rows}
 		if why != "" {
 			continue
 		}
-		// One candidate per probeable equality. Which of them is worth narrowing on is
-		// not knowable yet -- it turns on how many distinct keys the FROM side holds for
-		// each, which the scan below counts -- so all of them collect keys and the choice
-		// is made once the counts are in.
-		stats.ProbeSteps[i].Attr = attrs[0].attr
+		stepKeys[i] = &stepKey{step: i, attrs: all, rows: rows, segments: segments}
+		// One candidate per INDEXED probeable equality. Which of them is worth narrowing
+		// on is not knowable yet -- it turns on how many distinct keys the FROM side holds
+		// for each, which the scan below counts -- so all of them collect keys and the
+		// choice is made once the counts are in.
+		//
+		// attrs can be empty where all is not: a step whose key is answerable only as a
+		// whole, through a composite over component-only attributes. It has no
+		// per-attribute form to fall back to, and the tuple planner is what will speak
+		// for it.
+		if len(attrs) > 0 {
+			stats.ProbeSteps[i].Attr = attrs[0].attr
+		}
 		for _, pa := range attrs {
 			cands = append(cands, &probeCandidate{
 				step: i, equi: pa.equi, attr: pa.attr,
@@ -197,7 +222,7 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 			})
 		}
 	}
-	if len(cands) == 0 {
+	if len(cands) == 0 && len(stepKeys) == 0 {
 		stats.syncFirstProbe()
 		return out
 	}
@@ -206,7 +231,7 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	// because it changes what the scan has to COLLECT: the per-attribute form wants each
 	// attribute's distinct values, the tuple form wants the distinct tuples, and the second
 	// cannot be recovered from the first.
-	tprobes := cat.planTupleProbes(cands, sides, p.steps)
+	tprobes := cat.planTupleProbes(stepKeys, cands, sides, p.steps)
 
 	// Now the part that costs a scan. The FROM side is held either way from here: if every
 	// probe is declined below, it is handed back to be streamed from memory, so the scan is
@@ -289,16 +314,28 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 	// statistics and already orders conjuncts by estimated selectivity before intersecting
 	// their postings. A row matching all the equalities matches each of them, so the
 	// conjunction is as sound a superset filter as any one of them, and strictly narrower.
+	groups := map[int][]*probeCandidate{}
 	for _, g := range groupByStep(cands) {
-		st := &stats.ProbeSteps[g[0].step]
+		groups[g[0].step] = g
+	}
+	// Over STEPS rather than over the candidate groups, because a step can have a tuple
+	// form and no candidates at all -- its key answerable only as a whole, through a
+	// composite over component-only attributes. Iterating the groups would skip it, and it
+	// would read as a step that was never considered.
+	for i := range p.steps {
+		if stepKeys[i] == nil {
+			continue // gated out before the scan; its Why is already recorded
+		}
+		st := &stats.ProbeSteps[i]
 		// The whole key as one spine of tuples, where that pays. Preferred over the
 		// per-attribute form rather than compared with it: the spine admits exactly the
 		// tuples the FROM side holds where the conjunction of in-chains admits their cross
 		// product, so when both are affordable the spine is the narrower of the two by
 		// construction -- and when it would admit the cross product anyway, its own gate
 		// declines it.
-		if tp := tprobes[g[0].step]; tp != nil {
-			tp.cross = crossProduct(g)
+		g := groups[i]
+		if tp := tprobes[i]; tp != nil {
+			tp.cross = crossProduct(g, tp.attrs)
 			cons, why := tp.constraint()
 			if why == "" {
 				out.cons[tp.step] = cons
@@ -311,6 +348,14 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 			// Declined, but the per-attribute form is priced separately and may still pay,
 			// so this is recorded beside that decision rather than instead of it.
 			st.TupleWhy = why
+		}
+		if len(g) == 0 {
+			// No per-attribute form to fall back to: every equality of this step names an
+			// attribute that is a composite component and nothing else, so a constraint on
+			// any one of them would filter a full scan rather than replace it.
+			st.Why = "the step's key is answerable only as a whole, through a composite, " +
+				"and narrowing on the tuple was declined"
+			continue
 		}
 		keys, lookups := 0, 0
 		for _, c := range g {
@@ -368,9 +413,9 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 // This is also why a step is no longer refused outright for having several equalities. That
 // refusal cost the probe on exactly the shape it is most wanted for: a two-attribute key is
 // how jobs are identified, so the join that most wants an index was the one declining it.
-func (cat *Catalog) probeGateAll(sp *joinStepPlan, side JoinSide) (out []probeAttr, rows, segments int, why string) {
+func (cat *Catalog) probeGateAll(sp *joinStepPlan, side JoinSide) (out, all []probeAttr, rows, segments int, why string) {
 	if len(sp.equiSide) == 0 {
-		return nil, 0, 0, "the condition has no equality to probe an index with"
+		return nil, nil, 0, 0, "the condition has no equality to probe an index with"
 	}
 	var names []string
 	for i, ex := range sp.equiSide {
@@ -384,17 +429,24 @@ func (cat *Catalog) probeGateAll(sp *joinStepPlan, side JoinSide) (out []probeAt
 	}
 	if len(out) == 0 {
 		if !sp.rowReadsOnlySide0 {
-			return nil, 0, 0, "the equality's row half reads a side an earlier step folds " +
+			return nil, nil, 0, 0, "the equality's row half reads a side an earlier step folds " +
 				"in, so its key values are not known from a scan of the FROM side"
 		}
-		return nil, 0, 0, "the equality's table half is computed, so there is no attribute to name"
+		return nil, nil, 0, 0, "the equality's table half is computed, so there is no attribute to name"
 	}
 	// Every candidate reads the same table, so its size and segment count are asked once.
 	// Which attributes are INDEXED is per attribute, and is what the filter below is for.
 	rows, segments, _, _, ok := cat.joinSideStats(side.Table, "")
 	if !ok {
-		return nil, 0, 0, "the hashed side's size could not be learned"
+		return nil, nil, 0, 0, "the hashed side's size could not be learned"
 	}
+	// The whole probeable set is kept as well as the indexed subset. An attribute that
+	// carries no index of its own can still be a COMPONENT of a composite -- that is what
+	// a component-only attribute is -- and the step can then narrow on the whole tuple
+	// through that composite even though no single-attribute constraint on it would do
+	// anything but filter a full scan. So the filter below decides the per-attribute form,
+	// and the tuple form is offered the unfiltered set.
+	all = append(all, out...)
 	kept := out[:0]
 	var configuredOnly []string
 	for _, pa := range out {
@@ -408,7 +460,12 @@ func (cat *Catalog) probeGateAll(sp *joinStepPlan, side JoinSide) (out []probeAt
 	}
 	out = kept
 	if len(out) == 0 {
-		return nil, 0, 0, noIndexWhy(side.Alias, names, configuredOnly)
+		// Nothing is indexed in its own right. That is still probeable if a composite
+		// covers the whole key, which is the all-component-only case: every component
+		// answerable only as part of the tuple, and the tuple answerable exactly.
+		if _, ok := cat.joinSideComposite(side.Table, attrNames(all)); !ok {
+			return nil, nil, 0, 0, noIndexWhy(side.Alias, names, configuredOnly)
+		}
 	}
 	// A side with a constraint of its own does not read the whole table, so the table's size
 	// is not what a membership constraint would save. Price the read it actually does; the
@@ -417,14 +474,14 @@ func (cat *Catalog) probeGateAll(sp *joinStepPlan, side JoinSide) (out []probeAt
 	// date far more often than not.
 	rows, why = cat.sideRows(side, rows)
 	if why != "" {
-		return nil, 0, 0, why
+		return nil, nil, 0, 0, why
 	}
 	if rows < minProbeRows {
 		// rows is returned with the decline: it is the whole reason for it.
-		return nil, rows, segments, fmt.Sprintf("the hashed side's read visits %d records, "+
+		return nil, nil, rows, segments, fmt.Sprintf("the hashed side's read visits %d records, "+
 			"below the %d where narrowing is worth deciding", rows, minProbeRows)
 	}
-	return out, rows, segments, ""
+	return out, all, rows, segments, ""
 }
 
 // probeAttr is one equality of a step that a membership constraint could narrow on: which
