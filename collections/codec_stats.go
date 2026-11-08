@@ -30,7 +30,7 @@ type CodecStats struct {
 // readers and writers.
 func (c *Collection) CodecStats(sampleMax int) CodecStats {
 	if sampleMax <= 0 {
-		sampleMax = maxDistinctSample
+		sampleMax = defaultSampleMax
 	}
 	cs := CodecStats{Codec: c.currentCodec().Name(), DictBytes: c.lastDictBytes.Load()}
 	if n := c.lastRetrainUnix.Load(); n > 0 {

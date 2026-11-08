@@ -101,7 +101,7 @@ func (c *Collection) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
 		k = defaultGroupSchemas
 	}
 	if sampleMax <= 0 {
-		sampleMax = maxDistinctSample
+		sampleMax = defaultSampleMax
 	}
 	samples := c.CollectSamplesRecentN(sampleMax)
 	if len(samples) == 0 {

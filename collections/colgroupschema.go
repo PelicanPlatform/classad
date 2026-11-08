@@ -321,7 +321,7 @@ func (c *Collection) groupSchemasFor(s *adSchema) []*colGroup {
 	if k <= 0 {
 		return nil
 	}
-	samples := c.normalizeSamples(c.CollectSamplesRecentN(maxDistinctSample))
+	samples := c.normalizeSamples(c.CollectSamplesRecentN(defaultSampleMax))
 	if len(samples) == 0 {
 		return nil
 	}
