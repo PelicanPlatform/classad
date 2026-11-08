@@ -677,44 +677,7 @@ func (c *Client) streamEach(ctx context.Context, build func(id uint64) []byte, y
 // onStats when the op sends one (the *Stats projection op). onStats is nil for every ordinary
 // stream, which then ignores such a frame if one ever arrives.
 func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, onStats func(*reader)) error {
-	_, ch, strm, err := c.callStream(build)
-	if err != nil {
-		return err
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			drain(ch)
-			return ctx.Err()
-		case frame, ok := <-ch:
-			if !ok {
-				// The channel closes on the server's stream terminator AND on a
-				// transport failure, so ask which it was: reporting a truncated
-				// stream as a complete one hands the caller a short answer with
-				// no sign anything went wrong.
-				return c.streamEnd(strm)
-			}
-			_, status, body, ok := respHeader(frame)
-			if !ok {
-				return errShort
-			}
-			switch status {
-			case stStream:
-				if !yield(body.str()) {
-					drain(ch) // consumer stopped early; let the server-side stream finish
-					return nil
-				}
-			case stStreamStats:
-				if onStats != nil {
-					onStats(body)
-				}
-			case stErr, stBadReq:
-				// See streamCtx: stBadReq is the unknown-opcode signal, and ignoring it
-				// hangs the caller against a server that does not implement the op.
-				return statusErr(status, body)
-			}
-		}
-	}
+	return c.streamEachTrailer(ctx, build, yield, stStreamStats, onStats)
 }
 
 // streamEachCursor is streamEach that also delivers a resume-cursor trailer
@@ -722,6 +685,20 @@ func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []by
 // the end of the stream; an op that sends none leaves the caller's page zeroed,
 // which reads as "no more".
 func (c *Client) streamEachCursor(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, onCursor func(*reader)) error {
+	return c.streamEachTrailer(ctx, build, yield, stStreamCursor, onCursor)
+}
+
+// streamEachTrailer is streamEach that also delivers ONE kind of trailer frame to onTrailer.
+//
+// One loop for every trailer, because there is more than one -- scan stats, a resume cursor,
+// a join's execution statistics -- and they differ in nothing but which status they ride and
+// who decodes them. Three copies of this loop would be three places for the early-stop and
+// truncated-stream rules to drift apart, and those rules are the ones a trailer depends on:
+// a trailer that arrives is reported, and a stream that ends before one carries none.
+//
+// onTrailer may be nil, and a trailer of any other kind is ignored, so a stream that is sent
+// one it did not ask for simply drops it.
+func (c *Client) streamEachTrailer(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, trailer int32, onTrailer func(*reader)) error {
 	_, ch, strm, err := c.callStream(build)
 	if err != nil {
 		return err
@@ -749,11 +726,13 @@ func (c *Client) streamEachCursor(ctx context.Context, build func(id uint64) []b
 					drain(ch) // consumer stopped early; let the server-side stream finish
 					return nil
 				}
-			case stStreamCursor:
-				if onCursor != nil {
-					onCursor(body)
+			case trailer:
+				if onTrailer != nil {
+					onTrailer(body)
 				}
 			case stErr, stBadReq:
+				// See streamCtx: stBadReq is the unknown-opcode signal, and ignoring it
+				// hangs the caller against a server that does not implement the op.
 				return statusErr(status, body)
 			}
 		}

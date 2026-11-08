@@ -191,7 +191,7 @@ func TestTwoTableJoinStillSendsTheTwoTableOpcode(t *testing.T) {
 	if o != opJoin || feat != FeatJoin {
 		t.Fatalf("a two-table plan chose op %v / %v, want opJoin / %v", o, feat, FeatJoin)
 	}
-	frame := joinFrameOp(pair, opJoin, false, false)(7)
+	frame := joinFrameOp(pair, opJoin, false, false, false)(7)
 
 	// Decoded by the decoder a server runs, with chain=false, it must come back whole.
 	_, _, body, ok := reqHeader(frame)
@@ -213,7 +213,7 @@ func TestTwoTableJoinStillSendsTheTwoTableOpcode(t *testing.T) {
 // which are in different scopes and would be easy to swap.
 func TestChainFrameRoundTripsThroughTheSharedDecoder(t *testing.T) {
 	jr := chainRPCRequest(db.JoinInner, db.JoinLeft, "m.Eff > 0")
-	frame := joinFrameOp(jr, opJoinChain, false, false)(11)
+	frame := joinFrameOp(jr, opJoinChain, false, false, false)(11)
 	_, _, body, ok := reqHeader(frame)
 	if !ok {
 		t.Fatal("the request frame has no readable header")
@@ -249,7 +249,7 @@ func TestChainRefusesAnOverlongChain(t *testing.T) {
 	for len(jr.Spec.Steps) < maxJoinChainSides+2 {
 		jr.Spec.Steps = append(jr.Spec.Steps, jr.Spec.Steps[0])
 	}
-	frame := joinFrameOp(jr, opJoinChain, false, false)(13)
+	frame := joinFrameOp(jr, opJoinChain, false, false, false)(13)
 	_, _, body, ok := reqHeader(frame)
 	if !ok {
 		t.Fatal("the request frame has no readable header")

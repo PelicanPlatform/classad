@@ -59,6 +59,13 @@ type JoinAggRequest struct {
 // the server cannot serve this, and maps the server's own refusal to the same sentinel. A
 // caller distinguishes with errors.Is rather than by matching prose.
 func (c *Client) JoinAggregate(ctx context.Context, jr JoinAggRequest) ([]db.AggRow, error) {
+	return c.joinAggregate(ctx, jr, nil)
+}
+
+// joinAggregate is JoinAggregate with the statistics report threaded through it;
+// JoinAggregateStats is the exported form.
+func (c *Client) joinAggregate(ctx context.Context, jr JoinAggRequest, rep *JoinStatsReport) ([]db.AggRow, error) {
+	wantStats := c.wantJoinStats(rep)
 	if !c.SupportsNewer(FeatJoinAgg) {
 		return nil, ErrJoinAggUnsupported
 	}
@@ -74,7 +81,7 @@ func (c *Client) JoinAggregate(ctx context.Context, jr JoinAggRequest) ([]db.Agg
 		return nil, err
 	}
 	nGroup, nAgg := len(jr.Spec.GroupCols), len(jr.Spec.Aggs)
-	_, frames, strm, err := c.callStream(joinAggFrame(jr, chain))
+	_, frames, strm, err := c.callStream(joinAggFrame(jr, chain, wantStats))
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +112,8 @@ func (c *Client) JoinAggregate(ctx context.Context, jr JoinAggRequest) ([]db.Agg
 					}
 					out = append(out, row)
 				}
+			case stStreamJoinStats:
+				rep.take(body)
 			case stBadReq:
 				// A server too old to know the opcode refuses this way, and so does one
 				// whose catalog cannot reduce a join, and so does one asked for a chain
@@ -131,7 +140,7 @@ func refuseJoinAggSpec(spec db.JoinAggSpec) error {
 // joinAggFrame encodes the request: the join plan through the SAME encoder the row-streaming
 // join opcodes use, then the reduction. Sharing the encoder is what keeps the plan from
 // acquiring a second spelling here -- the decoder is likewise readJoinRequest, unchanged.
-func joinAggFrame(jr JoinAggRequest, chain bool) func(uint64) []byte {
+func joinAggFrame(jr JoinAggRequest, chain, wantStats bool) func(uint64) []byte {
 	return func(id uint64) []byte {
 		b := putU8(req(id, opJoinAgg), boolByte(chain))
 		b = appendJoinPlan(b, JoinRequest{Spec: jr.Spec.Join, Limits: jr.Limits}, chain)
@@ -146,7 +155,11 @@ func joinAggFrame(jr JoinAggRequest, chain bool) func(uint64) []byte {
 		// on it; this opcode has no older frame to stay identical to, so one tail serves
 		// every shape and a user-defined aggregate works over a join without a second
 		// opcode for the name.
-		return putAggSpecs(b, jr.Spec.Aggs, aggSpecNamed)
+		b = putAggSpecs(b, jr.Spec.Aggs, aggSpecNamed)
+		if wantStats {
+			b = putU8(b, 1)
+		}
+		return b
 	}
 }
 
@@ -202,6 +215,7 @@ func (s *Server) streamJoinAggregate(ctx context.Context, reqID uint64, r *reade
 		return
 	}
 	spec.Aggs = aggs
+	wantStats := readJoinStatsByte(r)
 
 	var stats db.JoinStats
 	if qlog != nil {
@@ -248,6 +262,8 @@ func (s *Server) streamJoinAggregate(ctx context.Context, reqID uint64, r *reade
 	// written, so a limit met part way through has already been reported above. That is
 	// what lets a caller treat a non-nil error as "no answer" rather than "some answer".
 	writeJoinAggRows(reqID, rows, write)
+	writeJoinStats(reqID, wantStats, stats, write)
+	write(respHead(reqID, stStreamEnd))
 }
 
 // joinAggExprs is every expression the REDUCTION will evaluate against a composite row: the
@@ -268,7 +284,8 @@ func joinAggExprs(spec db.JoinAggSpec) []string {
 }
 
 // writeJoinAggRows streams the groups, batched into frames of up to WireBatchBudget payload
-// bytes, then the terminator.
+// bytes. The caller ends the stream, because what comes between the last group and the
+// terminator -- the statistics trailer -- is not this function's business.
 //
 // Batched, where the single-table aggregate opcodes send one frame per group, because the
 // group counts differ by orders of magnitude. Those opcodes group by something that
@@ -309,7 +326,6 @@ func writeJoinAggRows(reqID uint64, rows []db.AggRow, write func([]byte)) {
 		}
 	}
 	flush()
-	write(respHead(reqID, stStreamEnd))
 }
 
 // appendJoinAggRow writes one group: the flags byte, the group cells and aggregate cells in
