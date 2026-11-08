@@ -526,3 +526,105 @@ func TestReindexPersistsIndexOverKeyOnlySidecar(t *testing.T) {
 		t.Errorf(`Owner == "u1": %d rows, want %d`, got, n/4)
 	}
 }
+
+// TestIndexBackfillCarriesACompositeToOlderSegments: a composite added to a collection whose
+// segments are already sealed reaches the ones beyond the backfill horizon.
+//
+// Those segments are the whole point. A composite is added to an archive that already holds
+// history -- by AutoTune, from the demand a workload has been accumulating -- and the
+// conjunction it answers is issued against the old records as much as the new ones. The
+// sealed sidecar carries the index generation, which the add moves, so staleIndexCounts
+// reports them stale and defers them to the backfill; before this the backfill selected on
+// the attribute DIRECTORIES alone, found every indexed attribute still present, and passed
+// over them. The configuration listed the composite, IndexBackfillPending reported nothing
+// to do, and every segment older than the horizon went on intersecting the components'
+// postings for the life of the collection.
+func TestIndexBackfillCarriesACompositeToOlderSegments(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	c, err := Open(Options{
+		Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 13,
+		ValueAttrs: []string{"ClusterId", "ProcId"},
+		// Small enough that most segments fall outside it, as a mature archive's horizon is.
+		IndexBackfillBytes: 24 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 2400
+	for i := range n {
+		ad := mustAdOld(t, fmt.Sprintf("ClusterId = %d\nProcId = %d\nPad = %q",
+			i/8, i%8, strings.Repeat("s", 60)))
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+	if seg, _ := c.IndexBackfillPending(); seg != 0 {
+		t.Fatalf("%d segment(s) uncovered before the composite was added: the test cannot tell "+
+			"the composite's backfill from an ordinary one", seg)
+	}
+
+	if !c.AddAutoComposites([][]string{{"ClusterId", "ProcId"}}) {
+		t.Fatal("AddAutoComposites declined the tuple")
+	}
+	c.Reindex() // bounded by the horizon: covers the newest segments only
+
+	deferred := c.StaleIndexSegmentsByPolicy()
+	if deferred == 0 {
+		t.Fatal("no sealed segment fell outside the horizon, so nothing was left for the backfill")
+	}
+	pending, _ := c.IndexBackfillPending()
+	if pending != deferred {
+		t.Errorf("IndexBackfillPending = %d, want the %d segment(s) staleIndexCounts deferred to it",
+			pending, deferred)
+	}
+	if res := c.BackfillIndexes(1 << 30); res.Rebuilt != deferred || res.PendingSegments != 0 {
+		t.Errorf("backfill rebuilt %d of %d segment(s), %d still pending",
+			res.Rebuilt, deferred, res.PendingSegments)
+	}
+	if n := c.StaleIndexSegmentsByPolicy(); n != 0 {
+		t.Errorf("%d sealed segment(s) still carry the pre-composite index generation", n)
+	}
+
+	// The segments do not merely claim coverage: every sealed sidecar carries the postings.
+	var sealed, withComposite int
+	sh := c.shards[0]
+	sh.mu.RLock()
+	for _, seg := range sh.segs {
+		if seg == nil || seg == sh.act {
+			continue
+		}
+		mm := seg.msidx.Load()
+		if mm == nil {
+			continue
+		}
+		sealed++
+		if len(mm.comps) > 0 {
+			withComposite++
+		}
+	}
+	sh.mu.RUnlock()
+	if withComposite != sealed {
+		t.Errorf("%d of %d sealed sidecar(s) carry composite postings after the backfill", withComposite, sealed)
+	}
+}
+
+// TestCoversSpecIgnoresCompositeOrder: a sidecar built for (A, B) covers a spec that
+// configures (B, A). The two are different composites by identity -- order is part of the
+// key -- but compositeMatch builds its probe key from the SIDECAR's own component order, so
+// both answer the same conjunctions. Rebuilding every sealed segment over a reordering would
+// decompress a whole archive to change nothing.
+func TestCoversSpecIgnoresCompositeOrder(t *testing.T) {
+	if !sameIDSet([]uint32{7, 3}, []uint32{3, 7}) {
+		t.Error("sameIDSet([7 3], [3 7]) = false, want true")
+	}
+	if sameIDSet([]uint32{7, 3}, []uint32{7, 7}) {
+		t.Error("sameIDSet([7 3], [7 7]) = true, want false: a repeated id is not the same set")
+	}
+	if sameIDSet([]uint32{7, 3}, []uint32{7, 3, 9}) {
+		t.Error("sameIDSet compared lists of different length as equal")
+	}
+}

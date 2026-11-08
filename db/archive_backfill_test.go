@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -116,5 +117,84 @@ func TestMaintainOptionsArchiveIndexBackfillBudget(t *testing.T) {
 		if got != tc.want || on != tc.on {
 			t.Errorf("ArchiveIndexBackfillBytes=%d: (%d, %v), want (%d, %v)", tc.set, got, on, tc.want, tc.on)
 		}
+	}
+}
+
+// TestArchiveAutoCompositeReachesSegmentsBeyondHorizon follows the production sequence for
+// a schedd-sync history archive: ClusterId and ProcId indexed from the start, a workload
+// that pins them together on every ingested record (the dedup probe), and the maintenance
+// pass's auto-tuner creating the composite from that demand. The archive is mature, so most
+// of it lies beyond the backfill horizon -- which is where the composite has to reach, since
+// that is where the history it answers questions about lives.
+func TestArchiveAutoCompositeReachesSegmentsBeyondHorizon(t *testing.T) {
+	dir := t.TempDir()
+	cat, err := OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{
+		SegmentSize:        64 << 10,
+		IndexBackfillBytes: 32 << 10,
+		CategoricalAttrs:   []string{"Owner"},
+		ValueAttrs:         []string{"ClusterId", "ProcId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for c := range 300 {
+		for p := range 20 {
+			ad := classad.New()
+			ad.Set("ClusterId", int64(c))
+			ad.Set("ProcId", int64(p))
+			ad.Set("Owner", "user")
+			ad.Set("Pad", strings.Repeat("p", 24))
+			if err := a.Append(ad); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	a.Reindex()
+	if n, _ := a.IndexBackfillPending(); n != 0 {
+		t.Fatalf("%d segment(s) uncovered before the composite exists: the test cannot tell the "+
+			"composite's backfill from an ordinary one", n)
+	}
+
+	for i := range 300 {
+		q := fmt.Sprintf("ClusterId == %d && ProcId == %d", i%300, i%20)
+		seq, err := a.QueryLimit(q, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range seq {
+		}
+	}
+	res := a.AutoTune(AutoTuneOptions{SampleMax: 4096, MinDemand: 100, Reindex: true})
+	if !res.Changed || len(a.CompositeAttrs()) == 0 {
+		t.Fatalf("the tuner did not create the composite (changes %v); the rest of the test has "+
+			"nothing to measure", res.Changes)
+	}
+
+	deferred := a.a.StaleIndexSegmentsByPolicy()
+	if deferred == 0 {
+		t.Fatal("no sealed segment fell outside the horizon, so nothing was left for the backfill")
+	}
+	if n, _ := a.IndexBackfillPending(); n != deferred {
+		t.Errorf("IndexBackfillPending = %d, want the %d segment(s) left outside the horizon", n, deferred)
+	}
+	if r := a.BackfillIndexes(1 << 30); r.Rebuilt != deferred || r.PendingSegments != 0 {
+		t.Errorf("backfill rebuilt %d of %d segment(s), %d still pending", r.Rebuilt, deferred, r.PendingSegments)
+	}
+	if n := a.a.StaleIndexSegmentsByPolicy(); n != 0 {
+		t.Errorf("%d sealed segment(s) still carry the pre-composite index generation", n)
+	}
+
+	// The payoff, in the planner's own words.
+	ex, err := a.Explain("ClusterId == 7 && ProcId == 3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ex.Reason, "from the composite index on ClusterId+ProcId") {
+		t.Errorf("the conjunction does not answer from the composite: %s", ex.Reason)
 	}
 }
