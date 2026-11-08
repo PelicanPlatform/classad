@@ -45,18 +45,66 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 )
 
-// maxJoinGroups caps the distinct groups one join aggregate may return.
+// The caps on a join aggregate's ANSWER: how many groups it may return, and how long one
+// list-valued aggregate's list may be in each of them.
 //
-// It bounds the ANSWER, not the peak: the reduce engine holds one entry per group while it
-// runs and this is checked once it has finished, so the memory is already spent by the time
-// it fires. That is deliberate rather than overlooked -- bounding the peak would mean
-// counting groups a second time alongside the engine that is already counting them, and the
-// peak is bounded anyway by the join's own MaxPairs budget.
+// Both bound the ANSWER rather than the peak, with one exception noted below: the reduce
+// engine holds one entry per group while it runs and the group count is checked once it has
+// finished, so that memory is already spent by the time the cap fires. That is deliberate
+// rather than overlooked -- bounding the peak would mean counting groups a second time
+// alongside the engine that is already counting them, and the peak is bounded anyway by the
+// join's own MaxPairs budget. The list cap is the exception: a list simply stops growing, so
+// it bounds what is held as well as what is returned.
 //
-// What it is actually for is the request that is not an aggregate. A hundred thousand groups
-// is a row stream with a GROUP BY written on it, and answering it would hand back something
-// the size of the rows this exists to avoid sending.
-var maxJoinGroups = 100_000
+// What a group cap is actually for is the request that is not an aggregate. A hundred
+// thousand groups is a row stream with a GROUP BY written on it, and answering it would hand
+// back something the size of the rows this exists to avoid sending.
+//
+// That reasoning holds for a grouping key that CLASSIFIES rows -- an owner, an exit code, a
+// host -- where a hundred thousand distinct values means something has gone wrong with the
+// query. It does not hold when the grouping key IS the entity: a caller grouping a history
+// join by (ClusterId, ProcId) to reduce each job's run attempts to one row has one group per
+// job by construction, and a pool with two million jobs in its history is an ordinary pool
+// rather than a mistake. For that caller the cap is not a guard, it is the feature being
+// refused.
+//
+// So the cap is the REQUEST's, within a ceiling, and the default is what a request that did
+// not think about groups gets. The default is unchanged at a hundred thousand, because the
+// request that did not think about it is still the one worth catching; the ceiling is what a
+// request that did think about it may ask for, and it is the join's own default row limit --
+// past one group per joined row there is nothing left to reduce.
+const (
+	maxJoinGroupsDefault = 100_000
+	maxJoinGroupsCeiling = 1_000_000
+
+	// The list cap is small by comparison, and for a different reason: the groups are the
+	// answer's length and a list is its width, so a long list in every group multiplies the
+	// whole reply. A thousand values is far past the run attempts of any real job, and the
+	// ceiling is where one cell stops being a summary of the rows and becomes the rows.
+	maxJoinListDefault = 1_000
+	maxJoinListCeiling = 10_000
+)
+
+// clampJoinAggCap resolves one caller-supplied cap on the answer: unasked for means the
+// default, asked for means the request's own value up to the ceiling. A negative value is a
+// request that wrote nonsense rather than a cap, and gets the default.
+//
+// It is NOT JoinLimits.clamp, and the difference is worth stating because the two look alike.
+// JoinLimits bound what the join SPENDS -- rows held, pairs examined, rows produced -- so the
+// store's own value is the maximum and a caller may only ask for less; a request must not be
+// able to make a daemon work harder. These bound what the answer SAYS, and the whole reason a
+// caller names one is to ask for MORE than the default, because its grouping key is finer
+// than the default was written for. Raising the default instead would hand that raise to
+// every request, including the ones the cap exists to catch.
+func clampJoinAggCap(want, def, ceiling int) int {
+	if want <= 0 {
+		return def
+	}
+	if want > ceiling {
+		return ceiling
+	}
+	return want
+}
 
 // DefaultJoinAggLimits are the limits a join aggregate runs under when a caller names none.
 //
@@ -98,6 +146,13 @@ type JoinAggSpec struct {
 	// row, except for "*" which counts rows. A spec's Filter, when set, is also an expression
 	// over the composite row, and narrows that one aggregate rather than the group.
 	Aggs []AggSpec
+	// MaxGroups caps the groups the answer may carry; 0 takes the default. A request past
+	// the cap is REFUSED rather than truncated, so see JoinAggregate for why.
+	MaxGroups int
+	// MaxListValues caps each list-valued aggregate's list within each group; 0 takes the
+	// default. A list past the cap is CUT rather than refused, and the group reports how
+	// many values it lost in AggRow.Elided.
+	MaxListValues int
 }
 
 // JoinAggregate runs a join and reduces its rows to one row per group, returning only the
@@ -116,11 +171,22 @@ type JoinAggSpec struct {
 // stop (may be nil) is polled per joined row by the reduce engine; returning true abandons the
 // scan. It is checked again afterwards, so a cancelled aggregate is reported as cancelled
 // rather than returned as the groups that happened to accumulate first.
+//
+// THE TWO CAPS ON THE ANSWER FAIL DIFFERENTLY, which is not an inconsistency. Too many groups
+// is REFUSED, because the groups this would return instead are an arbitrary subset -- the
+// reduce engine's first-seen order is scan order, so a truncated answer is "a hundred thousand
+// of your jobs, we will not say which" and reads exactly like a complete one. A list past its
+// cap is CUT, because there the loss is nameable: the group is still the right group, its
+// COUNT is still the count of every row, and AggRow.Elided says per cell how many values the
+// list does not show. Degrading is worth more than refusing wherever the caller can be told
+// precisely what it did not get, and is worth less than nothing where it cannot.
 func (cat *Catalog) JoinAggregate(spec JoinAggSpec, want JoinLimits, stats *JoinStats, stop func() bool) ([]AggRow, error) {
 	plan, err := compileJoinAgg(spec)
 	if err != nil {
 		return nil, err
 	}
+	maxGroups := clampJoinAggCap(spec.MaxGroups, maxJoinGroupsDefault, maxJoinGroupsCeiling)
+	maxList := clampJoinAggCap(spec.MaxListValues, maxJoinListDefault, maxJoinListCeiling)
 	if stats == nil {
 		stats = &JoinStats{}
 	}
@@ -130,8 +196,8 @@ func (cat *Catalog) JoinAggregate(spec JoinAggSpec, want JoinLimits, stats *Join
 	if err != nil {
 		return nil, err
 	}
-	rows, err := AggregateValues(plan.values(seq), plan.attrs, spec.GroupCols, plan.aggs,
-		plan.groupCol, plan.aggCol, stop)
+	rows, err := aggregateValues(plan.values(seq), plan.attrs, spec.GroupCols, plan.aggs,
+		plan.groupCol, plan.aggCol, stop, maxList)
 	if err != nil {
 		return nil, err
 	}
@@ -145,9 +211,10 @@ func (cat *Catalog) JoinAggregate(spec JoinAggSpec, want JoinLimits, stats *Join
 		return nil, fmt.Errorf("the join aggregate was abandoned before it finished")
 	}
 	stats.Groups = len(rows)
-	if len(rows) > maxJoinGroups {
+	if len(rows) > maxGroups {
 		return nil, fmt.Errorf("the join aggregate produced %d groups, more than the %d it may "+
-			"return; group by something coarser", len(rows), maxJoinGroups)
+			"return; group by something coarser, or raise JoinAggSpec.MaxGroups (up to %d)",
+			len(rows), maxGroups, maxJoinGroupsCeiling)
 	}
 	return rows, nil
 }

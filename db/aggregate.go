@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"iter"
 	"math"
@@ -43,7 +44,49 @@ const (
 	// only "past MAX" -- which aggregate was meant is in UserFunc, and a frame that cannot
 	// carry it cannot ask the question.
 	AggUser
+
+	// AggList collects the group's argument values into a LIST, bounded by a cap the
+	// request carries.
+	//
+	// THE ORDER INSIDE THE CELL IS THE ORDER THE ROWS ARRIVED IN, which is the join's own
+	// order and not a property of the group. A GROUP BY defines no order, the join planner
+	// exchanges its sides on cost, and a parallel walk interleaves them -- so the same
+	// query can return the same group's values in a different order on the next run, and a
+	// caller that needs one sorts, or lists an expression that carries its own sort key.
+	// That also decides WHICH values survive the cap: the first ones to arrive, which is to
+	// say an arbitrary subset rather than the smallest or the earliest.
+	//
+	// It is the aggregate for a question that is not a reduction of the values but the
+	// values themselves. An estimate over the (requested, used) PAIRS of a job's run
+	// attempts cannot be rebuilt from a SUM and a COUNT of each half, so a caller asking it
+	// had no choice but to take the rows -- which is the thing a join aggregate exists to
+	// avoid sending.
+	//
+	// It keeps EVERY row's value, undefined and error included. Two lists over one group
+	// are then positionally aligned -- element i of each came from the same row -- which is
+	// what lets a caller ask for LIST(a) and LIST(b) and read the results as pairs.
+	// Skipping undefined would misalign them, and the misalignment would be close to
+	// invisible: the only symptom is two lists of different lengths, and a group where both
+	// attributes go missing on the same rows does not even have that.
+	//
+	// A caller that would rather not depend on that can write the pair itself, where the
+	// argument is an expression -- a join aggregate's is -- since LIST({a, b}) is a list of
+	// pairs in one cell. It has to, if the two aggregates carry different FILTERs: a filter
+	// is what decides which rows reach THIS aggregate, so two differently filtered lists are
+	// two different selections of rows and nothing aligns them.
+	//
+	// It sits past AggUser, so a request carrying one reaches only a frame with a field for
+	// its BOUND. AggregateValues refuses it outright for the same reason: an unbounded
+	// list-valued aggregate turns a reduction back into the row stream it was reducing, one
+	// cell at a time.
+	AggList
 )
+
+// ErrListAggregateNeedsBound reports a list-valued aggregate asked for where no bound on it
+// can be stated. It is not a statement that the aggregate is unavailable -- see AggList --
+// but that this path has nowhere to put the cap that makes it safe.
+var ErrListAggregateNeedsBound = errors.New(
+	"a list-valued aggregate needs a bound on its list, which this request has no field for")
 
 // AggSpec is one aggregate in a query: a function over an argument attribute.
 // Arg "*" (only meaningful for plain COUNT) counts every row in the group; otherwise
@@ -96,6 +139,22 @@ type AggRow struct {
 	// no relation for them), but that text is a ClassAd literal, so the value survives the
 	// trip over dbrpc as well and a caller never finds a list standing in as a string.
 	GroupValues []classad.Value
+
+	// Elided is, per aggregate, how many of this group's values a BOUNDED aggregate left
+	// out of its answer. It is nil when nothing was left out, which is every row a
+	// producer without a bounded aggregate returns and most rows of one that has them.
+	//
+	// It exists because a cut list and a complete list are otherwise the same bytes. A
+	// caller that reads a truncated cell as the whole of the group has been answered
+	// wrongly and has no way to find out, which is the one failure a bounded list-valued
+	// aggregate can have -- so the cut is reported rather than implied, and the caller can
+	// decide between raising the bound, narrowing the query and showing the answer as the
+	// sample it is.
+	//
+	// It is per CELL and not per row because two list-valued aggregates in one request can
+	// carry different FILTERs and so fill at different rates: one of them being cut says
+	// nothing about the other.
+	Elided []int
 }
 
 // GroupCol is one GROUP BY column for a (possibly bucketed) aggregate: the
@@ -267,10 +326,37 @@ func bindValue(ad *classad.ClassAd, name string, v classad.Value) {
 // the scan halts early with the groups accumulated so far -- used to abandon a
 // scan whose client has gone away.
 func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []GroupCol, aggs []AggSpec, groupCol, aggCol []int, stop func() bool) (rows []AggRow, err error) {
+	// A list-valued aggregate is refused HERE rather than at each caller, which makes the
+	// refusal structural: every path that is not the join aggregate reduces through this
+	// function, so none of them can acquire an unbounded list by being written later. The
+	// join aggregate drives the same engine through aggregateValues with its cap.
+	for _, a := range aggs {
+		if a.Func == AggList {
+			return nil, ErrListAggregateNeedsBound
+		}
+	}
+	return aggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, stop, 0)
+}
+
+// aggregateValues is AggregateValues with the one thing its signature cannot carry: maxList,
+// the cap on how many values each list-valued aggregate keeps per group. It is unexported
+// because the cap belongs to a REQUEST and the exported engine's callers have no field for
+// one -- see AggList.
+//
+// Unlike the group cap, this one bounds the PEAK and not just the answer: a list stops
+// growing at the cap and counts what it dropped, so the memory a pathological group can
+// reach is the cap and not the group.
+func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []GroupCol, aggs []AggSpec, groupCol, aggCol []int, stop func() bool, maxList int) (rows []AggRow, err error) {
 	nGroup := len(groupCols)
 	for _, a := range aggs {
 		if a.Func == AggCountDistinct && a.Arg == "*" {
 			return nil, fmt.Errorf("COUNT(DISTINCT *) is not meaningful; name an attribute")
+		}
+		// LIST(*) has the same problem COUNT(DISTINCT *) has: the rows of a group are
+		// not a value, so there is nothing for the list to hold. Refused rather than
+		// read as "the whole row", which is a thing this cannot produce.
+		if a.Func == AggList && (a.Arg == "" || a.Arg == "*") {
+			return nil, fmt.Errorf("LIST(*) is not meaningful; name an attribute or an expression")
 		}
 	}
 	// Resolve user-defined aggregates once, so the reduction does no lookup per group, and
@@ -350,7 +436,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 			if aggCol[i] >= 0 {
 				v = vals[aggCol[i]]
 			}
-			gs.accs[i].update(a, v)
+			gs.accs[i].update(a, v, maxList)
 		}
 	}
 
@@ -370,6 +456,15 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 		row := AggRow{Group: gs.gvals, GroupValues: gs.gvalues, Values: make([]string, len(aggs))}
 		for i, a := range aggs {
 			row.Values[i] = gs.accs[i].result(a)
+			// Allocated only for a row that actually lost something, so the field
+			// stays nil for every aggregate that cannot elide and for every group
+			// of a list-valued one that fitted.
+			if gs.accs[i].elided > 0 {
+				if row.Elided == nil {
+					row.Elided = make([]int, len(aggs))
+				}
+				row.Elided[i] = gs.accs[i].elided
+			}
 		}
 		out = append(out, row)
 	}
@@ -427,11 +522,15 @@ type aggAcc struct {
 	vals []classad.Value     // argument values for SUM/AVG/MIN/MAX
 	seen map[string]struct{} // distinct defined argument values (COUNT DISTINCT)
 	user Accumulator         // a user-defined aggregate's own state (AggUser)
+	// elided counts the values a bounded aggregate did not keep (AggList past its cap).
+	// Counted rather than merely dropped, because a cut list and a short one are the same
+	// bytes and the caller has to be able to tell them apart.
+	elided int
 }
 
 // update folds one row's already-resolved argument value v into the accumulator.
 // For COUNT(*) (spec.Arg == "*") v is ignored.
-func (a *aggAcc) update(spec AggSpec, v classad.Value) {
+func (a *aggAcc) update(spec AggSpec, v classad.Value, maxList int) {
 	a.rows++
 	if spec.Arg == "*" {
 		return
@@ -447,6 +546,14 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value) {
 		// decision, exactly as it is for the built-ins, which drop undefined inside the
 		// reference implementation rather than before it.
 		a.user.Add(v)
+	case AggList:
+		// Undefined is kept, not skipped -- see AggList: two lists over one group stay
+		// positionally aligned only if every row contributes to both.
+		if len(a.vals) < maxList {
+			a.vals = append(a.vals, v)
+		} else {
+			a.elided++
+		}
 	case AggCountDistinct:
 		// Keyed on the same rendering the group tuple uses, so two rows count as one
 		// value exactly when they would group together.
@@ -481,6 +588,19 @@ func (a *aggAcc) result(spec AggSpec) string {
 		return ValueText(classad.Max(a.vals))
 	case AggUser:
 		return ValueText(a.user.Result())
+	case AggList:
+		// Rendered as a ClassAd LIST LITERAL by the group renderer, not by ValueText,
+		// because this cell has to be read back as a value and ValueText's output
+		// cannot be: it drops a string's quotes, so a list of owners would come back
+		// as a list of bare identifiers that evaluate to undefined, and it would send
+		// a list through the unparser, which keeps a literal's unevaluated source.
+		// GroupValueText is already the renderer whose text is a literal every kind
+		// inverts through ParseGroupValue, so a list aggregate is read back exactly.
+		//
+		// The cost of borrowing it, stated because it surprises: a string element
+		// arrives QUOTED and an integral real reads as the integer it equals, which is
+		// the group renderer's canonicalisation and not this aggregate's choice.
+		return GroupValueText(classad.NewListValue(a.vals))
 	}
 	return "undefined"
 }

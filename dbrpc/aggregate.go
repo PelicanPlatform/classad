@@ -51,7 +51,7 @@ func (c *Client) Aggregate(ctx context.Context, constraint string, groupBy []str
 // AggregateTable is Aggregate on the named table.
 func (c *Client) AggregateTable(ctx context.Context, table, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
 	form := aggSpecFormFor(aggs)
-	if err := c.refuseNamedAggregate(aggs, form); err != nil {
+	if err := c.refuseUnservableAggregate(aggs, form); err != nil {
 		return nil, err
 	}
 	// A server that can send typed group cells is asked to: the reply then carries the
@@ -144,7 +144,7 @@ func (c *Client) AggregateBucketed(ctx context.Context, constraint string, group
 // AggregateBucketedTable is AggregateBucketed on the named table.
 func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
 	form := aggSpecFormFor(aggs)
-	if err := c.refuseNamedAggregate(aggs, form); err != nil {
+	if err := c.refuseUnservableAggregate(aggs, form); err != nil {
 		return nil, err
 	}
 	// See AggregateTable: a server that can type the group cells is asked to, which widens
@@ -354,13 +354,22 @@ var ErrNamedAggregateUnsupported = errors.New(
 // Deprecated: use ErrNamedAggregateUnsupported, which says which side is too old.
 var ErrUserAggregateUnsupported = ErrNamedAggregateUnsupported
 
-// refuseNamedAggregate stops a named request that cannot be served, before it costs a round
+// refuseUnservableAggregate stops a named request that cannot be served, before it costs a round
 // trip. A peer that advertised its features and did not name this one is a definite no, so
 // issuing the request to find out would be a wasted trip to a refusal we already have. A peer
 // that advertised NOTHING is unknown, not no -- it may be a build that predates advertisement
 // entirely -- so that one is still probed, and the stBadReq it may answer with maps to the
 // same error.
-func (c *Client) refuseNamedAggregate(aggs []AggSpec, form aggSpecForm) error {
+func (c *Client) refuseUnservableAggregate(aggs []AggSpec, form aggSpecForm) error {
+	// A list-valued aggregate reaches only opJoinAgg, whose frame has a field for the cap
+	// that bounds it. Refused here rather than sent, because the function selector is a u8
+	// and a server that does not know this one answers that column "undefined" -- an
+	// unbounded request would look like a successful empty one. See db.AggList.
+	for _, a := range aggs {
+		if a.Func == db.AggList {
+			return fmt.Errorf("%w: over a single table", db.ErrListAggregateNeedsBound)
+		}
+	}
 	if form < aggSpecNamed {
 		return nil
 	}

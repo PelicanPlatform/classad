@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 5
+const ProtocolVersion = 6
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -156,6 +156,20 @@ const (
 	// makes the values available -- which is why its absence costs accuracy nowhere and
 	// needs no fallback path in the caller.
 	FeatTypedGroups Feature = "typedgroups"
+
+	// FeatJoinAgg is the GROUP BY over a join's rows, reduced in the store (opJoinAgg).
+	// Postdates advertisement, so silence is a no.
+	//
+	// One feature for the two body layouts the opcode carries, unlike the row-streaming
+	// join, where FeatJoinChain is separate. Nothing is lost by that: a server advertising
+	// this has the handler, and whether it can also fold in a THIRD table is a property of
+	// its catalog that FeatJoinChain already states. A client sending a chain asks for both.
+	//
+	// A peer advertising FeatJoin says nothing about this one. The two share a planner and
+	// nothing else -- a server can stream joined rows perfectly well and have no reduce
+	// engine wired to them -- so inferring one from the other would be the definite yes
+	// that turns out wrong.
+	FeatJoinAgg Feature = "joinagg"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -193,6 +207,7 @@ var serverFeatures = []Feature{
 	FeatNamedAggregate,
 	FeatJoinExplain,
 	FeatTypedGroups,
+	FeatJoinAgg,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar
@@ -247,6 +262,15 @@ func (s *Server) SessionAttrs() map[string]string {
 		// able to name them.
 		if f == FeatJoinExplain {
 			if _, ok := s.cat.(joinExplainCatalog); !ok {
+				continue
+			}
+		}
+		// Reducing a join is its own capability for the same reason explaining one is: a
+		// catalog that streams joined rows need not have a reduce engine reading them,
+		// and advertising on the strength of joinCatalog would send a client down a path
+		// that then fails.
+		if f == FeatJoinAgg {
+			if _, ok := s.cat.(joinAggCatalog); !ok {
 				continue
 			}
 		}

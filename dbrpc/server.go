@@ -818,6 +818,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamJoin(sc.ctx, reqID, body, priv, true, sc.write, sc.qlog)
 	case opJoinChainWire:
 		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, true, sc.write, sc.qlog)
+	case opJoinAgg:
+		sc.s.streamJoinAggregate(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opJoinExplain:
 		sc.write(sc.s.explainJoin(reqID, body, priv, false))
 	case opJoinChainExplain:

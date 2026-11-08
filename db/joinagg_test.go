@@ -421,11 +421,10 @@ func TestJoinAggregateRunsPastTheStreamingRowBudget(t *testing.T) {
 // written on it, and answering it would hand back the thing this exists not to send.
 func TestJoinAggregateRefusesTooManyGroups(t *testing.T) {
 	cat := joinFixture(t)
-	old := maxJoinGroups
-	maxJoinGroups = 1
-	defer func() { maxJoinGroups = old }()
+	capped := ownerCount(JoinInner)
+	capped.MaxGroups = 1
 
-	rows, err := cat.JoinAggregate(ownerCount(JoinInner), JoinLimits{}, nil, nil)
+	rows, err := cat.JoinAggregate(capped, JoinLimits{}, nil, nil)
 	if err == nil {
 		t.Fatalf("2 groups under a cap of 1 returned %v and no error", renderAgg(rows))
 	}
@@ -434,9 +433,15 @@ func TestJoinAggregateRefusesTooManyGroups(t *testing.T) {
 	}
 	// One group is under the cap and still answers.
 	one := ownerCount(JoinInner)
+	one.MaxGroups = 1
 	one.GroupCols = []GroupCol{{Attr: `"all"`}}
 	if _, err := cat.JoinAggregate(one, JoinLimits{}, nil, nil); err != nil {
 		t.Errorf("1 group under a cap of 1: %v", err)
+	}
+	// The same request without a cap of its own is well under the default, so the
+	// refusal above is the cap firing and not the query failing for some other reason.
+	if _, err := cat.JoinAggregate(ownerCount(JoinInner), JoinLimits{}, nil, nil); err != nil {
+		t.Errorf("the same 2-group request under the default cap: %v", err)
 	}
 }
 

@@ -298,7 +298,7 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 	// against: a width-only request may honestly fall back to client-side bucketing, where a
 	// filtered or named one may not.
 	form := aggSpecFormFor(aggs)
-	if err := c.refuseNamedAggregate(aggs, form); err != nil {
+	if err := c.refuseUnservableAggregate(aggs, form); err != nil {
 		return nil, err
 	}
 	// extended describes what the FRAME needs, which a bucket width alone is enough to widen.
@@ -363,7 +363,7 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 	// As in ArchiveAggregateBucketed: form is what the specs need and is what the refusal is
 	// read against, while the frame this opcode sends is always the extended one.
 	form := aggSpecFormFor(aggs)
-	if err := c.refuseNamedAggregate(aggs, form); err != nil {
+	if err := c.refuseUnservableAggregate(aggs, form); err != nil {
 		return nil, err
 	}
 	wire := form

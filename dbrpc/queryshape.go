@@ -337,6 +337,8 @@ func aggFuncName(f AggFunc) string {
 		return "min"
 	case db.AggMax:
 		return "max"
+	case db.AggList:
+		return "list"
 	}
 	return "agg" + strconv.Itoa(int(f))
 }
