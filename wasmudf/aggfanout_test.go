@@ -73,9 +73,9 @@ func fannedOut(t *testing.T, fn func()) bool {
 
 // aggSeq makes every registration in this file unique.
 //
-// db's aggregate registry is APPEND-ONLY -- there is no unregister, by design --
-// so a suite run with -count=2 would fail its second pass on "already registered"
-// if the names were literals. Worse, the second pass would be re-registering
+// db's RegisterAggregate fails rather than overwriting, so a suite run with
+// -count=2 would fail its second pass on "already registered" if the names were
+// literals. Worse, the second pass would be re-registering
 // against a Loader the first pass's cleanup had closed, so the surviving
 // registration would name a module that can no longer be instantiated.
 var aggSeq atomic.Int64

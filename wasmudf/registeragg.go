@@ -12,8 +12,7 @@ import (
 // It is an interface for the reason the scalar Registry is one: a test can hand
 // RegisterAggregate a registry it can inspect, which is the only way to assert
 // that loading registers the right name against the right aggregate without
-// depending on a process-wide table it cannot reset -- db's registry being
-// append-only, with no unregister, by design.
+// writing to the process-wide table every other test in this package shares.
 //
 // Unlike the scalar case there is no adapter waiting on a function that does not
 // exist yet: db.RegisterAggregate is here today, and DBRegistry calls it.
@@ -37,8 +36,9 @@ func (dbRegistry) RegisterAggregate(name string, agg db.Aggregate) error {
 // every static problem with the module is a returned error here, and a name is
 // only ever registered against a module that compiled, exports what it must,
 // speaks this ABI, instantiated, and produced an identity state that fits. db's
-// registry has no unregister, so registering something unproven is not a mistake
-// that can be taken back.
+// registry does take a withdrawal, but a name registered against an unproven
+// module is one queries reduce with until somebody withdraws it, which is a
+// window this order does not open.
 //
 // On a registration error the aggregate stays loaded in the Loader, reachable
 // through LookupAggregate, for the same reason a scalar UDF does: the usual cause

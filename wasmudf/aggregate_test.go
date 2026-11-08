@@ -690,11 +690,11 @@ func TestMergeRefusesAnAccumulatorFromAnotherAggregate(t *testing.T) {
 	}
 }
 
-// TestAnAggregateOutlivingItsLoaderFailsRatherThanCrashing, which it can, because db's registry
-// has no unregister.
+// TestAnAggregateOutlivingItsLoaderFailsRatherThanCrashing, which it can, because closing a
+// Loader withdraws nothing from db's registry.
 //
-// db's registry is append-only, so a registered aggregate CANNOT be withdrawn
-// when its Loader closes -- the registration outlives the thing that serves it.
+// The two are not wired together: a registration outlives the Loader that serves
+// it until somebody withdraws it by name.
 // A scalar UDF in that position returns ERROR with ReasonInstance; an aggregate
 // has no value to return, so it fails the query. What neither may do is take the
 // process down, which is what an unguarded call on a closed module would.

@@ -151,15 +151,24 @@ func validAggName(name string) bool {
 // RegisterAggregate registers agg under name, for use as AggSpec{Func: AggUser, UserFunc: name}.
 //
 // It fails rather than overwriting, so that what an aggregate means cannot depend on package
-// initialization order.
+// initialization order. A caller that MEANS to install over whatever is there says so, with
+// ReplaceAggregate.
 //
-// THERE IS NO UNREGISTER, and the reason is NOT the one that makes the scalar function registry
-// append-only. There, a compiled program captures the decision that a name was a UDF, programs are
-// cached, and withdrawing a registration would leave cached programs calling something that is
-// gone. Nothing of the sort applies here: an aggregate name is resolved once per query, so
-// withdrawing one would be perfectly well defined. It is append-only because nothing needs the
-// other thing, and an API with no caller is a maintenance cost with no return -- which is a reason
-// that would stop applying if a caller turned up, where the scalar registry's would not.
+// THIS REGISTRY OFFERS REPLACEMENT AND WITHDRAWAL AND THE SCALAR FUNCTION REGISTRY DOES NOT, and
+// the difference is where the decision is recorded. There, compiling an expression captures the
+// decision that a name was a UDF, along with its arity, and compiled programs are cached and
+// shared -- so withdrawing a scalar registration would leave cached programs calling something
+// that is gone. Nothing of the sort happens here. An aggregate name is resolved against this
+// registry once per query, when the reduction is set up (resolveAggregates, and the columnar
+// passes beside it), and nothing caches that resolution past the query that made it. Replacing or
+// removing a registration is therefore well defined, and ReplaceAggregate and UnregisterAggregate
+// do it.
+//
+// ARITY DOES NOT CONSTRAIN A REPLACEMENT, because an aggregate registration does not carry one. A
+// scalar registration declares min and max argument counts and every call site is checked against
+// them when the expression compiles; an AggSpec names exactly one argument attribute whatever the
+// aggregate is, so a replacement has no signature it could disagree with. What it has to keep is
+// Accumulator's laws, which CheckAggregate tests and no registration can check.
 func RegisterAggregate(name string, agg Aggregate) error {
 	if agg == nil {
 		return fmt.Errorf("RegisterAggregate(%q): nil aggregate: %w", name, ErrBadAggregate)
@@ -171,12 +180,7 @@ func RegisterAggregate(name string, agg Aggregate) error {
 	entry := aggEntry{name: name, agg: agg}
 	for {
 		cur := udafs.Load()
-		next := make(map[string]aggEntry, 8)
-		if cur != nil {
-			for k, v := range *cur {
-				next[k] = v
-			}
-		}
+		next := copyAggs(cur)
 		if prev, dup := next[folded]; dup {
 			return fmt.Errorf("RegisterAggregate(%q): registered as %q: %w", name, prev.name, ErrAggregateExists)
 		}
@@ -185,6 +189,105 @@ func RegisterAggregate(name string, agg Aggregate) error {
 			return nil
 		}
 	}
+}
+
+// ReplaceAggregate installs agg under name whether or not something is already registered there.
+// It is the overwrite RegisterAggregate refuses, for the caller holding aggregates somewhere
+// durable -- a table of stored modules an administrative command writes to -- which has to be able
+// to CORRECT one. Validation is RegisterAggregate's: a nil aggregate and a name no query could
+// refer to are both ErrBadAggregate, so nothing unusable reaches the registry by this door either.
+//
+// IT REGISTERS AN ABSENT NAME rather than requiring a present one, because its caller is applying
+// a stored definition and not editing a table: the command that writes a module and installs it
+// runs the same line whether or not this process has seen that name before, and demanding presence
+// would make every such caller write a lookup-then-branch that is also a race. A caller that wants
+// the name to be free uses RegisterAggregate, which says so by failing.
+//
+// THE NAME IS STORED AS GIVEN, so a replacement under a different casing than the registration it
+// replaces leaves ONE entry -- lookups fold case -- carrying the NEW spelling, which is what
+// RegisteredAggregates then reports. The spelling is diagnostics, and the useful thing to report
+// is how the aggregate that is installed was asked for, not how an earlier one was.
+//
+// A QUERY IN FLIGHT IS UNAFFECTED. A query resolves each name it uses to an Aggregate value once,
+// before it reduces anything, and runs against that value; a replacement that lands mid-scan
+// changes this map and reaches nothing already holding the old value. So a running query finishes
+// under the implementation it started with, and one group's rows are never split across two of
+// them -- which matters more than it sounds, because a half-and-half group is a wrong answer that
+// looks exactly like a right one.
+//
+// WHAT IT DOES CHANGE IS WHAT A LATER QUERY MEANS, mid-process and with no synchronization point
+// anywhere: two queries seconds apart, naming the same aggregate, can compute different things,
+// and nothing in either answer says so. That is the hazard, and it is inherent in being able to
+// correct a definition at all -- a caller that cares which definition produced a number has to
+// record that itself, because this registry holds only the current one.
+func ReplaceAggregate(name string, agg Aggregate) error {
+	if agg == nil {
+		return fmt.Errorf("ReplaceAggregate(%q): nil aggregate: %w", name, ErrBadAggregate)
+	}
+	if !validAggName(name) {
+		return fmt.Errorf("ReplaceAggregate(%q): not a name a query can refer to: %w", name, ErrBadAggregate)
+	}
+	folded := strings.ToLower(name)
+	entry := aggEntry{name: name, agg: agg}
+	for {
+		cur := udafs.Load()
+		next := copyAggs(cur)
+		next[folded] = entry
+		if udafs.CompareAndSwap(cur, &next) {
+			return nil
+		}
+	}
+}
+
+// UnregisterAggregate removes the registration of name, folding case as lookup does, and reports
+// whether there was one to remove. It is for the caller taking a stored aggregate out of service,
+// and it reports rather than returning nothing because "was it there" is the one thing that can
+// surprise a caller reconciling a stored set against this process.
+//
+// It does not validate the name: a name no query could refer to is a name nothing can be
+// registered under, so it is simply absent and the answer is false.
+//
+// A query in flight is unaffected, exactly as under ReplaceAggregate and for the same reason -- it
+// holds the Aggregate it resolved, not this map. A query naming the aggregate AFTERWARDS fails
+// with ErrNoSuchAggregate, the same answer a name that was never registered gets, since an unknown
+// aggregate fails a query rather than being answered undefined.
+func UnregisterAggregate(name string) bool {
+	folded := strings.ToLower(name)
+	for {
+		cur := udafs.Load()
+		if cur == nil {
+			return false
+		}
+		if _, ok := (*cur)[folded]; !ok {
+			return false
+		}
+		next := make(map[string]aggEntry, len(*cur))
+		for k, v := range *cur {
+			if k != folded {
+				next[k] = v
+			}
+		}
+		if udafs.CompareAndSwap(cur, &next) {
+			return true
+		}
+	}
+}
+
+// copyAggs returns a mutable copy of a published registry map, which is how each writer here
+// builds the version it tries to swap in: a published map is never written to, so a lookup is a
+// load and nothing else.
+func copyAggs(cur *map[string]aggEntry) map[string]aggEntry {
+	n := 8
+	if cur != nil && len(*cur) > n {
+		n = len(*cur)
+	}
+	next := make(map[string]aggEntry, n)
+	if cur != nil {
+		for k, v := range *cur {
+			next[k] = v
+		}
+	}
+	return next
 }
 
 // LookupAggregate finds a registration by name, case-insensitively.

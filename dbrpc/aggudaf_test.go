@@ -23,7 +23,7 @@ import (
 // argument in one request and checks that each column got its own answer -- which no amount of
 // guessing produces -- and a companion test asks for a name registered on neither side.
 //
-// Registration is append-only with no unregister, so every name here is unique to its test.
+// RegisterAggregate refuses a name that is taken, so every name here is unique to its test.
 
 // minInt and maxInt are two aggregates that disagree on every input but the degenerate one, so a
 // request naming both over one attribute distinguishes "the name crossed" from "the server
@@ -63,8 +63,8 @@ func (a *extremeIntAcc) Result() classad.Value {
 }
 
 // registerExtremes registers a fresh min/max pair under names unique to the caller and returns
-// them. Unique because RegisterAggregate fails rather than overwriting and has no unregister, so
-// two tests sharing a name would make the second depend on the first having run.
+// them. Unique because RegisterAggregate fails rather than overwriting, so two tests sharing a
+// name would make the second depend on the first having run.
 func registerExtremes(t *testing.T, suffix string) (minName, maxName string) {
 	t.Helper()
 	minName, maxName = "udafwire_lo_"+suffix, "udafwire_hi_"+suffix

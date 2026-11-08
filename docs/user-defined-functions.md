@@ -79,10 +79,14 @@ failing *aggregate* instead fails the whole query: one bad record is an ordinary
 outcome, but a group's answer depends on every row in it, so a half-accumulated
 state is a wrong answer that looks right.
 
-**Registration is append-only, so do it at start-up.** Registering a name twice
-fails rather than overwriting, nothing may shadow a built-in, and there is no
-unregister: compiling an expression records that a name was yours, and programs
-are cached and shared.
+**Registering a name twice fails rather than overwriting,** and nothing may
+shadow a built-in. A *function* registration is also permanent -- compiling an
+expression records that a name was yours, and programs are cached and shared --
+so register functions at start-up. An *aggregate* name is resolved once per
+query, so an aggregate registration can be replaced (`db.ReplaceAggregate`) or
+withdrawn (`db.UnregisterAggregate`); a query already running holds the
+aggregate it resolved and finishes under it, and the next query means the new
+one.
 
 **Names fold case,** like every function name in this language.
 
