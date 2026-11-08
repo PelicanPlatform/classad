@@ -177,7 +177,8 @@ func ints(ns ...int64) []classad.Value {
 }
 
 // mustRegister registers under a name unique to the test, since the registry is process-wide and
-// append-only: a shared name would make one test's failure depend on another having run.
+// RegisterAggregate refuses a name that is taken: a shared name would make one test's failure
+// depend on another having run.
 func mustRegister(t *testing.T, name string, agg Aggregate) string {
 	t.Helper()
 	if err := RegisterAggregate(name, agg); err != nil {
@@ -187,7 +188,7 @@ func mustRegister(t *testing.T, name string, agg Aggregate) string {
 }
 
 // registerOnce registers name unless it is already there, for a test that may run more than once in
-// a process (-count=2) against an append-only registry.
+// a process (-count=2) against a registry RegisterAggregate will not overwrite.
 func registerOnce(t *testing.T, name string, agg Aggregate) string {
 	t.Helper()
 	if _, ok := LookupAggregate(name); ok {
