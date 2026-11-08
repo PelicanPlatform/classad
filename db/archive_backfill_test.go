@@ -149,7 +149,7 @@ func TestArchiveAutoCompositeReachesSegmentsBeyondHorizon(t *testing.T) {
 			ad.Set("ProcId", int64(p))
 			ad.Set("Owner", "user")
 			ad.Set("Pad", strings.Repeat("p", 24))
-			if err := a.Append(ad); err != nil {
+			if err = a.Append(ad); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -162,9 +162,9 @@ func TestArchiveAutoCompositeReachesSegmentsBeyondHorizon(t *testing.T) {
 
 	for i := range 300 {
 		q := fmt.Sprintf("ClusterId == %d && ProcId == %d", i%300, i%20)
-		seq, err := a.QueryLimit(q, 1)
-		if err != nil {
-			t.Fatal(err)
+		seq, qerr := a.QueryLimit(q, 1)
+		if qerr != nil {
+			t.Fatal(qerr)
 		}
 		for range seq {
 		}
