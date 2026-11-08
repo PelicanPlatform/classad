@@ -24,12 +24,14 @@ func spineSource(n int) string {
 }
 
 // TestLongSpineParity pins the compiler's depth gate against the tree-walker's
-// recursion guard for the one shape whose length no longer costs the tree-walker
-// any depth. astHeight counts every node, so a long spine measures taller than
-// the depth the tree-walker reaches for it and the compiler delegates it whole.
+// recursion guard for the one shape whose length costs the tree-walker no
+// depth. astHeight counts every node, so a long spine measures taller than the
+// depth the tree-walker reaches for it and the compiler delegates it whole.
 // Delegation is conservative, not wrong: the delegated path IS the tree-walker,
 // so both answer the same, and that answer is the membership result rather than
-// an error.
+// an error. It is also the faster path here -- lowering a thousand-term spine to
+// native instructions costs an order of magnitude more to compile and evaluates
+// no quicker (see BenchmarkSpineCompile1000, BenchmarkSpineEval1000).
 func TestLongSpineParity(t *testing.T) {
 	ad, err := classad.Parse(`[X = 4000]`)
 	if err != nil {
