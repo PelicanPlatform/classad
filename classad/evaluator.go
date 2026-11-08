@@ -947,7 +947,8 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 	// predicate.go). Everything it cannot prove it reproduces exactly falls through to
 	// the ordinary Value comparison, from inside evaluateComparison, which resolves
 	// each operand ONCE whichever way it goes. This is the only hook: nested && / ||
-	// reach it once per conjunct through evaluateShortCircuit's existing recursion.
+	// reach it once per conjunct, through evaluateShortCircuit's descent into each
+	// spine node's operands.
 	if c := comparisonKind(op.Op); c != cmpNone && e.predicateEligible() {
 		return e.evaluateComparison(c, op)
 	}
@@ -1754,8 +1755,29 @@ func mapState(s logicalState) Value {
 // (for &&) or true (for ||) left operand decides the result outright; an error
 // left operand is an error; only a true/undefined (&&) or false/undefined (||)
 // left operand evaluates the right and applies the full three-valued logic.
+//
+// A left operand that is itself a && / || continues a left-deep spine -- the
+// shape "a || b || c || ..." parses into -- and the spine is folded iteratively
+// by evaluateSpine instead of recursed through, so a chain's length does not
+// count against the recursion-depth guard. Every other left operand is the
+// ordinary two-operand case, which takes the direct path here.
 func (e *Evaluator) evaluateShortCircuit(op *ast.BinaryOp) Value {
-	left := e.Evaluate(op.Left)
+	switch l := op.Left.(type) {
+	case *ast.BinaryOp:
+		if l.Op == "&&" || l.Op == "||" {
+			return e.evaluateSpine(op)
+		}
+	case *ast.ParenExpr:
+		// Parentheses are transparent, so they may be hiding a spine.
+		return e.evaluateSpine(op)
+	}
+	return e.combineShortCircuit(op, e.Evaluate(op.Left))
+}
+
+// combineShortCircuit applies one && / || node to its already-evaluated left
+// operand, evaluating the node's right operand only when the left does not
+// decide the result.
+func (e *Evaluator) combineShortCircuit(op *ast.BinaryOp, left Value) Value {
 	switch logicalView(left) {
 	case lsErr:
 		return NewErrorValue()
@@ -1773,6 +1795,65 @@ func (e *Evaluator) evaluateShortCircuit(op *ast.BinaryOp) Value {
 		return e.evaluateAnd(left, right)
 	}
 	return e.evaluateOr(left, right)
+}
+
+// spineInline is how many spine nodes evaluateSpine holds in its stack array
+// before it spills to the heap. Hand-written expressions sit far inside it, so
+// they fold without allocating; a machine-generated membership constraint runs
+// past it and spills, which its own evaluation cost dwarfs.
+const spineInline = 16
+
+// evaluateSpine evaluates a left-deep && / || spine by folding it left to
+// right, bottom node first, with no recursion between spine nodes.
+//
+// The fold is the recursive evaluation rearranged, not an approximation of it.
+// Evaluating the top node means evaluating its left operand -- the node below --
+// and combining the result with the top node's own operator, down to the
+// deepest node, whose left operand is not a spine node. So the value the deepest
+// node's left operand produces is the fold's first accumulator, and each node
+// from there up applies ITS OWN operator to the accumulator: a mixed spine such
+// as "(a || b) && c" combines with || then with &&, exactly as the recursion
+// does. A node whose accumulator already decides its result returns that result
+// without evaluating its right operand, and the fold carries that value to the
+// next node up, which is what the recursion hands its parent. An error
+// accumulator is an error at every node above it, so no right operand past it
+// is ever evaluated.
+//
+// Parentheses are transparent to evaluation, so they are peeled while walking
+// down: an explicitly parenthesised chain is the same chain.
+//
+// The recursion-depth guard keeps its job. A spine is a finite run of nodes in
+// one stored AST, so folding it cannot loop; every operand hanging off it is
+// still evaluated through Evaluate and still charges the depth its own nesting
+// needs, and a cyclic attribute reference reached through one still trips the
+// guard.
+func (e *Evaluator) evaluateSpine(op *ast.BinaryOp) Value {
+	var inline [spineInline]*ast.BinaryOp
+	spine := inline[:0]
+	node := op
+	var base ast.Expr
+	for {
+		spine = append(spine, node)
+		next := node.Left
+		for {
+			p, ok := next.(*ast.ParenExpr)
+			if !ok {
+				break
+			}
+			next = p.Inner
+		}
+		b, ok := next.(*ast.BinaryOp)
+		if !ok || (b.Op != "&&" && b.Op != "||") {
+			base = next
+			break
+		}
+		node = b
+	}
+	acc := e.Evaluate(base)
+	for i := len(spine) - 1; i >= 0; i-- {
+		acc = e.combineShortCircuit(spine[i], acc)
+	}
+	return acc
 }
 
 func (e *Evaluator) evaluateAnd(left, right Value) Value {
