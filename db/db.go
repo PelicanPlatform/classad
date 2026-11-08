@@ -468,6 +468,20 @@ type MaintainOptions struct {
 	// segments, so a table opts into the columnar count path once maintenance runs and stays
 	// covered as it grows. 0 leaves it off.
 	SchemaScanHotTopN int
+
+	// OnAutoTune, when set, is called with what the pass's auto-tuner changed -- once per
+	// pass, only when it changed something. Nil (the default) is the previous behaviour.
+	//
+	// It exists because the pass applied its decisions and then discarded them: Maintain
+	// read res.Changed to decide whether to persist and dropped the Changes. An index
+	// appearing or vanishing is the most consequential thing a background pass does -- a
+	// composite moves the index generation, so every sealed segment is rebuilt to carry it
+	// -- and nothing above this could say that it had happened, let alone which attribute
+	// or why. A caller that wants to log it had no way to be told.
+	//
+	// Called synchronously, on the maintenance goroutine, holding nothing the callback can
+	// reach. It must not call back into the table.
+	OnAutoTune func(AutoTuneResult) `json:"-"`
 }
 
 // DefaultArchiveIndexBackfillBytes is the per-pass index backfill budget when
@@ -508,6 +522,9 @@ func (db *DB) Maintain(opts MaintainOptions) {
 		})
 		if res.Changed {
 			db.saveIndexConfig() // persist auto add/drop (with provenance)
+			if opts.OnAutoTune != nil {
+				opts.OnAutoTune(res)
+			}
 		}
 	}
 	if db.c.MaintenanceStopping() {
