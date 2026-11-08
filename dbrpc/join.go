@@ -50,15 +50,7 @@ type JoinRequest struct {
 // is the failure this reports. A caller that must not emit a partial result should not commit
 // to its output until Join returns nil.
 func (c *Client) Join(ctx context.Context, jr JoinRequest, yield func(row string) bool) error {
-	o, feat := joinOpFor(jr, opJoin, opJoinChain, FeatJoin, FeatJoinChain)
-	if !c.SupportsNewer(feat) {
-		return ErrJoinUnsupported
-	}
-	err := c.streamEach(ctx, joinFrameOp(jr, o, false, false), yield)
-	if errors.Is(err, ErrBadRequest) {
-		return ErrJoinUnsupported
-	}
-	return err
+	return c.JoinStats(ctx, jr, yield, nil)
 }
 
 // joinOpFor picks the opcode and the feature a plan needs, from the plan alone.
@@ -83,18 +75,29 @@ func (c *Client) JoinRows(ctx context.Context, jr JoinRequest) ([]string, error)
 // joinFrameOp encodes a join request for either opcode. The plan is encoded ONCE here, so the
 // two ops cannot drift into two spellings of the same statement; opJoinWire's frame is this
 // one with a redact byte on the end.
-func joinFrameOp(jr JoinRequest, o op, withRedact, redact bool) func(uint64) []byte {
+//
+// wantStats appends the statistics byte, and only when the caller asked for them: a request
+// that does not ask is byte-for-byte the request every client has always sent, so a server
+// cannot tell a build that knows about the trailer from one that does not.
+func joinFrameOp(jr JoinRequest, o op, withRedact, redact, wantStats bool) func(uint64) []byte {
 	return func(id uint64) []byte {
 		b := appendJoinPlan(req(id, o), jr, joinOpCarriesChain(o))
 		if withRedact {
-			r := byte(0)
-			if redact {
-				r = 1
-			}
-			b = append(b, r)
+			b = putU8(b, boolByte(redact))
+		}
+		if wantStats {
+			b = putU8(b, 1)
 		}
 		return b
 	}
+}
+
+// readJoinStatsByte reads the trailing byte that asks for the statistics trailer. Absent on
+// every request from a client that predates it, which is why it is read as optional rather
+// than as part of the plan: a shorter frame is a well-formed request, not a malformed one.
+func readJoinStatsByte(r *reader) bool {
+	v, ok := r.optU8()
+	return ok && v != 0
 }
 
 // appendJoinPlan writes the plan itself, with the body layout named rather than derived from
@@ -178,6 +181,8 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 		return
 	}
 
+	wantStats := readJoinStatsByte(r)
+
 	var stats db.JoinStats
 	if qlog != nil {
 		defer func() {
@@ -215,6 +220,11 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 		}
 		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
 	}
+	// The statistics go out BEFORE whatever ends the stream, including before the error
+	// below: a client stops reading at an error, so a trailer written after one would never
+	// be seen -- and a join that stopped at a limit is the one whose access path a reader
+	// most wants to know.
+	writeJoinStats(reqID, wantStats, stats, write)
 	// A limit met part way through has already had rows sent, so it cannot be reported as a
 	// refusal. It goes out as an error AFTER them, which the streaming client surfaces on a
 	// partial result -- the alternative is a truncated join that reads as a complete one.
@@ -223,6 +233,18 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 		return
 	}
 	write(respHead(reqID, stStreamEnd))
+}
+
+// writeJoinStats sends the statistics trailer when the request asked for one. It is called at
+// the point the join has stopped producing rows and nowhere earlier: the counts are not final
+// until then, and a reader cannot tell an early reading from a final one.
+func writeJoinStats(reqID uint64, want bool, stats db.JoinStats, write func([]byte)) {
+	if !want {
+		return
+	}
+	if frame := joinStatsTrailer(reqID, stats); frame != nil {
+		write(frame)
+	}
 }
 
 // streamJoinWire serves opJoinWire: the same plan as opJoin, answered with wire-form rows
@@ -245,6 +267,7 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 		write(respBad(reqID))
 		return
 	}
+	wantStats := readJoinStatsByte(r)
 
 	var stats db.JoinStats
 	if qlog != nil {
@@ -313,6 +336,7 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 		rows++
 	}
 	flush()
+	writeJoinStats(reqID, wantStats, stats, write)
 	// A limit met part way through has already had rows sent, so it cannot be a refusal. It
 	// goes out as an error AFTER them, which the streaming client surfaces on a partial
 	// result -- the alternative is a truncated join that reads as a complete one.
@@ -617,11 +641,19 @@ type joinWireCatalog interface {
 // It returns ErrJoinWireUnsupported, before any row, when the stream is unavailable. An empty
 // stream means the join produced no rows; it never means the server could not answer.
 func (c *Client) JoinWire(ctx context.Context, jr JoinRequest, redact bool, yield func(row []byte) bool) error {
+	return c.joinWire(ctx, jr, redact, yield, nil)
+}
+
+// joinWire is JoinWire with the statistics report threaded through it; JoinWireStats is the
+// exported form. One body rather than two, so the two entry points cannot diverge in what
+// they do with a short stream.
+func (c *Client) joinWire(ctx context.Context, jr JoinRequest, redact bool, yield func(row []byte) bool, rep *JoinStatsReport) error {
 	o, feat := joinOpFor(jr, opJoinWire, opJoinChainWire, FeatJoinWire, FeatJoinChainWire)
+	wantStats := c.wantJoinStats(rep)
 	if !c.SupportsNewer(feat) {
 		return ErrJoinWireUnsupported
 	}
-	_, ch, strm, err := c.callStream(joinFrameOp(jr, o, true, redact))
+	_, ch, strm, err := c.callStream(joinFrameOp(jr, o, true, redact, wantStats))
 	if err != nil {
 		return err
 	}
@@ -651,6 +683,8 @@ func (c *Client) JoinWire(ctx context.Context, jr JoinRequest, redact bool, yiel
 						return nil
 					}
 				}
+			case stStreamJoinStats:
+				rep.take(body)
 			case stBadReq:
 				// A server too old to know the opcode rejects the request this way, and so
 				// does one whose catalog cannot serve wire rows, and so does a redacted

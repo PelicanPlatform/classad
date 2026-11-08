@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 6
+const ProtocolVersion = 7
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -170,6 +170,24 @@ const (
 	// engine wired to them -- so inferring one from the other would be the definite yes
 	// that turns out wrong.
 	FeatJoinAgg Feature = "joinagg"
+
+	// FeatJoinStats is the join's EXECUTION statistics, returned as a trailer on the join
+	// opcodes when the request asks for them (db.JoinStats: which access path each step
+	// took and why, what the planner priced the orientations at, and how much work it did).
+	// Postdates advertisement, so silence is a no.
+	//
+	// It must be a feature rather than a probe, and that is the whole point of it. The
+	// request byte is trailing and optional, so a server that does not know it answers the
+	// query perfectly well and simply sends no trailer -- which is indistinguishable, at the
+	// client, from a server that ran the join and used no index. Those are different facts:
+	// one is "nobody told me", the other is "it scanned". A client that could not tell them
+	// apart would reintroduce, across the wire, exactly the ambiguity db.JoinStats.ProbeWhy
+	// exists to remove inside the store.
+	//
+	// Distinct from FeatJoinExplain, which answers how a join WOULD run without running it.
+	// A plan and the run that followed it are different questions, and a store that can
+	// state the first need not have been taught to report the second.
+	FeatJoinStats Feature = "joinstats"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -208,6 +226,7 @@ var serverFeatures = []Feature{
 	FeatJoinExplain,
 	FeatTypedGroups,
 	FeatJoinAgg,
+	FeatJoinStats,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar
@@ -271,6 +290,16 @@ func (s *Server) SessionAttrs() map[string]string {
 		// that then fails.
 		if f == FeatJoinAgg {
 			if _, ok := s.cat.(joinAggCatalog); !ok {
+				continue
+			}
+		}
+		// The statistics ride the join opcodes, so a server with no catalog to join
+		// against has no join to report on. Gated on the same capability FeatJoin is, and
+		// on nothing more: filling the statistics is not a separate ability the catalog
+		// may lack -- the join fills them to decide what it is doing, and these handlers
+		// write what it filled whenever a request asks.
+		if f == FeatJoinStats {
+			if _, ok := s.cat.(joinCatalog); !ok {
 				continue
 			}
 		}

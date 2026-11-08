@@ -665,7 +665,7 @@ func (c *Client) ExplainJoin(ctx context.Context, jr JoinRequest) (*db.JoinExpla
 		return nil, ErrJoinUnsupported
 	}
 	o, _ := joinOpFor(jr, opJoinExplain, opJoinChainExplain, FeatJoinExplain, FeatJoinExplain)
-	status, body, err := c.callCtx(ctx, joinFrameOp(jr, o, false, false))
+	status, body, err := c.callCtx(ctx, joinFrameOp(jr, o, false, false, false))
 	if err != nil {
 		return nil, err
 	}

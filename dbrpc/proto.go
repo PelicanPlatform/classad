@@ -344,8 +344,12 @@ const (
 	// [kind u8][limit i32][maxHash i32][maxPairs i32][maxRows i32]
 	//   [lTable][lAlias][lConstraint][lNAttrs i32]{[attr]}
 	//   [rTable][rAlias][rConstraint][rNAttrs i32]{[attr]}
-	//   [nCond i32]{[expr]}[nPost i32]{[expr]}[nEqui i32]{[left][right]}
-	//     -> stream of [adText]
+	//   [nCond i32]{[expr]}[nPost i32]{[expr]}[nEqui i32]{[left][right]}[stats u8]
+	//     -> stream of [adText], then a stStreamJoinStats trailer when stats asked for one
+	//
+	// The stats byte is trailing and optional: a client that shipped before it sends a
+	// shorter frame, which readJoinRequest reads unchanged. It asks the server to say how it
+	// ran the join -- which access path, and why -- and costs one frame per query.
 	opJoin op = 69
 
 	// opQueryValues streams matching records as TYPED, EVALUATED value batches, column-major
@@ -402,8 +406,8 @@ const (
 	//   [fromTable][fromAlias][fromConstraint][fromNAttrs i32]{[attr]}
 	//   [nPost i32]{[expr]}
 	//   [nSteps i32]{[kind u8][table][alias][constraint][nAttrs i32]{[attr]}
-	//                [nCond i32]{[expr]}[nEqui i32]{[rowHalf][tableHalf]}}
-	//     -> stream of [adText]
+	//                [nCond i32]{[expr]}[nEqui i32]{[rowHalf][tableHalf]}}[stats u8]
+	//     -> stream of [adText], then a stStreamJoinStats trailer when stats asked for one
 	//
 	// The two halves of an equality are in DIFFERENT scopes, and the wire carries them that
 	// way: the table half is a bare path over the step's own table, and the row half is
@@ -411,7 +415,8 @@ const (
 	opJoinChain op = 72
 
 	// opJoinChainWire is opJoinChain with its rows in WIRE FORM, batched many per frame:
-	// the request frame is opJoinChain's with a redact byte appended, and the reply is
+	// the request frame is opJoinChain's with a redact byte appended (then the optional
+	// stats byte, which follows the redact byte on both wire opcodes), and the reply is
 	// opJoinWire's.
 	opJoinChainWire op = 73
 
@@ -530,10 +535,10 @@ const (
 	//
 	// [chain u8][join plan: opJoin's body, or opJoinChain's when chain]
 	//   [maxGroups i32][maxListValues i32]
-	//   [nGroup i32]{[attr][width u64]}[nAgg i32]{[func u8][arg][filter][name]}
+	//   [nGroup i32]{[attr][width u64]}[nAgg i32]{[func u8][arg][filter][name]}[stats u8]
 	//     -> stream of [nRows i32]{[flags u8][group cell]xnGroup[agg cell]xnAgg
 	//                              (flags&1: [nElided i32]{[aggIdx i32][elided i32]})}
-	//        then stStreamEnd
+	//        then a stStreamJoinStats trailer when stats asked for one, then stStreamEnd
 	//
 	// The group cells are tagged VALUES, as opAggregateTyped's are: there is no older peer
 	// to send the rendered text to, so the reply that needs no parse-back is the only one.
@@ -738,6 +743,15 @@ const (
 	stStreamEnd    int32 = 2  // end of a stream (no payload)
 	stStreamStats  int32 = 3  // a scan-stats trailer (ScanStats), sent just before stStreamEnd by a *Stats op
 	stStreamCursor int32 = 4  // a resume cursor, sent just before stStreamEnd by a paginated op
+	// stStreamJoinStats is a join's execution statistics (db.JoinStats as JSON), sent by a
+	// join opcode that was asked for them, after the last row and before whatever ends the
+	// stream -- the terminator, or the error a limit met part way through produces.
+	//
+	// Its own status rather than stStreamStats, which carries a differently shaped payload.
+	// The two could not collide, since a client knows which op it issued, but a status whose
+	// payload depends on the request is the kind of thing that is read with the wrong decoder
+	// exactly once.
+	stStreamJoinStats int32 = 5
 )
 
 // frameStatus reads the status field of a response frame (bytes 8..12).
@@ -825,6 +839,17 @@ func (r *reader) optI32() (int32, bool) {
 		return 0, false
 	}
 	return r.i32(), true
+}
+
+// optU8 reads a trailing byte that a request MAY carry, reporting whether it was there. It is
+// optI32 for a flag: an opcode that shipped without the byte is still sent by older clients,
+// and refusing their shorter frame as malformed would refuse a request that is well formed.
+// It never sets err, so a short frame stays readable.
+func (r *reader) optU8() (uint8, bool) {
+	if r.err != nil || len(r.b) < 1 {
+		return 0, false
+	}
+	return r.u8(), true
 }
 
 func (r *reader) u8() uint8 {
