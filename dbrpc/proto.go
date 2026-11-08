@@ -492,6 +492,52 @@ const (
 	opAggregateTyped op = 78
 	// [name][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name]}[stats u8]
 	opArchiveAggregateTyped op = 79
+
+	// opJoinAgg is a GROUP BY over a join's rows, reduced in the store: the join opcodes'
+	// plan followed by the reduction, answered with one row per GROUP.
+	//
+	// It is the only form of the join whose reply does not scale with the join's row count,
+	// and the reason it exists is that every network caller was obliged to do the reduction
+	// itself -- which means taking the rows. Over a jobs/history join the grouped reply is
+	// between 244x and 3754x smaller than the rows it reduces, and the ratio doubles with
+	// every doubling of the join's expansion, because the numerator scales with joined rows
+	// and the denominator does not.
+	//
+	// REDUCED SERVER-SIDE ONLY. There is no partial-reduction form in which the server
+	// sends per-group partials for the client to merge, and that is not a simplification
+	// deferred: it does not help the queries this is for. A caller whose grouping key is the
+	// ENTITY -- one group per job -- gets one partial per job, which is one row per job,
+	// which is the row stream again. And AVG and COUNT(DISTINCT) do not combine from
+	// partials without each becoming a different thing on the wire than it is in the API.
+	//
+	// THE REPLY BATCHES GROUPS MANY PER FRAME, like opJoinWire and unlike the single-table
+	// aggregate opcodes, which send one frame per group. One frame per group is affordable
+	// when a hundred thousand groups is a query gone wrong; it is not affordable here, where
+	// one group per job is the point and a caller may legitimately ask for a million.
+	//
+	// THE BODY LAYOUT IS NAMED BY A LEADING BYTE rather than by the opcode. opJoin and
+	// opJoinChain are two opcodes because opJoin shipped before chains existed and its body
+	// is two sides, so an older server reading a third would not find one. This opcode ships
+	// knowing about both, so there is no older peer whose frame it would be changing, and a
+	// chain is a flag rather than opcode 81. A server built without chains still refuses a
+	// chain body, and a client still asks FeatJoinChain before sending one.
+	//
+	// The reduction's own caps ride in the frame: a cap on the groups the answer may carry
+	// and a cap on a list-valued aggregate's list. The second is why a list-valued aggregate
+	// is reachable through this opcode and no other -- an aggregate that returns the matched
+	// values needs somewhere to say how many of them, and none of the older aggregate frames
+	// has a field for it (see db.AggList).
+	//
+	// [chain u8][join plan: opJoin's body, or opJoinChain's when chain]
+	//   [maxGroups i32][maxListValues i32]
+	//   [nGroup i32]{[attr][width u64]}[nAgg i32]{[func u8][arg][filter][name]}
+	//     -> stream of [nRows i32]{[flags u8][group cell]xnGroup[agg cell]xnAgg
+	//                              (flags&1: [nElided i32]{[aggIdx i32][elided i32]})}
+	//        then stStreamEnd
+	//
+	// The group cells are tagged VALUES, as opAggregateTyped's are: there is no older peer
+	// to send the rendered text to, so the reply that needs no parse-back is the only one.
+	opJoinAgg op = 80
 )
 
 // joinOpCarriesChain reports whether an opcode's body is a chain of steps rather than a pair
@@ -675,6 +721,8 @@ func (o op) String() string {
 		return "AggregateTyped"
 	case opArchiveAggregateTyped:
 		return "ArchiveAggregateTyped"
+	case opJoinAgg:
+		return "JoinAggregate"
 	}
 	return "op(unknown)"
 }

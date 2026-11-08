@@ -85,28 +85,7 @@ func (c *Client) JoinRows(ctx context.Context, jr JoinRequest) ([]string, error)
 // one with a redact byte on the end.
 func joinFrameOp(jr JoinRequest, o op, withRedact, redact bool) func(uint64) []byte {
 	return func(id uint64) []byte {
-		b := append(req(id, o), byte(jr.Spec.Kind))
-		b = putI32(b, int32(jr.Spec.Limit))
-		b = putI32(b, int32(jr.Limits.MaxHashRows))
-		b = putI32(b, int32(jr.Limits.MaxPairs))
-		b = putI32(b, int32(jr.Limits.MaxRows))
-		b = putJoinSide(b, jr.Spec.Left)
-		if joinOpCarriesChain(o) {
-			b = putStrs(b, jr.Spec.Post)
-			b = putI32(b, int32(len(jr.Spec.Steps)))
-			for i := range jr.Spec.Steps {
-				st := &jr.Spec.Steps[i]
-				b = append(b, byte(st.Kind))
-				b = putJoinSide(b, st.Side)
-				b = putStrs(b, st.Cond)
-				b = putJoinEqui(b, st.Equi)
-			}
-		} else {
-			b = putJoinSide(b, jr.Spec.Right)
-			b = putStrs(b, jr.Spec.Cond)
-			b = putStrs(b, jr.Spec.Post)
-			b = putJoinEqui(b, jr.Spec.Equi)
-		}
+		b := appendJoinPlan(req(id, o), jr, joinOpCarriesChain(o))
 		if withRedact {
 			r := byte(0)
 			if redact {
@@ -116,6 +95,36 @@ func joinFrameOp(jr JoinRequest, o op, withRedact, redact bool) func(uint64) []b
 		}
 		return b
 	}
+}
+
+// appendJoinPlan writes the plan itself, with the body layout named rather than derived from
+// an opcode. It is the mirror of readJoinRequest, which takes the same bool for the same
+// reason: an opcode that carries a plan as part of a LARGER request -- opJoinAgg, whose body
+// continues with the reduction -- has no entry in joinOpCarriesChain and says which layout it
+// is sending instead.
+func appendJoinPlan(b []byte, jr JoinRequest, chain bool) []byte {
+	b = append(b, byte(jr.Spec.Kind))
+	b = putI32(b, int32(jr.Spec.Limit))
+	b = putI32(b, int32(jr.Limits.MaxHashRows))
+	b = putI32(b, int32(jr.Limits.MaxPairs))
+	b = putI32(b, int32(jr.Limits.MaxRows))
+	b = putJoinSide(b, jr.Spec.Left)
+	if chain {
+		b = putStrs(b, jr.Spec.Post)
+		b = putI32(b, int32(len(jr.Spec.Steps)))
+		for i := range jr.Spec.Steps {
+			st := &jr.Spec.Steps[i]
+			b = append(b, byte(st.Kind))
+			b = putJoinSide(b, st.Side)
+			b = putStrs(b, st.Cond)
+			b = putJoinEqui(b, st.Equi)
+		}
+		return b
+	}
+	b = putJoinSide(b, jr.Spec.Right)
+	b = putStrs(b, jr.Spec.Cond)
+	b = putStrs(b, jr.Spec.Post)
+	return putJoinEqui(b, jr.Spec.Equi)
 }
 
 func putJoinEqui(b []byte, eq []db.JoinEqui) []byte {
@@ -506,8 +515,24 @@ func refusePrivateJoinRef(reqID uint64, spec db.JoinSpec, includePrivate bool, w
 	if includePrivate {
 		return false
 	}
-	aliases := joinAliases(spec)
-	for _, src := range joinExprs(spec) {
+	return refusePrivateAliasExprs(reqID, joinAliases(spec), joinExprs(spec), includePrivate, write)
+}
+
+// refusePrivateAliasExprs is the alias-qualified private-attribute gate over an arbitrary set
+// of expressions evaluated against a composite row. refusePrivateJoinRef is this over the
+// plan's own expressions; a join aggregate runs it a second time over the GROUP BY columns and
+// the aggregate arguments and filters, which are expressions over the same row and are not in
+// the plan.
+//
+// Those are worth more to a caller than a condition is. A condition that reaches a private
+// attribute is an oracle -- the value does not come back, the caller narrows it down by asking
+// repeatedly. A GROUP BY column that reaches one IS the value: the group's label is what the
+// expression evaluated to, so the aggregate would report it directly.
+func refusePrivateAliasExprs(reqID uint64, aliases, srcs []string, includePrivate bool, write func([]byte)) bool {
+	if includePrivate {
+		return false
+	}
+	for _, src := range srcs {
 		if strings.TrimSpace(src) == "" {
 			continue
 		}
