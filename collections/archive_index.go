@@ -39,7 +39,9 @@ import (
 //	         keysBlob;
 //	         exactN uint32; exactKeyOff [exactN+1] uint32; exactBmOff [exactN] uint32;
 //	         exactKeysBlob   -- exact-case keys (sorted) for =?=/=!=; a case-uniform
-//	         bucket's exact key reuses its folded bmOff (no duplicate payload);
+//	         bucket's exact key reuses its folded bmOff (no duplicate payload). exactN ==
+//	         exactRunMirrorsFolded (v12) replaces the four arrays with that one word: the
+//	         folded run IS the exact run, and the reader searches it instead;
 //	         bloomK uint32; bloomM uint32; bloom [bloomM/64] uint64  (v5) -- categorical
 //	         membership filter over the folded keys. A miss on every probe value lets a
 //	         query skip binary-searching (and paging) the sorted key blob for that probe;
@@ -63,7 +65,7 @@ import (
 // simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 11         // v11: composite (multi-column) index section
+	sidecarVersion = 12         // v12: exact-case run elided when it mirrors the folded run
 
 	// sidecarMinVersion is the oldest layout still read. v9 is byte-for-byte v10; it differs only in
 	// what its value postings hold. A v9 builder put a negative number stored as unary minus over a
@@ -86,6 +88,31 @@ const (
 	// plus the bloom already resolve equality cheaply, and the MPH's per-key overhead would
 	// not pay for itself.
 	mphNDVThreshold = 4096
+
+	// exactRunMirrorsFolded is the exactN sentinel for a categorical block whose exact-case
+	// run would restate the folded run byte for byte -- same keys, same order, same bitmap
+	// offsets -- which is what happens when every bucket is case-uniform AND already spelled
+	// in its folded (lower-case) form. That is the ordinary shape of a job id, a hostname, a
+	// path or a username, and writing the run out cost a second copy of every key plus eight
+	// bytes of offsets per key: for a 400k-record history keyed on GlobalJobId, more than a
+	// third of the whole index. The marker says "search the folded arrays", so the exact run
+	// costs four bytes and nothing is lost: every stored spelling is its own folded key, and
+	// a probe carrying any upper case simply fails to find itself there, which is what =?=
+	// asks for. A block that does not mirror writes the run exactly as before.
+	//
+	// Not every key gets this. A per-key back-reference would also dedup the lower-case keys
+	// of a mixed-case attribute, but it costs four bytes for EVERY key (including all of the
+	// ones this marker gets for free) and puts an indirection inside every =?= binary search,
+	// to win only on an attribute that is mostly-but-not-quite lower-case. The all-or-nothing
+	// marker is the cheap half of that trade.
+	//
+	// sidecarMinVersion does not move for this. A v9/v10/v11 sidecar predates the marker and
+	// cannot contain it, so it is read exactly as before; only a block that declares v12 is
+	// ever asked whether its exact run is a marker, and the reader decides that from the
+	// bytes rather than from the version. The other direction is the usual one: an older
+	// binary refuses a v12 sidecar outright and rebuilds it, which is what it already does
+	// for every format addition.
+	exactRunMirrorsFolded = 0xFFFFFFFF
 )
 
 // writeSidecarIndex serializes si to path (v2 sorted runs) and fsyncs it. si is
@@ -136,6 +163,7 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		bmOffs                []uint32
 		exKeys                []string // exact-case keys (sorted) -> exBmOffs (for =?=/=!=)
 		exBmOffs              []uint32
+		exMirrors             bool      // exact run restates the folded run: write the marker
 		stats                 *segStats // full summary (bloom, min/max, top-N, ndv, HLL)
 	}
 	type valBlk struct {
@@ -203,7 +231,8 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		if offErr != nil {
 			return nil, offErr
 		}
-		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs, &cp.stats})
+		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs,
+			exactRunIsFolded(keys, bmOffs, exKeys, exBmOffs), &cp.stats})
 	}
 	sort.Slice(catBlks, func(i, j int) bool { return catBlks[i].id < catBlks[j].id })
 
@@ -276,8 +305,10 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 	b = appendU32(b, uint32(len(catBlks)))
 	catSlot := make([]int, len(catBlks))
 	catStatsSlot := make([]int, len(catBlks))
-	for i, cb := range catBlks {
-		b = appendU32(b, cb.id)
+	// By index: catBlk is wide enough that copying one per iteration is worth avoiding, and
+	// these loops only read a few fields of it.
+	for i := range catBlks {
+		b = appendU32(b, catBlks[i].id)
 		catSlot[i] = len(b)
 		b = appendU32(b, 0)
 		catStatsSlot[i] = len(b)
@@ -313,7 +344,8 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		compSlot[i] = len(b)
 		b = appendU32(b, 0)
 	}
-	for i, cb := range catBlks {
+	for i := range catBlks {
+		cb := &catBlks[i]
 		binary.LittleEndian.PutUint32(b[catSlot[i]:], uint32(len(b)))
 		b = appendU32(b, cb.excOff)
 		b = appendU32(b, cb.postedOff) // presence: is/isnt undefined
@@ -333,22 +365,27 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		}
 		b = append(b, blob...)
 		// Exact-case run immediately after the folded keys blob: exactN;
-		// exactKeyOff[exactN+1]; exactBmOff[exactN]; exactKeysBlob.
-		b = appendU32(b, uint32(len(cb.exKeys)))
-		var exBlob []byte
-		exKeyOffs := make([]uint32, len(cb.exKeys)+1)
-		for j, k := range cb.exKeys {
-			exKeyOffs[j] = uint32(len(exBlob))
-			exBlob = append(exBlob, k...)
+		// exactKeyOff[exactN+1]; exactBmOff[exactN]; exactKeysBlob -- or, when it would
+		// restate the run just written, the exactRunMirrorsFolded marker alone.
+		if cb.exMirrors {
+			b = appendU32(b, exactRunMirrorsFolded)
+		} else {
+			b = appendU32(b, uint32(len(cb.exKeys)))
+			var exBlob []byte
+			exKeyOffs := make([]uint32, len(cb.exKeys)+1)
+			for j, k := range cb.exKeys {
+				exKeyOffs[j] = uint32(len(exBlob))
+				exBlob = append(exBlob, k...)
+			}
+			exKeyOffs[len(cb.exKeys)] = uint32(len(exBlob))
+			for _, o := range exKeyOffs {
+				b = appendU32(b, o)
+			}
+			for _, o := range cb.exBmOffs {
+				b = appendU32(b, o)
+			}
+			b = append(b, exBlob...)
 		}
-		exKeyOffs[len(cb.exKeys)] = uint32(len(exBlob))
-		for _, o := range exKeyOffs {
-			b = appendU32(b, o)
-		}
-		for _, o := range cb.exBmOffs {
-			b = appendU32(b, o)
-		}
-		b = append(b, exBlob...)
 		// Categorical bloom (v5), immediately after the exact-case run: bloomK; bloomM;
 		// bloom words. bloomM==0 marks "no filter". Reuses the filter built at seal.
 		if cb.stats.bloom != nil && cb.stats.bloom.m > 0 {
@@ -430,6 +467,25 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 	// and never touches this tail, so the footer is transparent to the lazy mmap reader.
 	b = appendU32(b, crc32.Checksum(b, crcTable))
 	return b, nil
+}
+
+// exactRunIsFolded reports whether a categorical block's exact-case run would be a
+// byte-for-byte restatement of its folded run, which is what the exactRunMirrorsFolded
+// marker stands in for. Both runs are sorted, so comparing them index by index is the whole
+// test: it fails for a spelling that differs from its folded key in any position, and for a
+// folded key with two spellings, which makes the runs different lengths. The bitmap offsets
+// are compared too -- they already alias for a case-uniform bucket, but the marker promises
+// the reader the folded bmOff array verbatim, and nothing here may promise that on a hunch.
+func exactRunIsFolded(keys []string, bmOffs []uint32, exKeys []string, exBmOffs []uint32) bool {
+	if len(exKeys) != len(keys) || len(exBmOffs) != len(bmOffs) {
+		return false
+	}
+	for i := range keys {
+		if exKeys[i] != keys[i] || exBmOffs[i] != bmOffs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // sidecarCRCValid recomputes the CRC-32C footer and reports whether it matches. A false

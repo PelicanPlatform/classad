@@ -461,22 +461,34 @@ func (si *mmapSegIndex) prefixKeyCount(up usableProbe) (int, bool) {
 	return to - from, true
 }
 
-// catFindExact binary-searches the exact-case key run (=?=/=!=) for an exact spelling.
-// The run sits immediately after the folded keys blob: its offset is blobBase plus the
-// folded blob's length (the last folded keyOff).
-func (si *mmapSegIndex) catFindExact(attrOff uint32, key string) (bmOff uint32, ok bool) {
+// catExactRun locates the exact-case key run (=?=/=!=) of a categorical attr block. The run
+// sits immediately after the folded keys blob, and since v12 a block whose run would restate
+// that blob writes the exactRunMirrorsFolded marker in place of the four arrays: the folded
+// run then IS the exact run, and the bases returned are its own. So every caller searches or
+// walks the same three arrays without caring which layout it got. end is the first byte past
+// the run, where the bloom begins.
+//
+// Deliberately the only place that knows the marker: the walk to the bloom, the =?= search
+// and the canonical-value iteration all reach the run through here, because three copies of
+// a layout rule are three places for the next format addition to be missed.
+func (si *mmapSegIndex) catExactRun(attrOff uint32) (n, keyOffBase, bmOffBase, blobBase, end uint32) {
 	d := si.data
-	n := le32(d, attrOff+8)
-	keyOffBase := attrOff + 12
-	bmOffBase := keyOffBase + (n+1)*4
-	blobBase := bmOffBase + n*4
-	foldedBlobLen := le32(d, keyOffBase+n*4) // keyOff[n]
-	exOff := blobBase + foldedBlobLen
-
+	fn, fKeyOffBase, fBmOffBase, fBlobBase := si.catKeyBases(attrOff)
+	exOff := fBlobBase + le32(d, fKeyOffBase+fn*4) // + folded blob length (keyOff[n])
 	exN := le32(d, exOff)
+	if exN == exactRunMirrorsFolded {
+		return fn, fKeyOffBase, fBmOffBase, fBlobBase, exOff + 4
+	}
 	exKeyOffBase := exOff + 4
 	exBmOffBase := exKeyOffBase + (exN+1)*4
 	exBlobBase := exBmOffBase + exN*4
+	return exN, exKeyOffBase, exBmOffBase, exBlobBase, exBlobBase + le32(d, exKeyOffBase+exN*4)
+}
+
+// catFindExact binary-searches the exact-case key run (=?=/=!=) for an exact spelling.
+func (si *mmapSegIndex) catFindExact(attrOff uint32, key string) (bmOff uint32, ok bool) {
+	d := si.data
+	exN, exKeyOffBase, exBmOffBase, exBlobBase, _ := si.catExactRun(attrOff)
 	lo, hi := 0, int(exN)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -495,20 +507,10 @@ func (si *mmapSegIndex) catFindExact(attrOff uint32, key string) (bmOff uint32, 
 }
 
 // catBloomOff returns the file offset of the categorical bloom block (bloomK) within a
-// cat attr block: it sits immediately after the exact-case run. Mirrors catFindExact's
-// walk to the exact run, then skips the exact blob.
+// cat attr block: it sits immediately after the exact-case run.
 func (si *mmapSegIndex) catBloomOff(attrOff uint32) uint32 {
-	d := si.data
-	n := le32(d, attrOff+8)
-	keyOffBase := attrOff + 12
-	bmOffBase := keyOffBase + (n+1)*4
-	blobBase := bmOffBase + n*4
-	exOff := blobBase + le32(d, keyOffBase+n*4) // + folded blob length (keyOff[n])
-	exN := le32(d, exOff)
-	exKeyOffBase := exOff + 4
-	exBmOffBase := exKeyOffBase + (exN+1)*4
-	exBlobBase := exBmOffBase + exN*4
-	return exBlobBase + le32(d, exKeyOffBase+exN*4) // + exact blob length (exKeyOff[exN])
+	_, _, _, _, end := si.catExactRun(attrOff)
+	return end
 }
 
 // catBloomAllAbsent reports whether the categorical bloom proves EVERY key definitely
@@ -570,15 +572,7 @@ func (si *mmapSegIndex) catCanonicalValues(id uint32, add func(string) bool) boo
 	if !ok {
 		return true
 	}
-	n := le32(d, attrOff+8)
-	keyOffBase := attrOff + 12
-	bmOffBase := keyOffBase + (n+1)*4
-	blobBase := bmOffBase + n*4
-	exOff := blobBase + le32(d, keyOffBase+n*4) // + folded blob length
-	exN := le32(d, exOff)
-	exKeyOffBase := exOff + 4
-	exBmOffBase := exKeyOffBase + (exN+1)*4
-	exBlobBase := exBmOffBase + exN*4
+	exN, exKeyOffBase, _, exBlobBase, _ := si.catExactRun(attrOff)
 	for i := uint32(0); i < exN; i++ {
 		ks := exBlobBase + le32(d, exKeyOffBase+i*4)
 		ke := exBlobBase + le32(d, exKeyOffBase+(i+1)*4)
