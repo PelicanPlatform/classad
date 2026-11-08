@@ -267,18 +267,18 @@ func TestNDVAccuracyAgainstGroundTruth(t *testing.T) {
 func TestNDVSampledProfileError(t *testing.T) {
 	t.Parallel()
 	cat, val := ndvIndexOpts()
-	const n = 20000 // past maxDistinctSample, which is where the cap bites
+	const n = 20000 // far past defaultSampleMax, which is where the sample stops keeping up
 	c := New(Options{Shards: 1, SegmentSize: 1 << 20, CategoricalAttrs: cat, ValueAttrs: val})
 	ndvFillCollection(t, c, n)
 	c.Reindex()
 
-	profiles := c.profileAttrs(maxDistinctSample)
+	profiles := c.profileAttrs(defaultSampleMax)
 	for _, a := range ndvMeasuredAttrs {
 		truth, _, _ := ndvOracle(t, c, a.attr)
 		p := profiles[strings.ToLower(a.attr)]
 		sampled, capped, present := 0, false, 0
 		if p != nil {
-			sampled, capped, present = len(p.distinct), p.capped, p.present
+			sampled, capped, present = len(p.distinct), p.lowerBound(), p.present
 		}
 		est, _ := c.AttrNDV(a.attr)
 		t.Logf("%-14s truth=%-6d sampled=%-6d capped=%-5v sample_present=%-5d err=%+8.2f%%   index=%-6d err=%+7.2f%%",
@@ -287,22 +287,31 @@ func TestNDVSampledProfileError(t *testing.T) {
 		if capped && sampled > truth {
 			t.Errorf("%s: a capped sample is a lower bound but %d > %d", a.attr, sampled, truth)
 		}
+		// The flag has to hold at the size the auto-tuner actually runs at, which is this
+		// one. A count short of the truth and not flagged is the whole failure being
+		// measured here; the reverse -- flagged and exact -- is allowed, since a lower
+		// bound that happens to be tight is still a lower bound.
+		if sampled < truth && !capped {
+			t.Errorf("%s: %d of %d distinct values reported as the count, unflagged", a.attr, sampled, truth)
+		}
 	}
 
-	// What the Capped flag can and cannot catch. It is raised by the DISTINCT-SET
-	// ceiling, which is reached only by taking more samples than the ceiling allows
-	// distinct values -- so at the sample size the auto-tuner uses it cannot be raised at
-	// all, and the badly short count above goes out unflagged. Raising the sample size is
-	// what makes it fire. The error it misses is the error on exactly the high-cardinality
-	// keys a join is made on, which is why the flag is necessary and not sufficient.
+	// What the flag is worth as the sample grows. The sampler is byte-bounded as well as
+	// count-bounded, so asking for more ads stops helping long before the count catches
+	// up: the error on a per-slot attribute stays enormous at every size, and the flag is
+	// what keeps that from being read as a number.
 	truth, _, _ := ndvOracle(t, c, "Name")
-	for _, sampleMax := range []int{maxDistinctSample, 4 * maxDistinctSample, 16 * maxDistinctSample} {
+	for _, sampleMax := range []int{defaultSampleMax, 4 * defaultSampleMax, 16 * defaultSampleMax} {
 		p := c.profileAttrs(sampleMax)[strings.ToLower("Name")]
 		if p == nil {
 			t.Fatal("Name is in every sampled ad")
 		}
 		t.Logf("Name sampleMax=%-6d sampled_ads=%-6d distinct=%-6d capped=%-5v err=%+8.2f%%",
-			sampleMax, p.present, len(p.distinct), p.capped, relErrPct(uint64(len(p.distinct)), truth))
+			sampleMax, p.present, len(p.distinct), p.lowerBound(), relErrPct(uint64(len(p.distinct)), truth))
+		if !p.lowerBound() {
+			t.Errorf("Name at sampleMax=%d: %d of %d distinct values reported as the count, unflagged",
+				sampleMax, len(p.distinct), truth)
+		}
 	}
 }
 

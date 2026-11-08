@@ -151,10 +151,23 @@ func (d *demandTracker) recordReads(names []string) {
 	}
 }
 
-// maxDistinctSample bounds the per-attribute distinct-value set kept while
-// profiling, so a high-cardinality attribute cannot blow up memory. Beyond it the
-// profile is marked Capped and the exact count is a lower bound.
-const maxDistinctSample = 4096
+// defaultSampleMax is how many live ads a profiling pass draws when the caller names no
+// bound. It is a COUNT of ads, which is what the decisions downstream of it need: presence
+// fractions and literal-kind dominance get noisy on a few dozen records however fat those
+// records happen to be.
+const defaultSampleMax = 4096
+
+// maxDistinctSample bounds the per-attribute distinct-value set kept while profiling, so a
+// caller that asks for a very large sample cannot turn one high-cardinality attribute into
+// an unbounded map. It is deliberately NOT defaultSampleMax: a sample of n ads can yield at
+// most n distinct values of any one attribute, so a ceiling equal to the sample bound can
+// only be reached by an attribute that is distinct in EVERY sampled ad -- at which point
+// the sample has run out at the same moment the set has, and the overflow that raises the
+// flag never arrives. Setting the two to one number is what made the flag unraisable at the
+// size actually used. Keeping the ceiling above the default sample bound leaves it doing
+// the one job it is for -- bounding memory on an oversized sample -- and leaves saying
+// whether the COUNT is short to sampleBound below, which is the thing that actually binds.
+const maxDistinctSample = 16384
 
 // attrProfile is one attribute's shape across the sampled ads.
 type attrProfile struct {
@@ -165,6 +178,12 @@ type attrProfile struct {
 	other    int // undefined/error literals, or non-literal (expression/list/record)
 	distinct map[string]struct{}
 	capped   bool
+
+	// presentHalf and distinctHalf are this attribute's two counters as they stood after the
+	// first half of the sampled ads. They are what sampleBound reads; see it for why a
+	// snapshot taken halfway answers a question the final counts cannot.
+	presentHalf  int
+	distinctHalf int
 }
 
 func (p *attrProfile) addDistinct(k string) {
@@ -178,6 +197,56 @@ func (p *attrProfile) addDistinct(k string) {
 	p.distinct[k] = struct{}{}
 }
 
+// sampleBoundGrowthDivisor sets how fast the second half of the sample must still be
+// turning up NEW values for the count to be called sample-bound: a new value in at least
+// one ad in sampleBoundGrowthDivisor. The two regimes are far apart on real data -- a
+// near-unique attribute adds a new value in nearly every ad of the second half, a settled
+// one adds none or a handful out of thousands -- so the threshold sits in a wide gap
+// rather than on a cliff, and its exact value is not load-bearing.
+const sampleBoundGrowthDivisor = 8
+
+// sampleBound reports whether the SAMPLE, rather than the data, decided this attribute's
+// distinct count -- i.e. whether len(distinct) is a materially short lower bound.
+//
+// The final count cannot answer that on its own. An attribute with 20,000 distinct values
+// profiled over 4,096 ads yields ~4,077 of them, and 4,077 is neither the ceiling (so
+// nothing overflowed) nor equal to the ads seen (a few ads did collide), so every terminal
+// signal says "nothing was truncated" while the number is short by 79%. Two tests together
+// cover it, and either one alone leaves a gap the other fills:
+//
+//   - NO COLLISIONS AT ALL. Every ad carrying the attribute held a different value, so the
+//     sample found no repetition to suggest it had seen the whole range. This is the only
+//     test that works on a handful of observations, where halves are too noisy to compare.
+//   - STILL CLIMBING AT THE END. The sampler draws records at random from the recent
+//     window, so the two halves of a pass are exchangeable: an attribute whose distinct set
+//     has converged sees the second half contribute almost nothing new, while one still
+//     bounded by the sample keeps adding values right to the last ad. This is what catches
+//     a near-unique attribute that did collide a few times, which the first test misses.
+//     It costs one extra int per attribute and no extra pass.
+//
+// Both are deliberately one-sided. A sample can only ever UNDERSTATE a distinct count --
+// every value counted was really there -- so this says "the truth is at least len(distinct),
+// and may be well above it", never that the count is too high. It is also allowed to say so
+// of a count that happens to be exact; a bound that is tight is still a bound, while a short
+// count presented as the truth is not recoverable by its reader.
+func (p *attrProfile) sampleBound() bool {
+	if p.present > 0 && len(p.distinct) == p.present {
+		return true // a distinct value per ad: the sample never repeated itself
+	}
+	secondHalfPresent := p.present - p.presentHalf
+	if secondHalfPresent <= 0 {
+		return false // no second half to compare against: no evidence either way
+	}
+	newInSecondHalf := len(p.distinct) - p.distinctHalf
+	return newInSecondHalf*sampleBoundGrowthDivisor >= secondHalfPresent
+}
+
+// lowerBound reports whether DistinctValues is a lower bound rather than the count: either
+// the distinct set overflowed its ceiling, or the sample ran out while the set was still
+// growing. Both are one-sided in the same direction, so a caller that sees it set knows the
+// truth is at least the reported number and may be far above it.
+func (p *attrProfile) lowerBound() bool { return p.capped || p.sampleBound() }
+
 // profileAttrs samples up to sampleMax live ads and profiles every attribute seen,
 // keyed by folded (case-insensitive) name so it joins directly with the name-keyed
 // demand map. ForEachNamed reads both encodings -- interned ids (in-memory store) and
@@ -185,7 +254,17 @@ func (p *attrProfile) addDistinct(k string) {
 // which carries no intern ids (the id-based ForEach would have yielded nothing).
 func (c *Collection) profileAttrs(sampleMax int) map[string]*attrProfile {
 	profiles := map[string]*attrProfile{}
-	for _, w := range c.CollectSamplesRecentN(sampleMax) {
+	samples := c.CollectSamplesRecentN(sampleMax)
+	// Where the half-sample snapshot is taken. The sampler draws at random, so the first
+	// half is a sample of the same window the whole pass is -- which is what lets
+	// sampleBound read the two halves as comparable.
+	half := len(samples) / 2
+	for i, w := range samples {
+		if i == half {
+			for _, p := range profiles {
+				p.presentHalf, p.distinctHalf = p.present, len(p.distinct)
+			}
+		}
 		wire.Ad(w).ForEachNamed(c.intern, func(name string, node []byte) bool {
 			fold := strings.ToLower(name)
 			p := profiles[fold]
@@ -244,7 +323,26 @@ type IndexSuggestion struct {
 	SampledPresent int     // sampled ads with this attribute present
 	StringFrac     float64 // fraction of present values that are string literals
 	NumericFrac    float64 // fraction that are numeric literals
-	DistinctValues int     // distinct values in the sample (a lower bound if Capped)
+
+	// DistinctValues is how many distinct values the attribute took across the
+	// SampledPresent ads, and Capped says whether that is the count or a floor under it.
+	//
+	// Capped is one-sided: a sample can only understate a distinct count, so when it is
+	// set the truth is at least DistinctValues and may be far above -- on a 20,000-slot
+	// pool a per-slot attribute reports a few thousand against a true count of ~20,000.
+	// It is set when the sample ran out while the attribute's distinct set was still
+	// growing, and when the distinct set overflowed its own ceiling; the first is what
+	// binds at the sample sizes callers actually pass.
+	//
+	// Absence is not a small count: an attribute no sampled ad carried is not suggested
+	// at all, so DistinctValues == 0 here cannot mean "never seen". SampledPresent is the
+	// population the count describes.
+	//
+	// Neither field decides anything. The Kind below is chosen from literal-kind
+	// dominance and observed demand; these two are the rationale a reader needs to judge
+	// what an index on this attribute would cost, which is why their honesty matters even
+	// though no branch reads them.
+	DistinctValues int
 	Capped         bool
 }
 
@@ -299,7 +397,7 @@ func (c *Collection) SuggestIndexes(sampleMax int) []IndexSuggestion {
 		base := IndexSuggestion{
 			Attr: p.name, QueriesEq: eq, QueriesRange: rng,
 			SampledPresent: p.present, StringFrac: strFrac, NumericFrac: numFrac,
-			DistinctValues: len(p.distinct), Capped: p.capped,
+			DistinctValues: len(p.distinct), Capped: p.lowerBound(),
 		}
 		switch {
 		case strFrac >= kindDominanceFrac && eq > 0:
@@ -331,6 +429,8 @@ type DropSuggestion struct {
 	QueriesEq      int64
 	QueriesRange   int64
 	SampledPresent int
+	// DistinctValues and Capped read exactly as IndexSuggestion's do: a count over
+	// SampledPresent ads, and whether that count is only a floor.
 	DistinctValues int
 	Capped         bool
 }
@@ -381,12 +481,29 @@ func (c *Collection) SuggestDrops(sampleMax int) []DropSuggestion {
 		}
 		ds := DropSuggestion{Attr: display, Kind: kind, QueriesEq: eq, QueriesRange: rng}
 		if p != nil {
-			ds.SampledPresent, ds.DistinctValues, ds.Capped = p.present, len(p.distinct), p.capped
+			ds.SampledPresent, ds.DistinctValues, ds.Capped = p.present, len(p.distinct), p.lowerBound()
 		}
 		switch {
 		case eq == 0 && rng == 0:
 			ds.Reason = "unused"
-		case ds.SampledPresent > 0 && ds.DistinctValues <= 1 && !ds.Capped:
+		// No !Capped term. Carrying one would change what this rule reports, and dropping it
+		// does not, which is the opposite of how it reads.
+		//
+		// Against the old meaning of the flag -- the distinct SET hit its ceiling -- the term
+		// could never discriminate anything: a set at its ceiling holds thousands of values and
+		// the test beside it demands at most one, so no profile could satisfy both. Removing it
+		// therefore leaves every suggestion this rule has ever made exactly as it was.
+		//
+		// Against the new meaning -- the count is a FLOOR, for either reason -- the term would
+		// start suppressing cases, and precisely the wrong ones. An attribute carried by only a
+		// handful of ads that all agree on one value is both single-valued and short, so it is
+		// flagged, and requiring the flag clear would silently drop it from the report.
+		//
+		// What the rule needs is not that the count be complete but that the one value seen be
+		// the whole story, and SampledPresent is what carries that: thousands of ads agreeing is
+		// strong evidence, four ads agreeing is not. Weighing it is the reader's, since this is
+		// advisory and AutoTune never acts on low-cardinality.
+		case ds.SampledPresent > 0 && ds.DistinctValues <= 1:
 			ds.Reason = "low-cardinality"
 		default:
 			return
@@ -411,7 +528,7 @@ func (c *Collection) SuggestDrops(sampleMax int) []DropSuggestion {
 
 // AutoTuneOptions configures AutoTune.
 type AutoTuneOptions struct {
-	// SampleMax caps the ads profiled. Default maxDistinctSample.
+	// SampleMax caps the ads profiled. Default defaultSampleMax.
 	SampleMax int
 	// MinDemand is the minimum equality+range probe count for an attribute to be
 	// added as an index. Default 1 (any observed demand).
@@ -478,7 +595,7 @@ type AutoTuneResult struct {
 // applied.
 func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 	if opts.SampleMax <= 0 {
-		opts.SampleMax = maxDistinctSample
+		opts.SampleMax = defaultSampleMax
 	}
 	minDemand := opts.MinDemand
 	if minDemand < 1 {

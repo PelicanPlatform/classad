@@ -39,11 +39,22 @@ import (
 //     join is made on. It also exists only for a VALUE (numeric) index, so a string join
 //     key has none at all.
 //   - The sampled attribute profile behind SuggestIndexes (attrProfile.distinct) counts
-//     distinct values over a bounded sample of recent ads and stops at maxDistinctSample,
-//     marking itself Capped. Past the cap its number is a lower bound unrelated to the
-//     truth, and obtaining it costs a sample scan -- which is a scan, so it does not
-//     belong on a per-query planning path. It stays where it is, deciding which indexes
+//     distinct values over a bounded sample of recent ads, so on a high-cardinality
+//     attribute its number is a lower bound unrelated to the truth -- it says so (Capped),
+//     which is what it owes its own readers, but a bound of "at least a few thousand" is
+//     not a denominator. Obtaining it also costs a sample scan, which is a scan, so it does
+//     not belong on a per-query planning path. It stays where it is, deciding which indexes
 //     to build.
+//
+// AND NOT THE OTHER WAY EITHER. The traffic does not run in reverse: auto-indexing cannot
+// profile attributes with AttrNDV, because AttrNDV answers only for an attribute some
+// segment ALREADY indexes (ndvProbe returns false otherwise) and auto-indexing exists to
+// decide what to index. Every attribute it is weighing is, by construction, one with no
+// index and therefore no answer here. The overlap is the other list -- an index already
+// configured, which SuggestDrops judges -- and even there the two measure different
+// populations: AttrNDV counts the indexed prefix of the sealed segments, while the profile
+// counts a sample of the RECENT window, which is where an attribute that has just gone
+// constant (or just stopped being constant) shows up first.
 
 // NDVAccuracy says how to read NDVEstimate.Distinct. It is derived from Err, so the two
 // cannot disagree; it exists because "exact" and "estimate" are what a planner branches on
