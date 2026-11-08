@@ -876,6 +876,13 @@ func (a *Archive) MarkAutoIndexes(names []string) { a.c.MarkAutoIndexes(names) }
 // provenance alongside the index set itself.
 func (a *Archive) AutoIndexNames() []string { return a.c.AutoIndexNames() }
 
+// CompositeRefusals returns the configured composite tuples this archive could not install,
+// and why. The archive counterpart of Collection.CompositeRefusals, and the reason it is
+// forwarded rather than left to the caller to reach through: an archive's configuration is
+// supplied to OpenArchive on every open, so an archive is the store most likely to be
+// carrying a tuple that resolved when it was created and does not resolve now.
+func (a *Archive) CompositeRefusals() []CompositeRefusal { return a.c.CompositeRefusals() }
+
 // CompositeAttrs returns the attribute tuples the archive indexes together. An archive's
 // saved config is authoritative on reopen and rebuilds the whole index set from it, so the
 // composites have to be in it or a tuple the tuner created is gone at the next start.

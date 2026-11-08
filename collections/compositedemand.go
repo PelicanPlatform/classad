@@ -444,7 +444,12 @@ func (c *Collection) addCompositesAuto(tuples [][]string) [][]string {
 			// One tuple at a time: newCompositeSpecs resolves against next, so a tuple
 			// added in this pass is visible to coversTupleIDs for the next one, and a
 			// refused tuple does not take an accepted one down with it.
-			specs := next.newCompositeSpecs(c.intern, [][]string{t}, true)
+			// The refusals are discarded here, and only here. These tuples are the
+			// tuner's PROPOSALS, not an operator's configuration: a refused proposal is
+			// the rule that refused it working, there is nothing for anyone to fix, and
+			// the tuner runs on a timer -- so recording them would be an unbounded log of
+			// a system behaving correctly. CompositeRefusals reports configuration.
+			specs, _ := next.newCompositeSpecs(c.intern, [][]string{t}, true)
 			if len(specs) != 1 || next.coversTupleIDs(specs[0].ids) {
 				continue
 			}

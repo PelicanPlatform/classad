@@ -373,6 +373,23 @@ func (c *Collection) CompositeAttrs() [][]string {
 	return out
 }
 
+// CompositeRefusals returns the configured composite tuples this collection could not
+// install, and why -- the other half of CompositeAttrs, which reports only what survived.
+//
+// It is fixed at construction and never changes afterwards, because it describes the
+// configuration this store was opened with. A later AddIndex or DropIndex that would make a
+// refused tuple resolvable does not install it: the tuple is not retried, and the entry
+// here does not go away. Only reconfiguring and reopening does that, which is also the only
+// action a caller should take on a non-empty result -- see CompositeRefusal.
+//
+// The composites the AUTO-TUNER proposes are not reported here; see addCompositesAuto.
+func (c *Collection) CompositeRefusals() []CompositeRefusal {
+	if len(c.compRefused) == 0 {
+		return nil
+	}
+	return append([]CompositeRefusal(nil), c.compRefused...)
+}
+
 // AutoCompositeNames returns the tuples of the composites the auto-tuner created, a subset
 // of CompositeAttrs. The composite counterpart of AutoIndexNames.
 func (c *Collection) AutoCompositeNames() [][]string {
@@ -393,9 +410,10 @@ func (c *Collection) AutoCompositeNames() [][]string {
 // any was installed. The composite counterpart of AddAutoIndex, and the restore path for a
 // store whose composites are not re-derived from a saved configuration at open.
 //
-// Fewer tuples may be installed than were asked for, silently: a tuple whose component is
-// not indexed in its own right is refused (newCompositeSpecs), as is one some composite
-// already covers in any order. Both are the right answer for a restore -- the first says the
+// Fewer tuples may be installed than were asked for, silently -- and silently on purpose,
+// where a configured tuple's refusal is reported (CompositeRefusals): a tuple whose
+// component is not indexed in its own right is refused (newCompositeSpecs), as is one some
+// composite already covers in any order. Both are the right answer for a restore -- the first says the
 // component index did not come back, which leaves the composite nothing to fall back to for
 // the conjunctions it cannot answer; the second says the tuple is already configured, and a
 // configured composite is not the tuner's to claim.
