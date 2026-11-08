@@ -61,6 +61,9 @@ func (si *mmapSegIndex) stalePostings() bool {
 // statsFor returns the parsed per-segment summary for a probe's attribute (nil if the
 // attribute is not indexed in this segment).
 func (si *mmapSegIndex) statsFor(up usableProbe) *segStats {
+	if up.compOnly {
+		return nil // no standalone postings, so no summary of them
+	}
 	if up.cat {
 		return si.catStats[up.attrID]
 	}
@@ -223,8 +226,12 @@ func (si *mmapSegIndex) compositeCandidates(usable []usableProbe) (float64, stri
 }
 func (si *mmapSegIndex) coveredUpto() uint32 { return si.upto }
 
-// coversProbe reports whether this segment indexes one probe's attribute.
+// coversProbe reports whether this segment indexes one probe's attribute. A component-only
+// attribute has no directory entry here and never will, so it is never covered.
 func (si *mmapSegIndex) coversProbe(up usableProbe) bool {
+	if up.compOnly {
+		return false
+	}
 	if up.cat {
 		_, ok := si.catDir[up.attrID]
 		return ok
@@ -233,10 +240,14 @@ func (si *mmapSegIndex) coversProbe(up usableProbe) bool {
 	return ok
 }
 
+// allOffsets is a fresh copy of every record this sidecar's index covers -- the candidate
+// set that narrows nothing. See indexCandidateOffsets for the one case that needs it.
+func (si *mmapSegIndex) allOffsets() *roaring.Bitmap { return si.allBitmap().Clone() }
+
 // bloomAbsent consults the on-disk categorical bloom (v5) for a ==/in probe: true iff every
 // probe value is definitely absent.
 func (si *mmapSegIndex) bloomAbsent(up usableProbe) bool {
-	if !up.cat || (up.op != "==" && up.op != "in") {
+	if up.compOnly || !up.cat || (up.op != "==" && up.op != "in") {
 		return false
 	}
 	attrOff, ok := si.catDir[up.attrID]
@@ -254,7 +265,13 @@ func (si *mmapSegIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
 
 // probeOffsets returns a fresh, mutable offset bitmap for one probe, reading only the
 // touched postings from the mapping.
+// probeOffsets must never be asked for a component-only probe -- the directory holds no
+// entry for one, and the empty bitmap the miss below would return reads as "no record
+// matches" (see segIndex.probeOffsets). It answers with the whole covered prefix instead.
 func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
+	if up.compOnly {
+		return si.allOffsets()
+	}
 	if up.cat {
 		attrOff, ok := si.catDir[up.attrID]
 		if !ok {

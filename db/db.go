@@ -134,6 +134,17 @@ type Config struct {
 	// (`omitempty` for the same reason the archive's is: an unconfigured field must not
 	// change the bytes an existing deployment's config file is rewritten with.)
 	CompositeAttrs [][]string `json:",omitempty"`
+	// CategoricalComponentAttrs / ValueComponentAttrs name attributes that exist ONLY as
+	// composite components: they carry no index of their own, so no constraint on one
+	// alone is index-answered, and which list a name appears in fixes how the composite
+	// encodes it. They are what lets a composite over (ClusterId, ProcId) be configured
+	// without also paying for a standalone ProcId index nothing queries.
+	//
+	// Persisted with the rest of the index set, and `omitempty` for the same reason the
+	// other index fields are: a configuration naming none must write the bytes it always
+	// wrote.
+	CategoricalComponentAttrs []string `json:",omitempty"`
+	ValueComponentAttrs       []string `json:",omitempty"`
 
 	// DisableReadVerification turns off the per-record checksum check on reads for
 	// this table. Verification is ON by default (see
@@ -251,28 +262,30 @@ func OpenConfig(cfg Config) (*DB, error) {
 		return nil, err
 	}
 	opts := collections.Options{
-		Dir:                     cfg.Dir,
-		WatchHistory:            4096, // enables Watch
-		Ordered:                 cfg.Ordered,
-		HotAttrs:                cfg.HotAttrs,
-		CategoricalAttrs:        cfg.CategoricalAttrs,
-		ValueAttrs:              cfg.ValueAttrs,
-		CompositeAttrs:          cfg.CompositeAttrs,
-		MatchClosureRoots:       cfg.MatchClosureRoots,
-		SchemaRequireAttrs:      cfg.SchemaRequireAttrs,
-		GroupSchemaCount:        cfg.GroupSchemaCount,
-		GroupStabilityRuns:      cfg.GroupStabilityRuns,
-		GroupMergeJaccard:       cfg.GroupMergeJaccard,
-		GroupMaxPartialFrac:     cfg.GroupMaxPartialFrac,
-		ColumnarSegmentBudget:   cfg.ColumnarSegmentBudget,
-		DeltaMax:                resolveDeltaMax(cfg.DeltaMax),
-		DisableReadVerification: cfg.DisableReadVerification,
-		Codec:                   chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
-		DataKey:                 enc.data(),
-		EncryptedAttrs:          cfg.EncryptedAttrs,
-		SegmentSize:             cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
-		QueryParallelism:        cfg.QueryParallelism,
-		AggMinBytes:             cfg.AggMinBytes,
+		Dir:                       cfg.Dir,
+		WatchHistory:              4096, // enables Watch
+		Ordered:                   cfg.Ordered,
+		HotAttrs:                  cfg.HotAttrs,
+		CategoricalAttrs:          cfg.CategoricalAttrs,
+		ValueAttrs:                cfg.ValueAttrs,
+		CompositeAttrs:            cfg.CompositeAttrs,
+		CategoricalComponentAttrs: cfg.CategoricalComponentAttrs,
+		ValueComponentAttrs:       cfg.ValueComponentAttrs,
+		MatchClosureRoots:         cfg.MatchClosureRoots,
+		SchemaRequireAttrs:        cfg.SchemaRequireAttrs,
+		GroupSchemaCount:          cfg.GroupSchemaCount,
+		GroupStabilityRuns:        cfg.GroupStabilityRuns,
+		GroupMergeJaccard:         cfg.GroupMergeJaccard,
+		GroupMaxPartialFrac:       cfg.GroupMaxPartialFrac,
+		ColumnarSegmentBudget:     cfg.ColumnarSegmentBudget,
+		DeltaMax:                  resolveDeltaMax(cfg.DeltaMax),
+		DisableReadVerification:   cfg.DisableReadVerification,
+		Codec:                     chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
+		DataKey:                   enc.data(),
+		EncryptedAttrs:            cfg.EncryptedAttrs,
+		SegmentSize:               cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
+		QueryParallelism:          cfg.QueryParallelism,
+		AggMinBytes:               cfg.AggMinBytes,
 		// Process-global shared block-cache budgets (0 ⇒ collections default). Both are set here at DB
 		// open: collections.New applies BOTH the mutating and archive budgets to the process globals,
 		// so archives opened later from a plain ArchiveConfig inherit the archive budget set now.

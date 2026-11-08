@@ -62,10 +62,31 @@ type indexSpec struct {
 	auto map[uint32]struct{}
 
 	// comps are the configured composite (multi-column) indexes, ordered by tuple identity
-	// so a build is deterministic. Every component is also indexed on its own (see
-	// newCompositeSpecs), so a composite only ever makes a conjunction cheaper -- it is
-	// never the sole index on an attribute.
+	// so a build is deterministic.
 	comps []compositeSpec
+
+	// compOnly are the attributes that exist in this spec ONLY to be composite components:
+	// id -> the component's kind (true categorical, false value). They carry no postings of
+	// their own -- nothing is in cat or val for them, no catPostings/valPostings is built,
+	// and no sidecar attribute directory entry is written -- so every single-attribute index
+	// path must read them as NOT INDEXED and fall back to the scan. Only the composite path
+	// may use one.
+	//
+	// That is the whole of what this map buys, and it buys two things the composite cannot
+	// do without. The component's KIND has to be fixed at configuration time, because the
+	// record side and the probe side must encode a component identically and a kind inferred
+	// from observed values would make them disagree; with no index of its own there is
+	// nowhere else for the kind to come from. And probe planning resolves an attribute only
+	// if the spec knows it, so without an entry here `ProcId == 3` never becomes a probe at
+	// all and the composite is never even offered the conjunction.
+	//
+	// A single-attribute path that read the ABSENT postings of one of these as "no record
+	// holds that value" would silently drop rows, so the paths that could -- coversProbe,
+	// statsFor, bloomAbsent, probeOffsets, the skip and estimate logic -- each refuse a
+	// component-only probe explicitly rather than relying on a missing map entry.
+	compOnly map[uint32]bool
+	// compOnlyIDs is compOnly's keys in configuration order, so the signature is stable.
+	compOnlyIDs []uint32
 
 	// paths holds, for the ids that index a NESTED PATH, the components of that path.
 	//
@@ -214,6 +235,88 @@ func (s *indexSpec) isAuto(id uint32) bool {
 
 func (s *indexSpec) catHas(id uint32) bool { _, ok := s.cat[id]; return ok }
 func (s *indexSpec) valHas(id uint32) bool { _, ok := s.val[id]; return ok }
+
+// compOnlyHas reports whether id is a component-only attribute and, if so, its kind.
+func (s *indexSpec) compOnlyHas(id uint32) (cat, ok bool) {
+	if s == nil || s.compOnly == nil {
+		return false, false
+	}
+	cat, ok = s.compOnly[id]
+	return cat, ok
+}
+
+// componentKind is the kind a composite must encode id with, from whichever registration
+// gives id a kind: its own index, or its component-only declaration. An index of its own
+// wins, so promoting a component-only attribute to a real index (AddIndex) re-kinds the
+// composite rather than leaving two answers in play -- addIndex drops the component-only
+// entry for exactly that reason.
+func (s *indexSpec) componentKind(id uint32) (cat, ok bool) {
+	if s.catHas(id) {
+		return true, true
+	}
+	if s.valHas(id) {
+		return false, true
+	}
+	return s.compOnlyHas(id)
+}
+
+// addCompOnly registers id as a component-only attribute of kind cat. An attribute already
+// indexed in its own right is left alone: its index already fixes its kind, and shadowing it
+// here would give componentKind two answers.
+func (s *indexSpec) addCompOnly(id uint32, cat bool) {
+	if s.catHas(id) || s.valHas(id) {
+		return
+	}
+	if _, dup := s.compOnly[id]; dup {
+		return
+	}
+	if s.compOnly == nil {
+		s.compOnly = map[uint32]bool{}
+	}
+	s.compOnly[id] = cat
+	s.compOnlyIDs = append(s.compOnlyIDs, id)
+}
+
+// dropCompOnly removes id's component-only registration, if it has one.
+func (s *indexSpec) dropCompOnly(id uint32) {
+	if _, ok := s.compOnly[id]; !ok {
+		return
+	}
+	delete(s.compOnly, id)
+	out := s.compOnlyIDs[:0]
+	for _, x := range s.compOnlyIDs {
+		if x != id {
+			out = append(out, x)
+		}
+	}
+	s.compOnlyIDs = out
+}
+
+// setComponentAttrs registers the attributes that are to be composite components and nothing
+// else, resolving each name the way an indexed name resolves (so a dotted name is a nested
+// path here too). Called before setComposites, which resolves the tuples against them.
+//
+// An attribute named in both lists is categorical, matching AddIndex's rule for an attribute
+// given as both kinds; one that is already indexed in its own right is ignored, because its
+// own index already settles its kind.
+func (s *indexSpec) setComponentAttrs(intern *wire.InternTable, catNames, valNames []string) {
+	for _, name := range catNames {
+		if id, ok := s.indexID(intern, name); ok {
+			s.addCompOnly(id, true)
+		}
+	}
+	for _, name := range valNames {
+		id, ok := s.indexID(intern, name)
+		if !ok {
+			continue
+		}
+		if c, have := s.compOnlyHas(id); have && c {
+			continue // already declared categorical
+		}
+		s.addCompOnly(id, false)
+	}
+	s.gen = s.signature()
+}
 
 // isAutoName reports whether the index on the named attribute is auto-created, resolving
 // the name to an id in either index mode (inline by folded name, interned by id).
@@ -404,7 +507,12 @@ func (s *indexSpec) recordMember(node []byte, p attrPath, i int, dict *segDictHa
 	return wire.RecordMemberID(node, p.ids[i])
 }
 
-func (s *indexSpec) any() bool { return s != nil && (len(s.catIDs) > 0 || len(s.valIDs) > 0) }
+// any reports whether this spec can narrow anything. A composite counts on its own: with
+// every component declared component-only there is no catIDs/valIDs entry anywhere, and
+// without this the planner would decline the query before the composite was ever offered it.
+func (s *indexSpec) any() bool {
+	return s != nil && (len(s.catIDs) > 0 || len(s.valIDs) > 0 || len(s.comps) > 0)
+}
 
 // newIndexSpec resolves configured attribute names to interned ids (gen 0). A name holding a
 // dot configures an index on that nested path (see splitAttrPath).
@@ -485,6 +593,28 @@ func (s *indexSpec) signature() uint64 {
 			mix(^uint64(0))
 		}
 	}
+	if len(s.compOnly) > 0 {
+		// The component-only attributes and their kinds, under their own separator. A
+		// component's kind decides how every record's value is folded into the composite
+		// key, so two configurations differing only in a component's kind describe
+		// different postings and must not share a generation -- the tuple ids in the
+		// composite keys above do not carry the kind.
+		//
+		// Only when there ARE component-only attributes, for the reason the composite and
+		// path sets are conditional: a configuration without them must sign exactly as it
+		// did before they existed, or every sidecar on disk reads as stale.
+		mix(^uint64(2))
+		ids := append([]uint32(nil), s.compOnlyIDs...)
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		for _, id := range ids {
+			mix(uint64(id))
+			if s.compOnly[id] {
+				mix(1)
+			} else {
+				mix(0)
+			}
+		}
+	}
 	if len(s.paths) > 0 {
 		// The path ids again, under their own separator: the same id means a different index
 		// depending on whether it is keyed on an attribute or on a path, and a sidecar built
@@ -530,6 +660,13 @@ func (s *indexSpec) clone() *indexSpec {
 		}
 	}
 	n.comps = append([]compositeSpec(nil), s.comps...)
+	if s.compOnly != nil {
+		n.compOnly = make(map[uint32]bool, len(s.compOnly))
+		for id, cat := range s.compOnly {
+			n.compOnly[id] = cat
+		}
+		n.compOnlyIDs = append([]uint32(nil), s.compOnlyIDs...)
+	}
 	if s.paths != nil {
 		n.paths = make(map[uint32]attrPath, len(s.paths))
 		for id, p := range s.paths {
@@ -592,6 +729,14 @@ func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
 func (s *indexSpec) equalIDs(o *indexSpec) bool {
 	if len(s.cat) != len(o.cat) || len(s.val) != len(o.val) || len(s.comps) != len(o.comps) {
 		return false
+	}
+	if len(s.compOnly) != len(o.compOnly) {
+		return false
+	}
+	for id, cat := range s.compOnly {
+		if c, ok := o.compOnly[id]; !ok || c != cat {
+			return false
+		}
 	}
 	for i, cs := range s.comps {
 		if cs.key != o.comps[i].key {

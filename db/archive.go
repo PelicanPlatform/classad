@@ -101,6 +101,17 @@ type ArchiveConfig struct {
 	// it is a composite that does not come back -- along with the sidecar rebuild that creating
 	// it paid for.
 	CompositeAttrs [][]string `json:",omitempty"`
+	// CategoricalComponentAttrs / ValueComponentAttrs name attributes that exist ONLY as
+	// composite components: they carry no index of their own, so no constraint on one
+	// alone is index-answered, and which list a name appears in fixes how the composite
+	// encodes it. They are what lets a composite over (ClusterId, ProcId) be configured
+	// without also paying for a standalone ProcId index nothing queries.
+	//
+	// Persisted with the rest of the index set, and `omitempty` for the same reason the
+	// other index fields are: a configuration naming none must write the bytes it always
+	// wrote.
+	CategoricalComponentAttrs []string `json:",omitempty"`
+	ValueComponentAttrs       []string `json:",omitempty"`
 	// AutoComposites names the subset of CompositeAttrs the auto-tuner created, as AutoAttrs
 	// does for the single-attribute indexes. Without it a composite the tuner created returns
 	// from a restart indistinguishable from a configured one: no longer trimmable by the
@@ -294,25 +305,27 @@ func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*Arc
 		return nil, err
 	}
 	opts := collections.ArchiveOptions{
-		Dir:                 dir,
-		SegmentSize:         cfg.SegmentSize,
-		RowGroupBytes:       cfg.RowGroupBytes,
-		Codec:               codec,
-		HotAttrs:            cfg.HotAttrs,
-		Unordered:           cfg.Unordered,
-		GroupSchemaCount:    cfg.GroupSchemaCount,
-		GroupStabilityRuns:  cfg.GroupStabilityRuns,
-		GroupMergeJaccard:   cfg.GroupMergeJaccard,
-		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
-		CategoricalAttrs:    categorical,
-		ValueAttrs:          value,
-		CompositeAttrs:      cfg.CompositeAttrs,
-		ZoneAttrs:           cfg.ZoneAttrs,
-		SchemaRequireAttrs:  cfg.SchemaRequireAttrs,
-		IndexBackfillBytes:  cfg.backfillHorizon(),
-		Retention:           cfg.Retention,
-		DataKey:             enc.data(),
-		EncryptedAttrs:      encAttrs,
+		Dir:                       dir,
+		SegmentSize:               cfg.SegmentSize,
+		RowGroupBytes:             cfg.RowGroupBytes,
+		Codec:                     codec,
+		HotAttrs:                  cfg.HotAttrs,
+		Unordered:                 cfg.Unordered,
+		GroupSchemaCount:          cfg.GroupSchemaCount,
+		GroupStabilityRuns:        cfg.GroupStabilityRuns,
+		GroupMergeJaccard:         cfg.GroupMergeJaccard,
+		GroupMaxPartialFrac:       cfg.GroupMaxPartialFrac,
+		CategoricalAttrs:          categorical,
+		ValueAttrs:                value,
+		CompositeAttrs:            cfg.CompositeAttrs,
+		CategoricalComponentAttrs: cfg.CategoricalComponentAttrs,
+		ValueComponentAttrs:       cfg.ValueComponentAttrs,
+		ZoneAttrs:                 cfg.ZoneAttrs,
+		SchemaRequireAttrs:        cfg.SchemaRequireAttrs,
+		IndexBackfillBytes:        cfg.backfillHorizon(),
+		Retention:                 cfg.Retention,
+		DataKey:                   enc.data(),
+		EncryptedAttrs:            encAttrs,
 	}
 	// Created or reopened alike: the emptiness CreateArchive would check was checked above.
 	a, err := collections.OpenArchive(opts)

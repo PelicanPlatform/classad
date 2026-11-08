@@ -109,8 +109,14 @@ type ArchiveOptions struct {
 	CategoricalAttrs []string
 	ValueAttrs       []string
 	// CompositeAttrs configures composite (multi-column) indexes over attribute tuples
-	// (see Collection). Each tuple's attributes must also be in CategoricalAttrs/ValueAttrs.
+	// (see Collection). Each tuple's attributes must also be in CategoricalAttrs/ValueAttrs
+	// or in CategoricalComponentAttrs/ValueComponentAttrs.
 	CompositeAttrs [][]string
+	// CategoricalComponentAttrs / ValueComponentAttrs name attributes indexed only as
+	// composite components, with no index of their own (see Options). A constraint naming
+	// one of them alone scans.
+	CategoricalComponentAttrs []string
+	ValueComponentAttrs       []string
 	// ZoneAttrs names numeric attributes to keep per-segment min/max on, so a query with
 	// a range/equality constraint on one can skip whole segments. ValueAttrs are
 	// automatically included.
@@ -192,28 +198,30 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		segSize = defaultArchiveSegmentSize
 	}
 	return Options{
-		AppendOnly:          true,            // pure append log: no supersession, no compaction, no key dir
-		ReverseScan:         !opts.Unordered, // newest-first Query, matching condor_history order
-		Dir:                 opts.Dir,
-		SegmentSize:         segSize,
-		Codec:               opts.Codec,
-		HotAttrs:            opts.HotAttrs,
-		CategoricalAttrs:    opts.CategoricalAttrs,
-		ValueAttrs:          opts.ValueAttrs, // numeric ValueAttrs are auto-added to the zone maps
-		CompositeAttrs:      opts.CompositeAttrs,
-		ZoneAttrs:           opts.ZoneAttrs,
-		Retention:           opts.Retention,
-		InternAtSeal:        opts.InternAtSeal, // intern each segment eagerly at seal
-		IndexBackfillBytes:  opts.IndexBackfillBytes,
-		RowGroupBytes:       opts.RowGroupBytes,
-		SchemaRequireAttrs:  opts.SchemaRequireAttrs,
-		GroupSchemaCount:    opts.GroupSchemaCount,
-		GroupStabilityRuns:  opts.GroupStabilityRuns,
-		GroupMergeJaccard:   opts.GroupMergeJaccard,
-		GroupMaxPartialFrac: opts.GroupMaxPartialFrac,
-		RemnantDictionary:   opts.RemnantDictionary,
-		MoveListColumns:     opts.MoveListColumns,
-		WatchHistory:        archiveWatchCap, // enable the append-stream watch
+		AppendOnly:                true,            // pure append log: no supersession, no compaction, no key dir
+		ReverseScan:               !opts.Unordered, // newest-first Query, matching condor_history order
+		Dir:                       opts.Dir,
+		SegmentSize:               segSize,
+		Codec:                     opts.Codec,
+		HotAttrs:                  opts.HotAttrs,
+		CategoricalAttrs:          opts.CategoricalAttrs,
+		ValueAttrs:                opts.ValueAttrs, // numeric ValueAttrs are auto-added to the zone maps
+		CompositeAttrs:            opts.CompositeAttrs,
+		CategoricalComponentAttrs: opts.CategoricalComponentAttrs,
+		ValueComponentAttrs:       opts.ValueComponentAttrs,
+		ZoneAttrs:                 opts.ZoneAttrs,
+		Retention:                 opts.Retention,
+		InternAtSeal:              opts.InternAtSeal, // intern each segment eagerly at seal
+		IndexBackfillBytes:        opts.IndexBackfillBytes,
+		RowGroupBytes:             opts.RowGroupBytes,
+		SchemaRequireAttrs:        opts.SchemaRequireAttrs,
+		GroupSchemaCount:          opts.GroupSchemaCount,
+		GroupStabilityRuns:        opts.GroupStabilityRuns,
+		GroupMergeJaccard:         opts.GroupMergeJaccard,
+		GroupMaxPartialFrac:       opts.GroupMaxPartialFrac,
+		RemnantDictionary:         opts.RemnantDictionary,
+		MoveListColumns:           opts.MoveListColumns,
+		WatchHistory:              archiveWatchCap, // enable the append-stream watch
 		// Global shared ARCHIVE block-cache budget (0 keeps the current/default).
 		ArchiveBlockCacheBytes: opts.BlockCacheBytes,
 		DataKey:                opts.DataKey,
@@ -867,6 +875,13 @@ func (a *Archive) MarkAutoIndexes(names []string) { a.c.MarkAutoIndexes(names) }
 // AutoIndexNames returns the names of the archive's auto-created indexes, for persisting
 // provenance alongside the index set itself.
 func (a *Archive) AutoIndexNames() []string { return a.c.AutoIndexNames() }
+
+// CompositeRefusals returns the configured composite tuples this archive could not install,
+// and why. The archive counterpart of Collection.CompositeRefusals, and the reason it is
+// forwarded rather than left to the caller to reach through: an archive's configuration is
+// supplied to OpenArchive on every open, so an archive is the store most likely to be
+// carrying a tuple that resolved when it was created and does not resolve now.
+func (a *Archive) CompositeRefusals() []CompositeRefusal { return a.c.CompositeRefusals() }
 
 // CompositeAttrs returns the attribute tuples the archive indexes together. An archive's
 // saved config is authoritative on reopen and rebuilds the whole index set from it, so the

@@ -22,12 +22,17 @@ import (
 // lookup returning the answer. BenchmarkComposite* measures both.
 //
 // FULL TUPLE ONLY. A composite answers an equality on EVERY one of its components and
-// nothing else: no prefix probe on the leading attribute, no range on any of them. That is
-// deliberate, and it costs nothing: a composite's components must each be indexed in their
-// own right (newCompositeSpecs enforces it), so the leading attribute alone is already
-// served by its own index, as is any range. Keys are therefore hashed (in RAM) or
-// byte-sorted (in the sidecar) rather than order-preserving -- there is no ordering to
-// preserve.
+// nothing else: no prefix probe on the leading attribute, no range on any of them. Keys are
+// therefore hashed (in RAM) or byte-sorted (in the sidecar) rather than order-preserving --
+// there is no ordering to preserve.
+//
+// For a component that is also indexed in its own right that costs nothing: the leading
+// attribute alone is already served by its own index, as is any range. For a COMPONENT-ONLY
+// component (indexSpec.compOnly) it costs exactly what it says -- a conjunction pinning
+// fewer than all the components gets no index from the composite, so `ProcId == 5` alone
+// scans, as does `ProcId >= 2` and `ProcId != 1` in any combination. That is the trade an
+// installation makes when it declares a component-only attribute, and it is worth making
+// only when nothing queries the attribute by itself.
 //
 // SOUNDNESS. The composite is a candidate SUPERSET like every other index path, and the
 // store re-verifies each candidate against the real predicate:
@@ -282,36 +287,68 @@ func compositeMatchIn(comps map[string]*compPostings, usable []usableProbe) (com
 
 // --- spec construction -------------------------------------------------------------
 
-// newCompositeSpecs resolves configured attribute tuples against the single-attribute index
-// configuration already in s, and returns the composites that are admissible.
+// newCompositeSpecs resolves configured attribute tuples against the index configuration
+// already in s, and returns the composites that are admissible.
 //
-// A tuple is REFUSED, silently, when a component is not itself indexed. That is not a
-// formality: a segment whose index predates the composite, a window the composite does not
-// cover, and a conjunction naming only part of the tuple all fall back to intersecting the
-// components' own postings, and there has to be something to fall back to. It also keeps a
-// composite from being the only reason an attribute is read out of every record.
+// A component must have a KIND in s -- from its own index, or from a component-only
+// declaration (indexSpec.compOnly). A tuple naming an attribute s knows nothing about is
+// REFUSED, silently: the record side and the probe side have to fold that component the same
+// way, and with no kind there is no way to fold it at all.
+//
+// What is NOT required any more is that every component be indexed in its own right. The
+// reason it once was -- that everything the composite does not answer falls back to the
+// components' own postings -- holds, and the fallback is still what happens; the change is
+// that an installation may decide a particular component is not worth the fallback. A
+// history archive asking only `ClusterId == c && ProcId == p` gets nothing from a standalone
+// ProcId index and pays for it per record, and on a real pool one cluster carries nearly
+// three million distinct ProcIds. Declaring ProcId component-only buys the tuple lookup and
+// gives up `ProcId == 5` on its own, which becomes a scan.
 //
 // Duplicate components, a tuple of fewer than two attributes, and a tuple wider than
-// maxCompositeAttrs are refused for the same reason: none of them describes an index.
-func (s *indexSpec) newCompositeSpecs(intern *wire.InternTable, tuples [][]string, auto bool) []compositeSpec {
+// maxCompositeAttrs are refused as before: none of them describes an index.
+//
+// Every refusal is also RETURNED, as a CompositeRefusal naming the tuple and the reason, so
+// a drop is something the caller can read rather than something it has to infer from a
+// missing index. Refusing is still all that happens -- the tuples that survive are exactly
+// the tuples that survived before.
+func (s *indexSpec) newCompositeSpecs(intern *wire.InternTable, tuples [][]string, auto bool) ([]compositeSpec, []CompositeRefusal) {
 	var out []compositeSpec
+	var refused []CompositeRefusal
+	refuse := func(t []string, reason, attr string) {
+		refused = append(refused, CompositeRefusal{
+			Attrs:  append([]string(nil), t...),
+			Reason: reason,
+			Attr:   attr,
+		})
+	}
 	seen := map[string]bool{}
 	for _, t := range tuples {
-		if len(t) < 2 || len(t) > maxCompositeAttrs {
+		if len(t) < 2 {
+			refuse(t, CompositeRefusedTooFewComponents, "")
+			continue
+		}
+		if len(t) > maxCompositeAttrs {
+			refuse(t, CompositeRefusedTooManyComponents, "")
 			continue
 		}
 		cs := compositeSpec{auto: auto}
 		dup := map[uint32]bool{}
 		bad := false
 		for _, name := range t {
-			id, ok := s.resolveIndexed(intern, name)
-			if !ok || dup[id] {
+			id, cat, ok := s.resolveComponent(intern, name)
+			if !ok {
+				refuse(t, CompositeRefusedUnresolvableComponent, name)
+				bad = true
+				break
+			}
+			if dup[id] {
+				refuse(t, CompositeRefusedDuplicateComponent, name)
 				bad = true
 				break
 			}
 			dup[id] = true
 			cs.ids = append(cs.ids, id)
-			cs.cats = append(cs.cats, s.catHas(id))
+			cs.cats = append(cs.cats, cat)
 			cs.names = append(cs.names, name)
 		}
 		if bad {
@@ -319,50 +356,147 @@ func (s *indexSpec) newCompositeSpecs(intern *wire.InternTable, tuples [][]strin
 		}
 		cs.key = compositeKey(cs.ids)
 		if seen[cs.key] {
+			refuse(t, CompositeRefusedDuplicateTuple, "")
 			continue
 		}
 		seen[cs.key] = true
 		out = append(out, cs)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
-	return out
+	return out, refused
+}
+
+// CompositeRefusal is one configured composite tuple that was not installed, and why.
+//
+// It exists because the failure it describes has no other symptom. A refused tuple does not
+// break the store and does not fail the open: the table comes up, the queries that were
+// meant to use the composite still answer correctly, and they answer by intersecting
+// postings or by scanning. The only thing an operator sees is that something got slower,
+// with nothing anywhere to point at -- which is how a typo in a component name, or dropping
+// an index some composite depended on, survives for months.
+//
+// WHAT A CALLER IS EXPECTED TO DO WITH IT. Log it at open and treat a non-empty slice as a
+// configuration bug to fix in the configuration, not as a condition to handle at runtime.
+// There is nothing to retry and nothing to repair: the store is already as configured, minus
+// the tuple. Fixing the spelling (or restoring the component's index, or declaring it
+// component-only) and reopening installs the composite. An empty slice is the normal state
+// and the only one worth alerting on the absence of.
+//
+// It is deliberately NOT an error. A collection's configuration is applied in New, which
+// cannot fail, and again on every reopen of a persistent store -- so a refusal raised as an
+// error would either have to be unreportable in the in-memory tier or stop an existing
+// deployment from opening its own data because a tuple in its saved configuration stopped
+// resolving. Turning a missing index into a refusal to start is the worse failure of the two.
+type CompositeRefusal struct {
+	// Attrs is the tuple exactly as it was configured, including spelling and order.
+	Attrs []string `json:"attrs"`
+	// Reason is one of the CompositeRefused* constants below.
+	Reason string `json:"reason"`
+	// Attr is the component at fault for the reasons that name one, and empty for the
+	// reasons that are about the tuple as a whole. Only the FIRST offending component is
+	// named: resolution stops at it, so a second one has not been looked at.
+	Attr string `json:"attr,omitempty"`
+}
+
+// The reasons a configured composite tuple is refused.
+//
+// A component that is not in the spec's id space at all (a name nothing was ever configured
+// under) and one that is in it but carries no kind (indexed neither in its own right nor as
+// a declared component) are ONE reason, not two. Which of the two a given name hits depends
+// on the id space: an inline spec knows only the names its own configuration mentions, an
+// interned one knows every name the store has ever interned. Splitting them would make the
+// same configuration report a different reason in memory than on disk, which is a worse
+// diagnostic than the slightly coarse one -- and the fix is the same either way.
+const (
+	// CompositeRefusedUnresolvableComponent: Attr is neither indexed in its own right nor
+	// declared a composite component, so there is no kind to fold it by.
+	CompositeRefusedUnresolvableComponent = "unresolvable-component"
+	// CompositeRefusedDuplicateComponent: Attr appears twice in the tuple. The second
+	// occurrence pins nothing the first did not.
+	CompositeRefusedDuplicateComponent = "duplicate-component"
+	// CompositeRefusedTooFewComponents: fewer than two components, which is an
+	// attribute index written as a tuple, not a composite.
+	CompositeRefusedTooFewComponents = "too-few-components"
+	// CompositeRefusedTooManyComponents: wider than maxCompositeAttrs.
+	CompositeRefusedTooManyComponents = "too-many-components"
+	// CompositeRefusedDuplicateTuple: these components in this order are already
+	// configured. The same components in a DIFFERENT order are a different composite and
+	// are not refused here.
+	CompositeRefusedDuplicateTuple = "duplicate-tuple"
+)
+
+// String renders a refusal as one log line: "ClusterId+ProcId: unresolvable-component ProcId".
+func (r CompositeRefusal) String() string {
+	s := strings.Join(r.Attrs, "+") + ": " + r.Reason
+	if r.Attr != "" {
+		s += " " + r.Attr
+	}
+	return s
 }
 
 // resolveIndexed returns the id of an attribute that is already indexed in this spec
-// (categorically or by value), in either id mode.
+// (categorically or by value), in either id mode. A component-only attribute is NOT indexed
+// and does not resolve here; that is what keeps the auto-tuner's components-first rule
+// (SuggestComposites) meaning what it always meant.
 func (s *indexSpec) resolveIndexed(intern *wire.InternTable, name string) (uint32, bool) {
-	fold := strings.ToLower(name)
-	var id uint32
-	var ok bool
-	if s.inline {
-		id, ok = s.nameToID[fold]
-	} else if intern != nil {
-		id, ok = intern.LookupID(fold)
-	}
+	id, ok := s.resolveID(intern, name)
 	if !ok {
 		return 0, false
 	}
 	return id, s.catHas(id) || s.valHas(id)
 }
 
-// setComposites installs the configured tuples on a freshly built spec and recomputes its
-// generation. Tuples naming an attribute the spec does not index are dropped (see
-// newCompositeSpecs).
-func (s *indexSpec) setComposites(intern *wire.InternTable, tuples [][]string, auto bool) {
-	if len(tuples) == 0 {
-		return
+// resolveComponent returns the id and kind of an attribute this spec can use as a composite
+// component: one indexed in its own right, or one declared component-only.
+func (s *indexSpec) resolveComponent(intern *wire.InternTable, name string) (id uint32, cat, ok bool) {
+	if id, ok = s.resolveID(intern, name); !ok {
+		return 0, false, false
 	}
-	s.comps = s.newCompositeSpecs(intern, tuples, auto)
-	s.gen = s.signature()
+	cat, ok = s.componentKind(id)
+	return id, cat, ok
 }
 
-// pruneComposites drops every composite a change to the single-attribute configuration has
-// invalidated: a component that is no longer indexed (what a DropIndex on one of its
+// resolveID looks a configured attribute name up in whichever id space this spec uses. It
+// does not say whether the attribute is indexed, only what it would be keyed as.
+func (s *indexSpec) resolveID(intern *wire.InternTable, name string) (uint32, bool) {
+	fold := strings.ToLower(name)
+	if s.inline {
+		id, ok := s.nameToID[fold]
+		return id, ok
+	}
+	if intern == nil {
+		return 0, false
+	}
+	return intern.LookupID(fold)
+}
+
+// setComposites installs the configured tuples on a freshly built spec and recomputes its
+// generation. Tuples naming an attribute the spec gives no kind to -- neither indexed nor
+// declared component-only -- are dropped (see newCompositeSpecs), and the dropped ones are
+// returned so the caller can say so. The returned slice holds at most one entry per tuple
+// passed in, which is what keeps it bounded by the configuration rather than by the store's
+// history: a caller that re-applies a configuration REPLACES what it holds with this, it
+// never appends.
+func (s *indexSpec) setComposites(intern *wire.InternTable, tuples [][]string, auto bool) []CompositeRefusal {
+	if len(tuples) == 0 {
+		return nil
+	}
+	var refused []CompositeRefusal
+	s.comps, refused = s.newCompositeSpecs(intern, tuples, auto)
+	s.gen = s.signature()
+	return refused
+}
+
+// pruneComposites drops every composite a change to the attribute configuration has
+// invalidated: a component that no longer has a kind at all (what a DropIndex on one of its
 // attributes leaves behind), or one whose KIND has changed, which an AddIndex naming a
-// value-indexed attribute as categorical does. A composite that outlived its components
-// would have nothing to fall back to for the conjunctions it does not cover; one whose
-// component kind is stale would fold every record's value the wrong way and post the whole
-// segment as exceptional.
+// value-indexed attribute as categorical does. A composite whose component kind is stale
+// would fold every record's value the wrong way and post the whole segment as exceptional.
+//
+// A component-only component is judged by exactly the same rule, through componentKind: it
+// is live while its declaration stands and dies with it. DropIndex removes the declaration
+// along with a real index, so dropping ProcId takes (ClusterId, ProcId) with it whether
+// ProcId was indexed or only a component.
 func (s *indexSpec) pruneComposites() {
 	if len(s.comps) == 0 {
 		return
@@ -371,7 +505,8 @@ func (s *indexSpec) pruneComposites() {
 	for _, cs := range s.comps {
 		live := true
 		for i, id := range cs.ids {
-			if (!s.catHas(id) && !s.valHas(id)) || s.catHas(id) != cs.cats[i] {
+			cat, ok := s.componentKind(id)
+			if !ok || cat != cs.cats[i] {
 				live = false
 				break
 			}
@@ -381,4 +516,23 @@ func (s *indexSpec) pruneComposites() {
 		}
 	}
 	s.comps = kept
+}
+
+// compositePinned marks, in into, the component ids of every configured composite whose
+// every component usable pins to a single value.
+//
+// This is the planner's gate on a component-only probe. Such a probe can only ever be
+// answered by a composite -- there are no postings for it to fall back to -- so one that no
+// configured composite can consume is dropped from the plan entirely rather than carried
+// into the single-attribute machinery, where an absent posting map reads as "no record
+// matches" and silently drops rows.
+func (s *indexSpec) compositePinned(usable []usableProbe, into map[uint32]struct{}) {
+	for _, cs := range s.comps {
+		if _, _, ok := compositeTupleKey(cs, usable); !ok {
+			continue
+		}
+		for _, id := range cs.ids {
+			into[id] = struct{}{}
+		}
+	}
 }

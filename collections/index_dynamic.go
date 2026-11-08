@@ -77,6 +77,11 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 			}
 			removeID(&next.valIDs, next.val, id) // categorical wins if it was a value index
 			addID(&next.catIDs, next.cat, id)
+			// The attribute now has an index of its own, which settles its kind; a
+			// component-only declaration alongside it would be a second answer to the
+			// question componentKind asks. pruneComposites below then drops any composite
+			// whose component this just re-kinded.
+			next.dropCompOnly(id)
 			mark(id)
 		}
 		for _, name := range value {
@@ -88,6 +93,7 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 				continue // already categorical; do not double-index
 			}
 			addID(&next.valIDs, next.val, id)
+			next.dropCompOnly(id) // an index of its own settles the kind (see above)
 			mark(id)
 		}
 		next.pruneComposites() // a composite whose component changed kind no longer describes the data
@@ -148,6 +154,10 @@ func (c *Collection) DropIndex(names ...string) bool {
 			}
 			removeID(&next.catIDs, next.cat, id)
 			removeID(&next.valIDs, next.val, id)
+			// A component-only declaration is dropped by name too: the attribute stops
+			// being anything to this spec, and pruneComposites then takes the composites
+			// that named it, exactly as it does for a dropped real index.
+			next.dropCompOnly(id)
 			// The id stops meaning anything, so it stops meaning a path too: a later AddIndex
 			// on the plain attribute of that name must not be refused by a shape this spec no
 			// longer indexes.
@@ -223,6 +233,12 @@ func (c *Collection) staleIndexCounts() (pending, byPolicy, sealed int) {
 
 // IndexedAttrs returns the currently-indexed attribute names, split by kind, in the
 // collection's canonical (interned) casing.
+//
+// Component-only attributes (Options.CategoricalComponentAttrs / ValueComponentAttrs) are
+// NOT reported, and that is the contract callers want: they ask this to decide whether a
+// constraint on an attribute can be answered from an index, and a component-only attribute
+// has no index of its own to answer one with. Nothing else reports them -- they are a
+// property of the composites that use them, which IndexSizes already names.
 func (c *Collection) IndexedAttrs() (categorical, value []string) {
 	spec := c.spec.Load()
 	name := func(id uint32) (string, bool) {
@@ -357,6 +373,23 @@ func (c *Collection) CompositeAttrs() [][]string {
 	return out
 }
 
+// CompositeRefusals returns the configured composite tuples this collection could not
+// install, and why -- the other half of CompositeAttrs, which reports only what survived.
+//
+// It is fixed at construction and never changes afterwards, because it describes the
+// configuration this store was opened with. A later AddIndex or DropIndex that would make a
+// refused tuple resolvable does not install it: the tuple is not retried, and the entry
+// here does not go away. Only reconfiguring and reopening does that, which is also the only
+// action a caller should take on a non-empty result -- see CompositeRefusal.
+//
+// The composites the AUTO-TUNER proposes are not reported here; see addCompositesAuto.
+func (c *Collection) CompositeRefusals() []CompositeRefusal {
+	if len(c.compRefused) == 0 {
+		return nil
+	}
+	return append([]CompositeRefusal(nil), c.compRefused...)
+}
+
 // AutoCompositeNames returns the tuples of the composites the auto-tuner created, a subset
 // of CompositeAttrs. The composite counterpart of AutoIndexNames.
 func (c *Collection) AutoCompositeNames() [][]string {
@@ -377,9 +410,10 @@ func (c *Collection) AutoCompositeNames() [][]string {
 // any was installed. The composite counterpart of AddAutoIndex, and the restore path for a
 // store whose composites are not re-derived from a saved configuration at open.
 //
-// Fewer tuples may be installed than were asked for, silently: a tuple whose component is
-// not indexed in its own right is refused (newCompositeSpecs), as is one some composite
-// already covers in any order. Both are the right answer for a restore -- the first says the
+// Fewer tuples may be installed than were asked for, silently -- and silently on purpose,
+// where a configured tuple's refusal is reported (CompositeRefusals): a tuple whose
+// component is not indexed in its own right is refused (newCompositeSpecs), as is one some
+// composite already covers in any order. Both are the right answer for a restore -- the first says the
 // component index did not come back, which leaves the composite nothing to fall back to for
 // the conjunctions it cannot answer; the second says the tuple is already configured, and a
 // configured composite is not the tuner's to claim.

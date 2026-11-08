@@ -283,7 +283,13 @@ func Open(opts Options) (*Collection, error) {
 	// below). Replace the interned spec New built with an inline one that extracts
 	// values by name (records carry no intern ids).
 	inlineSpec := newInlineIndexSpec(opts.CategoricalAttrs, opts.ValueAttrs)
-	inlineSpec.setComposites(nil, opts.CompositeAttrs, false)
+	inlineSpec.setComponentAttrs(nil, opts.CategoricalComponentAttrs, opts.ValueComponentAttrs)
+	// REPLACES what New recorded against the interned spec rather than adding to it: these
+	// are the same configured tuples resolved a second time, against the id space this store
+	// actually uses, so re-applying a configuration on every reopen leaves one entry per
+	// refused tuple and not one per open.
+	c.compRefused = inlineSpec.setComposites(nil, opts.CompositeAttrs, false)
+	c.openIdxDiag.CompositeRefusals = c.compRefused
 	c.spec.Store(inlineSpec)
 	// Inline mode keys the hot header by (folded) name; install the configured HotAttrs
 	// plus the always-hot defaults (Requirements, Rank) in inline form.

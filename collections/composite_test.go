@@ -274,9 +274,9 @@ func TestCompositeSkipsSegmentNeitherAttributeCan(t *testing.T) {
 	}
 }
 
-// A tuple naming an attribute that is not indexed in its own right is refused: the
-// fallbacks (a conjunction on part of the tuple, a segment indexed before the composite)
-// have to have something to fall back to.
+// A tuple naming an attribute this spec gives no kind to -- neither indexed nor declared a
+// composite component -- is refused: the record side and the probe side have to fold every
+// component the same way, and with no kind there is no way to fold it at all.
 func TestCompositeRequiresIndexedComponents(t *testing.T) {
 	c := New(Options{Shards: 1,
 		ValueAttrs:     []string{"ClusterId"},

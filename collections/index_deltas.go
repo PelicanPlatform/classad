@@ -186,6 +186,13 @@ func (c *Collection) newDeltaScope(sh *shard, s0 uint64, wins []segWindow, usabl
 		keep[i] = t.deltas.Clone()
 	}
 	for _, up := range usable {
+		if up.compOnly {
+			// A component-only attribute has no postings of its own, so neither this probe
+			// nor the presence probe below can be answered for it and there is nothing to
+			// narrow the inheriting deltas by. They stay admitted, which is a superset the
+			// caller re-verifies -- the same answer a delta of an unindexed attribute gets.
+			continue
+		}
 		single := []usableProbe{up}
 		present := []usableProbe{{attrID: up.attrID, cat: up.cat, op: "present"}}
 		// Deltas that do not carry the probe's attribute and are not candidates on their own:
