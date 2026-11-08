@@ -414,8 +414,10 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 				default:
 				}
 				if d, ok := s.cat.Table(name); ok {
+					o := opts // per-table, so the hook can name the table it fired for
+					o.OnAutoTune = func(res db.AutoTuneResult) { s.logAutoTune(name, "table", res) }
 					s.maintainMu.Lock()
-					d.Maintain(opts)
+					d.Maintain(o)
 					s.maintainMu.Unlock()
 				}
 			}
@@ -2278,11 +2280,11 @@ func (s *Server) maintainArchives(opts db.MaintainOptions, done <-chan struct{})
 		// an archive index is paid for by reading history back, so it is not something to
 		// start doing to an existing deployment on an upgrade.
 		if opts.ArchiveIndexMinDemand > 0 && !stopping() {
-			a.AutoTune(db.AutoTuneOptions{
+			s.logAutoTune(name, "archive", a.AutoTune(db.AutoTuneOptions{
 				SampleMax: opts.SampleMax,
 				MinDemand: opts.ArchiveIndexMinDemand,
 				Reindex:   true,
-			})
+			}))
 		}
 		// Age and checkpoint the recorded query demand. An archive needs this more than a
 		// mutable table does: indexing one is paid for by decompressing history, so the
@@ -2290,5 +2292,32 @@ func (s *Server) maintainArchives(opts db.MaintainOptions, done <-chan struct{})
 		// relied on to stay up.
 		a.SaveDemand()
 		s.maintainMu.Unlock()
+	}
+}
+
+// logAutoTune reports what the maintenance pass's auto-tuner did to one table. A pass that
+// changed nothing says nothing, which is almost every pass.
+//
+// The pass used to apply its decisions silently. That is tolerable for a single-attribute
+// index on a mutable table, which is built from live data; it is not for an archive, where
+// an add is paid for by decompressing history, and least of all for a composite, which moves
+// the index generation and so leaves EVERY sealed segment to be rebuilt by the backfill over
+// the passes that follow. An operator watching an archive suddenly read its whole history
+// back had nothing in the log to connect it to, and -- the question that actually gets asked
+// -- no way to confirm that an index demand should have earned had in fact been created.
+//
+// One line per change rather than one per pass: each carries its own attribute, kind and
+// reason, and a pass that changes several things is rare enough that the lines are not a
+// burden. Info, not Debug: these are infrequent and consequential.
+func (s *Server) logAutoTune(table, kind string, res db.AutoTuneResult) {
+	if !res.Changed || len(res.Changes) == 0 {
+		return
+	}
+	for _, ch := range res.Changes {
+		msg := "maintenance added an index"
+		if ch.Action == "drop" {
+			msg = "maintenance dropped an index"
+		}
+		s.logger().Info(msg, kind, table, "attr", ch.Attr, "index", ch.Kind, "reason", ch.Reason)
 	}
 }
