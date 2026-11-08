@@ -184,6 +184,16 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) 
 			res := classad.ApplyFunction(ev, f.name, stack[base:])
 			stack = append(stack[:base], res)
 			ip++
+		case OpMakeList:
+			base := len(stack) - int(in.A)
+			// The elements are COPIED out of the stack rather than handed over as a slice of it,
+			// which is the one place this differs from OpCallFunc: the value outlives the call, so
+			// aliasing the stack would let the next push overwrite an element of a list already
+			// returned.
+			els := make([]classad.Value, in.A)
+			copy(els, stack[base:])
+			stack = append(stack[:base], classad.NewListValue(els))
+			ip++
 		case OpEvalNode:
 			stack = append(stack, evalDelegated(ev, p.nodes[in.A], p.nodeLocals[in.A], locals))
 			ip++

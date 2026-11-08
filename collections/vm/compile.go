@@ -126,6 +126,19 @@ type compiler struct {
 	// isScriptFunc reports whether a name is one of the script's functions, for the refusal a
 	// delegated subtree gets. Nil outside a script.
 	isScriptFunc func(string) bool
+
+	// noAd says this program has no subject ad: it is a module function being compiled for
+	// registration, whose only inputs are its parameters. Set by ScriptModule.Compile and false
+	// everywhere else.
+	//
+	// IT UNLOCKS THE EAGER LIST, and that is the whole of what it does. A list literal is otherwise
+	// delegated and lazy, which is right against an ad and impossible without one: the elements are
+	// evaluated later, in a scope built from the ad the literal was written in, so with no ad there
+	// is no scope and with no scope a parameter has nowhere to be read from. Laziness is observable
+	// in exactly one place -- string coercion unparses the element SOURCE -- and that one place is
+	// why the eager form stays behind this flag rather than becoming how the language works. See
+	// OpMakeList.
+	noAd bool
 }
 
 // ins appends an instruction and returns its index (for later backpatching).
@@ -270,8 +283,26 @@ func (c *compiler) emit(expr ast.Expr) {
 		c.emitSubscript(v)
 	case *ast.ConditionalExpr:
 		c.emitTernary(v)
+	case *ast.ListLiteral:
+		// A list literal is built on the spot ONLY where there is no ad to evaluate it against
+		// later. Everywhere else it delegates with the rest, and stays lazy. See OpMakeList.
+		//
+		// An AD literal is not given the same treatment, and the reason is not effort. Its
+		// attribute values resolve against the literal ITSELF -- `[a = 1; b = a + 1]` is an ad
+		// whose b is 2 -- so building it eagerly would have to decide what a bare name inside it
+		// means, and in a function the answer would stop being "the sibling attribute" and start
+		// being "the parameter of that name". That is a change to what the construct means, where
+		// the list is a change only to when its elements are computed.
+		if !c.noAd {
+			c.delegate(expr)
+			return
+		}
+		for _, el := range v.Elements {
+			c.emit(el)
+		}
+		c.ins(OpMakeList, int32(len(v.Elements)))
 	default:
-		// ListLiteral, RecordLiteral, or any future node: delegate to the evaluator.
+		// RecordLiteral, or any future node: delegate to the evaluator.
 		// (A FunctionCall reaches the evaluator too, but only the ones StrictFunction
 		// refuses; the case above compiles the rest.)
 		c.delegate(expr)
@@ -294,9 +325,13 @@ func (c *compiler) emit(expr ast.Expr) {
 // own that the overlay does not reach: a list literal's elements (lazy -- materialized later, from
 // a captured scope, possibly after the script's registers are gone), an ad literal's attribute
 // values, and the first argument of countMatches/evalInEachContext. A local read in one of them is
-// refused with LocalCaptureError rather than silently resolved to the attribute of the same name,
-// and the ways around it -- binding the whole construct to a local, or MY.x where the attribute
-// really was meant -- are both one line away.
+// refused with LocalCaptureError rather than silently resolved to the attribute of the same name.
+//
+// BINDING THE CONSTRUCT TO A LOCAL IS NOT A WAY ROUND IT. `x = {a, b}` is refused in the same
+// place as `{a, b}`, because the refusal is about the elements and not about where the list ends
+// up; MY.x, where the attribute really was meant, is the only one-line answer. A list literal in a
+// MODULE FUNCTION does not reach here at all -- with no ad there is nothing to be lazy against, so
+// the compiler builds it on the spot (see OpMakeList).
 func (c *compiler) delegate(expr ast.Expr) {
 	c.ins(OpEvalNode, c.addNode(expr, c.bindDelegated(expr)))
 }
@@ -339,8 +374,9 @@ func (e *LocalCaptureError) Error() string { return "vm: script: " + e.detail() 
 func (e *LocalCaptureError) detail() string {
 	return fmt.Sprintf("%s reads the local %q from a list literal, an ad literal or a per-ad "+
 		"context, each of which is evaluated in a scope of its own where a local does not exist; "+
-		"bind the whole construct to a local first, or write MY.%s if the attribute was meant",
-		e.Expr, e.Local, e.Local)
+		"write MY.%s if the attribute was meant. Binding the construct to a local does not help: "+
+		"`x = %s` is refused in the same place, because its elements still read %q",
+		e.Expr, e.Local, e.Local, e.Expr, e.Local)
 }
 
 // detailed is a compiler refusal that can render itself without the "vm: script: " prefix.

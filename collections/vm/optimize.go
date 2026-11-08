@@ -102,7 +102,7 @@ func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond,
 		RShortSubscript, RTernBranch:
 		buf = append(buf, in.A)
-	case RCallFunc:
+	case RCallFunc, RMakeList:
 		buf = append(buf, rp.args[in.Args]...)
 	default:
 		// Loudly, because the alternative is a pass that quietly treats a new instruction as reading
@@ -257,7 +257,14 @@ func substitute(rp *RegProgram, j int, from, to int32) {
 				rp.nodeLocals[in.Imm][k].reg = to
 			}
 		}
-	case RCallFunc:
+	case RCallFunc, RMakeList:
+		// RMakeList CANNOT REACH HERE TODAY, and is listed anyway. Only a module function emits
+		// one, and copy propagation does not elide a copy feeding one in any program the current
+		// compile path builds -- which is a property of that path and not of this function's
+		// contract. Leaving it out would make the first program that does reach it read the
+		// register the elided copy wrote, silently, and the operand list is the one place a
+		// missing rewrite does not fail to compile.
+		//
 		// Copied before writing: Optimize shares the argument lists with the program it was given,
 		// and rewriting in place would reach back into the unoptimized one -- which is the oracle.
 		src := rp.args[in.Args]

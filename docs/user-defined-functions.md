@@ -15,17 +15,17 @@ Every sample is an excerpt from a file `go test` runs; section 9 lists them.
 |---|---|---|
 | **Go** | `classad.RegisterFunction` | `db.RegisterAggregate` |
 | **WebAssembly** | `wasmudf.Register` | `wasmudf.RegisterAggregate` |
-| **ClassAd Script** | `scriptudf.Register` | — |
+| **ClassAd Script** | `scriptudf.Register` | `scriptagg.Register` |
 
 A **scalar function** is called once per value, anywhere a built-in like `pow()`
 can appear. An **aggregate** reduces a group of rows to one answer, named in an
 `AggSpec` as `AggUser`, and reduced by the same `GROUP BY` core as `SUM`.
 
 The second and third rows are not separate mechanisms. `wasmudf` loads a guest
-module; `scriptudf` compiles a module written in **ClassAd Script**, the statement
-language of section 7. Each picks one of the module's exports by name, wraps it in
-the Go signature the registry above it takes, and registers it there. Sections 2
-and 3 apply to all three.
+module; `scriptudf` and `scriptagg` compile a module written in **ClassAd Script**,
+the statement language of section 7. Each picks one of the module's exports by name,
+wraps it in the Go signature the registry above it takes, and registers it there.
+Sections 2 and 3 apply to all three.
 
 ## 2. Go, WebAssembly or ClassAd Script
 
@@ -482,8 +482,14 @@ result = countMatches(x, MY.GPUs)   # a per-ad context
 Each of those evaluates in a scope of its own. A list literal is the clearest
 case: its elements are evaluated on demand, in a scope captured when the list was
 built, which may be long after the script has finished and its locals are gone.
-Bind the whole construct to a local first, or write `MY.x` if the attribute was
-what you meant.
+Write `MY.x` if the attribute was what you meant.
+
+Binding the construct to a local is **not** a way round it: `y = {x, 1}` is
+refused in the same place as `result = {x, 1}`, because the elements are what
+read the local and that does not change by giving the list a name. In a
+*registered function* there is no ad, so a list literal is built where it stands
+and its elements may read the parameters freely — which is what makes composite
+aggregate state possible (section 7's aggregate).
 
 **A script can define its own functions**, for a rule it applies more than once:
 
@@ -610,12 +616,12 @@ examplePct(Used, Label)     error
 the body does not bind is an attribute of the subject ad, and that is most of what
 makes a script function useful there. A registration has no subject ad, so
 `def fits(requested, cap): return Optimistic` is refused rather than registered —
-along with `MY.RequestMemory`, a call to `random()`, a list literal and a
+along with `MY.RequestMemory`, a call to `random()`, an ad literal and a
 selection. Pass what the function needs as a parameter.
 
 A body may use the operators and constructs the compiler lowers natively, over
 its parameters: arithmetic and comparison, `&&` and `||`, `?:`, a ternary
-`c ? t : f`, a subscript, `ifThenElse` and the strict built-ins. The error says which rule refused it
+`c ? t : f`, a list literal, a subscript, `ifThenElse` and the strict built-ins. The error says which rule refused it
 and what to write instead, and `errors.Is(err, vm.ErrReadsAd)` tells that refusal
 apart from a function that simply does not compile.
 
@@ -623,6 +629,67 @@ Everything else in section 3 holds. Compilation happens before registration, so 
 name is only ever registered against a function that compiled; registration is
 append-only; names fold case; and a call that runs too long gives ERROR rather
 than hanging the scan, because a script may loop.
+
+### An aggregate in ClassAd Script
+
+An aggregate is four `def`s threading a state value. There is no accumulator
+object, no mutation and no handle — the Go side holds one `classad.Value` per
+group and passes it in and out:
+
+```
+def init():            the identity — the answer for a group with no rows
+def add(state, v):     the state with one row's value folded in
+def merge(a, b):       two partial states combined
+def result(state):     the group's answer
+```
+
+```go
+mod, err := vm.ParseScriptModule(`
+def init():
+    return {0, 0}
+
+def add(s, v):
+    return isReal(v) || isInteger(v) ? {s[0] + v, s[1] + 1} : s
+
+def merge(a, b):
+    return {a[0] + b[0], a[1] + b[1]}
+
+def result(s):
+    return s[1] > 0 ? real(s[0]) / s[1] : undefined
+`)
+
+agg, err := scriptagg.Register("exampleMean", mod, scriptagg.Spec{})
+```
+
+```
+GROUP BY Pool, exampleMean(Memory)
+"cm1" count=3 mean=2389.3333333333335
+"cm2" count=2 mean=8192
+```
+
+The state is a **list** because a mean needs a sum and a count at once. A list
+literal in a registered function is built where it stands rather than evaluated
+later against an ad, which is what lets its elements read the parameters — see
+section 7's note on what a registered function may contain. Scalar state (a
+running total, a maximum, a count) is just a number.
+
+`Spec` names the four functions when they are not called `init`, `add`, `merge`
+and `result`, so one module can export several aggregates. Everything is
+compiled at `Register` time, including `init`, which is *called*: an aggregate
+with no usable identity is a registration error and not a column of ERROR later.
+
+Everything in section 5 still applies, and the merge laws most of all. They are
+the script's to keep and nothing in the compiler can check them, so run
+`db.CheckAggregate` over a sample and keep the test:
+
+```go
+db.CheckAggregate(agg, samples)
+```
+
+Set `Spec{Columnar: true}` to opt into the columnar value pass. It is the same
+promise `ColumnAccumulator` is in section 5 — order independence, and counting
+only the rows the pass offers — made on behalf of a script the compiler cannot
+read. `CheckAggregate` tests it for an aggregate that declares it.
 
 The language's design, and what remains to build, are in
 [docs/SCRIPTING_LANGUAGE_DESIGN.md](SCRIPTING_LANGUAGE_DESIGN.md).
@@ -645,6 +712,7 @@ The samples above, all run by `go test`:
 | `collections/vm/example_script_test.go` | the same script through the builder API |
 | `collections/vm/example_scriptfunc_test.go` | the script function above |
 | `collections/scriptudf/example_test.go` | registering a script module's function |
+| `db/scriptagg/example_test.go` | registering a script module's aggregate |
 | `db/example_udaf_test.go` | the Go aggregate and `CheckAggregateEqual` |
 | `wasmudf/example_test.go` | loading and registering both kinds of wasm module |
 | `wasmudf/testdata/examplepct.wat` | the wasm function |

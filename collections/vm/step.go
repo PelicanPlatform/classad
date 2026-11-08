@@ -40,11 +40,13 @@ package vm
 // reclassifies every opcode after the one somebody inserts in the middle.
 const valueOps = 1<<OpPushConst | 1<<OpPushTrue | 1<<OpPushFalse | 1<<OpPushUndef | 1<<OpPushError |
 	1<<OpLoadRef | 1<<OpBinop | 1<<OpUnop | 1<<OpCombineAnd | 1<<OpCombineOr |
-	1<<OpMember | 1<<OpStrListMember | 1<<OpCallFunc | 1<<OpEvalNode | 1<<OpSubscript
+	1<<OpMember | 1<<OpStrListMember | 1<<OpCallFunc | 1<<OpEvalNode | 1<<OpSubscript |
+	1<<OpMakeList
 
 const regValueOps = 1<<RConst | 1<<RTrue | 1<<RFalse | 1<<RUndef | 1<<RError |
 	1<<RLoadRef | 1<<RBinop | 1<<RUnop | 1<<RCombineAnd | 1<<RCombineOr |
-	1<<RMember | 1<<RStrListMember | 1<<RCallFunc | 1<<REvalNode | 1<<RSubscript
+	1<<RMember | 1<<RStrListMember | 1<<RCallFunc | 1<<REvalNode | 1<<RSubscript |
+	1<<RMakeList
 
 // nonValueOps and regNonValueOps are the complements, written out rather than derived. They exist so
 // that an opcode added later is in NEITHER mask, which TestEveryOpcodeIsClassified turns into a

@@ -142,6 +142,10 @@ const (
 	RTernBranch
 	RTernTrue
 	RTernFalse
+
+	// RMakeList sets Dst to the list holding the values in the registers listed by args[Args], in
+	// element order. The register-form twin of OpMakeList, and eager for the reason stated there.
+	RMakeList
 )
 
 // RegInstr is one register-form instruction. Dst, A and B are register numbers; Imm is an index into
@@ -161,7 +165,7 @@ type RegInstr struct {
 // the two forms from being able to disagree about what a constant or an operator is.
 type RegProgram struct {
 	code  []RegInstr
-	args  [][]int32     // RCallFunc argument register lists
+	args  [][]int32     // RCallFunc and RMakeList operand register lists
 	conds []condTargets // RBranchCond targets, as REGISTER-form indices
 	nregs int
 	res   int32 // the register holding the expression's value, or -1 for an empty program
@@ -562,6 +566,18 @@ func (l *lowerer) one(ip int) {
 		d := l.reg()
 		l.emit(RegInstr{Op: RCallFunc, Dst: d, Imm: in.A, Args: int32(len(l.rp.args) - 1)})
 		l.push(d)
+	case OpMakeList:
+		// The same operand-list machinery a call uses, because the shape is the same: n values
+		// popped in reverse and one produced. Sharing it means the optimizer's use list and its
+		// register rewrite cover both with one case apiece rather than two that can drift.
+		els := make([]int32, in.A)
+		for i := int(in.A) - 1; i >= 0; i-- {
+			els[i] = l.pop()
+		}
+		l.rp.args = append(l.rp.args, els)
+		d := l.reg()
+		l.emit(RegInstr{Op: RMakeList, Dst: d, Args: int32(len(l.rp.args) - 1)})
+		l.push(d)
 	case OpEvalNode:
 		d := l.reg()
 		l.emit(RegInstr{Op: REvalNode, Dst: d, Imm: in.A})
@@ -876,6 +892,14 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 				args[i] = regs[r]
 			}
 			regs[in.Dst] = classad.ApplyFunction(ev, f.name, args)
+			ip++
+		case RMakeList:
+			srcs := rp.args[in.Args]
+			els := make([]classad.Value, len(srcs))
+			for i, r := range srcs {
+				els[i] = regs[r]
+			}
+			regs[in.Dst] = classad.NewListValue(els)
 			ip++
 		case REvalNode:
 			regs[in.Dst] = evalDelegated(ev, p.nodes[in.Imm], rp.nodeLocals[in.Imm], regs)

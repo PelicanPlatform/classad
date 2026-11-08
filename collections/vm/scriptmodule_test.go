@@ -200,9 +200,11 @@ func TestScriptFuncPurityGate(t *testing.T) {
 		// overlay makes a function compile that the compiler would otherwise refuse, and the gate
 		// has to catch it either way.
 		{"lazy_builtin_over_param", "def f(x):\n    return eval(x)\n", "eval(x)"},
-		// A list literal over a parameter is still refused by the COMPILER, before the gate: the
-		// elements are evaluated later, from a captured scope, where the register does not exist.
-		{"list_over_param", "def f(x):\n    return {x, 1}\n", `reads the local "x"`},
+		// An ad literal over a parameter is refused by the COMPILER, before the gate: its attribute
+		// values are evaluated later, in a scope of their own, where the register does not exist.
+		// A LIST literal over a parameter is not here, because a module function compiles one
+		// natively; see TestScriptFuncBuildsAList.
+		{"ad_literal_over_param", "def f(x):\n    return [a = x]\n", `reads the local "x"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -346,16 +348,16 @@ func TestScriptFuncDelegatedRefusalNamesWhatWasFound(t *testing.T) {
 		return ""
 	}
 
-	list := refusal(t, "def f(x):\n    return size({1, 2, 3})\n")
-	if !strings.Contains(list, "{1, 2, 3}") {
-		t.Errorf("the refusal should name what it found; got %q", list)
+	rec := refusal(t, "def f(x):\n    return size([a = 1])\n")
+	if !strings.Contains(rec, "a = 1") {
+		t.Errorf("the refusal should name what it found; got %q", rec)
 	}
 
 	lazy := refusal(t, "def f(x):\n    return eval(x)\n")
 	if !strings.Contains(lazy, "eval(x)") {
 		t.Errorf("the refusal should name what it found; got %q", lazy)
 	}
-	if strings.Contains(lazy, "{1, 2, 3}") {
+	if strings.Contains(lazy, "a = 1") {
 		t.Errorf("the refusal names a construct the function does not contain; got %q", lazy)
 	}
 }
