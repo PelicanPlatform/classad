@@ -48,9 +48,9 @@ func lacksCoverage(seg, act *segment, spec *indexSpec) bool {
 }
 
 // coversSpec reports whether the sidecar holds every attribute spec indexes, as the kind
-// spec indexes it as. An attribute the sidecar holds as the other kind does not count: a
-// probe looks the attribute up in the directory for its own kind, so it would read as
-// uncovered there too.
+// spec indexes it as, and a composite for every tuple it configures. An attribute the
+// sidecar holds as the other kind does not count: a probe looks the attribute up in the
+// directory for its own kind, so it would read as uncovered there too.
 func (si *mmapSegIndex) coversSpec(spec *indexSpec) bool {
 	for _, id := range spec.catIDs {
 		if _, ok := si.catDir[id]; !ok {
@@ -62,7 +62,53 @@ func (si *mmapSegIndex) coversSpec(spec *indexSpec) bool {
 			return false
 		}
 	}
+	return si.coversComposites(spec)
+}
+
+// coversComposites reports whether the sidecar carries a composite for every tuple spec
+// configures.
+//
+// Without this a composite added to an existing archive could never reach a segment the
+// bounded Reindex did not cover. Every sealed sidecar carries the index GENERATION, which a
+// composite add moves, so staleIndexCounts correctly reports those segments as stale and
+// defers them to the backfill -- and the backfill, selecting on the attribute directories
+// alone, saw a sidecar that still held every indexed attribute and passed over it. The two
+// disagreed silently: the configuration listed the composite, IndexBackfillPending reported
+// nothing to do, and the conjunction kept intersecting the components' postings on every
+// segment older than the horizon, for the life of the archive.
+//
+// Compared as a SET of component ids rather than by the composite's key, which is ordered.
+// A sidecar holding (ClusterId, ProcId) answers a spec declaring (ProcId, ClusterId) --
+// compositeMatch builds the probe key from the SIDECAR's own component order, not the
+// configuration's -- so the two differ in identity and not in what they answer, and
+// rebuilding every sealed segment over a reordering would cost a whole archive for nothing.
+//
+// A sidecar written before the format carried composites declares none, so any configured
+// composite makes it uncovered and the backfill rebuilds it. That is the intended bill and
+// the only way those segments can ever answer from the composite; an archive with no
+// composite configured is untouched, which is every archive that has not asked for one.
+func (si *mmapSegIndex) coversComposites(spec *indexSpec) bool {
+	for i := range spec.comps {
+		if !slices.ContainsFunc(si.comps, func(mc mmapComposite) bool {
+			return sameIDSet(mc.spec.ids, spec.comps[i].ids)
+		}) {
+			return false
+		}
+	}
 	return true
+}
+
+// sameIDSet reports whether two component id lists hold the same ids, in any order. Neither
+// input is modified.
+func sameIDSet(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]uint32(nil), a...)
+	y := append([]uint32(nil), b...)
+	slices.Sort(x)
+	slices.Sort(y)
+	return slices.Equal(x, y)
 }
 
 // IndexBackfillPending reports how many sealed segments lack postings for some currently
