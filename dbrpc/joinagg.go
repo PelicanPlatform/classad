@@ -67,7 +67,7 @@ func (c *Client) JoinAggregate(ctx context.Context, jr JoinAggRequest) ([]db.Agg
 func (c *Client) joinAggregate(ctx context.Context, jr JoinAggRequest, rep *JoinStatsReport) ([]db.AggRow, error) {
 	wantStats := c.wantJoinStats(rep)
 	if !c.SupportsNewer(FeatJoinAgg) {
-		return nil, ErrJoinAggUnsupported
+		return nil, c.featureRefusal(FeatJoinAgg, ErrJoinAggUnsupported)
 	}
 	chain := len(jr.Spec.Join.Steps) > 0
 	// A chain rides this opcode under a flag, but it still needs a server whose join folds
@@ -75,7 +75,7 @@ func (c *Client) joinAggregate(ctx context.Context, jr JoinAggRequest, rep *Join
 	// a chain from reaching a two-table server as a request it will refuse after a round
 	// trip -- the same check Join and JoinWire make by picking a chain opcode.
 	if chain && !c.SupportsNewer(FeatJoinChain) {
-		return nil, ErrJoinAggUnsupported
+		return nil, c.featureRefusal(FeatJoinChain, ErrJoinAggUnsupported)
 	}
 	if err := refuseJoinAggSpec(jr.Spec); err != nil {
 		return nil, err

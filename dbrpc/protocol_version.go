@@ -369,6 +369,9 @@ func WithPeerSessionAttrs(attrs map[string]string) ClientOption {
 		if len(attrs) == 0 {
 			return
 		}
+		// Whatever the attrs turn out to say, this client has now been told what the
+		// peer advertised, so a feature missing from them is the PEER's silence.
+		c.peerAttrsGiven = true
 		raw, ok := attrs[SessionAttrFeatures]
 		if !ok {
 			// A version without a feature list tells us the peer advertises,

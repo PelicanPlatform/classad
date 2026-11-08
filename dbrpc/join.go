@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"strings"
 	"time"
@@ -651,7 +652,7 @@ func (c *Client) joinWire(ctx context.Context, jr JoinRequest, redact bool, yiel
 	o, feat := joinOpFor(jr, opJoinWire, opJoinChainWire, FeatJoinWire, FeatJoinChainWire)
 	wantStats := c.wantJoinStats(rep)
 	if !c.SupportsNewer(feat) {
-		return ErrJoinWireUnsupported
+		return c.featureRefusal(feat, ErrJoinWireUnsupported)
 	}
 	_, ch, strm, err := c.callStream(joinFrameOp(jr, o, true, redact, wantStats))
 	if err != nil {
@@ -695,4 +696,36 @@ func (c *Client) joinWire(ctx context.Context, jr JoinRequest, redact bool, yiel
 			}
 		}
 	}
+}
+
+// ErrPeerFeaturesUnknown reports that this CLIENT was never told what the peer advertised,
+// so it cannot say whether the server implements a request. It is a fact about the local
+// client -- NewClient without WithPeerSessionAttrs -- and not a statement about the server.
+//
+// Before it existed the two were the same error. A client built without the peer's session
+// attributes has peerFeatures nil, every feature introduced after advertisement reads as
+// SupportUnknown, and SupportsNewer turns that into a no; the caller was then told "the
+// server does not implement a server-side join" about a server that does. Production is
+// fine, because the transports that matter pass the session's attrs, but a test harness that
+// forgets gets a confident wrong answer, and the sentinel gave it nothing to tell that from
+// a genuinely old peer.
+//
+// It is reported ALONGSIDE the request's own sentinel, never instead of it: errors.Is finds
+// both, so a caller that already classifies ErrJoinUnsupported (and falls back to joining the
+// sides itself) keeps working unchanged, and only a caller that asks the new question sees
+// the difference.
+var ErrPeerFeaturesUnknown = errors.New("dbrpc: this client was not given the peer's session attributes, so it cannot tell what the server supports")
+
+// featureRefusal is what a client returns when advertisement says not to send a request.
+//
+// sentinel is the request's own "the server cannot do this" error, returned as it stands
+// whenever this client actually knows something about the peer. It is wrapped together with
+// ErrPeerFeaturesUnknown in the one case where the refusal was decided by this client's own
+// ignorance.
+func (c *Client) featureRefusal(f Feature, sentinel error) error {
+	if c.peerAttrsGiven || c.Supports(f) != SupportUnknown {
+		return sentinel
+	}
+	return fmt.Errorf("%w (%w): build the client with WithPeerSessionAttrs so it can tell a "+
+		"server that lacks %q from one it was never told about", sentinel, ErrPeerFeaturesUnknown, f)
 }

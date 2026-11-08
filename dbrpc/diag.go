@@ -662,7 +662,7 @@ func (c *Client) ExplainTable(ctx context.Context, table, constraint string) (*d
 // Join uses, so a caller classifies both the same way.
 func (c *Client) ExplainJoin(ctx context.Context, jr JoinRequest) (*db.JoinExplain, error) {
 	if !c.SupportsNewer(FeatJoinExplain) {
-		return nil, ErrJoinUnsupported
+		return nil, c.featureRefusal(FeatJoinExplain, ErrJoinUnsupported)
 	}
 	o, _ := joinOpFor(jr, opJoinExplain, opJoinChainExplain, FeatJoinExplain, FeatJoinExplain)
 	status, body, err := c.callCtx(ctx, joinFrameOp(jr, o, false, false, false))

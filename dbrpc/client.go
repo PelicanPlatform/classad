@@ -39,6 +39,12 @@ type Client struct {
 	// advertising an empty set -- see Support.
 	peerProtocol int
 	peerFeatures map[Feature]bool
+	// peerAttrsGiven records that this client was TOLD what the peer advertised, which is
+	// not the same as the peer having advertised something. Both leave peerFeatures nil,
+	// and until they were told apart a client built without WithPeerSessionAttrs reported
+	// every newer feature as one the server lacks -- a statement about the server, made
+	// from a fact about this client. See featureRefusal.
+	peerAttrsGiven bool
 
 	// Observer, if set before use, receives a timing breakdown for each completed unary
 	// call. It lets an embedder (e.g. a collector's Prometheus metrics) localize where a
