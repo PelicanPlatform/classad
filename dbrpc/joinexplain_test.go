@@ -206,3 +206,54 @@ func mustSecondConn(t *testing.T, srv *Server) MsgConn {
 	t.Cleanup(func() { _ = cconn.Close() })
 	return cconn
 }
+
+// What the plan would HOLD is the number that decides whether it runs, so a client has to
+// get both the bound and the verdict on it, not just the limit it was measured against.
+//
+// This fixture is small -- two rows held -- so the two verdicts are reached by moving the
+// LIMIT rather than the data, which is also the only part of this a client controls.
+func TestExplainJoinReportsWhatThePlanWouldHold(t *testing.T) {
+	c, _ := chainRPCFixture(t)
+	ask := func(t *testing.T, maxHash int) *db.JoinExplain {
+		t.Helper()
+		jr := chainRPCRequest(db.JoinInner, db.JoinInner)
+		jr.Limits = db.JoinLimits{MaxHashRows: maxHash}
+		got, err := c.ExplainJoin(context.Background(), jr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.EstHashRows <= 0 {
+			t.Fatalf("the report gives no bound on what the plan holds: %s", got.HashWhy)
+		}
+		// The per-step shares have to add up to the total, or the two numbers are
+		// describing different plans.
+		sum := 0
+		for _, st := range got.Steps {
+			sum += st.EstRecords
+		}
+		if sum != got.EstHashRows {
+			t.Errorf("the steps hold %d rows between them and the plan reports %d", sum,
+				got.EstHashRows)
+		}
+		return got
+	}
+
+	fits := ask(t, 7)
+	if fits.EstHashRows > 7 {
+		t.Fatalf("the plan holds %d rows, so a limit of 7 is not the fitting case",
+			fits.EstHashRows)
+	}
+	if !strings.Contains(fits.HashWhy, "within") {
+		t.Errorf("HashWhy is %q, want it to say the plan is within the limit", fits.HashWhy)
+	}
+
+	// One row is below anything this fixture can hold, so the same plan is now refused.
+	over := ask(t, 1)
+	if !strings.Contains(over.HashWhy, "refused") {
+		t.Errorf("HashWhy is %q, want it to say the plan will be refused", over.HashWhy)
+	}
+	if over.EstHashRows != fits.EstHashRows {
+		t.Errorf("the bound moved with the limit: %d against %d", over.EstHashRows,
+			fits.EstHashRows)
+	}
+}
