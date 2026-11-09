@@ -155,7 +155,7 @@ func TestChainReorderAnswersTheSameRows(t *testing.T) {
 func TestChainReorderPlacesEachOnTermAtItsEarliestStep(t *testing.T) {
 	cat := orderFixture(t, 4000, 40)
 	var st JoinStats
-	out := cat.planJoinOrder(orderSpec(), false, &st)
+	out := cat.planJoinOrder(orderSpec(), DefaultJoinLimits(), false, &st)
 
 	if st.ChainFromAlias != "jobs" {
 		t.Fatalf("read FROM %q, want jobs: the largest table is streamed when no index "+
@@ -266,7 +266,7 @@ func TestChainReorderDeclines(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cat, spec := tc.build(t)
 			var st JoinStats
-			out := cat.planJoinOrder(spec, false, &st)
+			out := cat.planJoinOrder(spec, DefaultJoinLimits(), false, &st)
 			if !strings.Contains(st.ChainOrderWhy, tc.want) {
 				t.Errorf("declined with %q, want it to mention %q", st.ChainOrderWhy, tc.want)
 			}
@@ -298,7 +298,7 @@ func TestChainReorderRefusesAnOnTermItCannotPlace(t *testing.T) {
 	spec := orderSpec()
 	spec.Steps[0].Cond = append(spec.Steps[0].Cond, "size({hist, jobs}) > 0")
 	var st JoinStats
-	cat.planJoinOrder(spec, false, &st)
+	cat.planJoinOrder(spec, DefaultJoinLimits(), false, &st)
 	if !strings.Contains(st.ChainOrderWhy, "no step it can safely be moved to") {
 		t.Errorf("declined with %q, want it to refuse the term it cannot place", st.ChainOrderWhy)
 	}
@@ -315,7 +315,7 @@ func TestPlanJoinOrderLeavesTwoTablesToTheBuildSidePlanner(t *testing.T) {
 		Equi:  []JoinEqui{{Left: "K", Right: "K"}},
 	}
 	var st JoinStats
-	cat.planJoinOrder(spec, false, &st)
+	cat.planJoinOrder(spec, DefaultJoinLimits(), false, &st)
 	if st.BuildSideWhy == "" {
 		t.Error("a two-table join reported no build-side decision")
 	}
@@ -428,11 +428,123 @@ func TestChainReorderDeclinesAFromTableJoinedToNothing(t *testing.T) {
 	spec.Steps[1].Cond = []string{"hist.K == small.K"}
 	spec.Steps[1].Equi = []JoinEqui{{Left: "hist.K", Right: "K"}}
 	var st JoinStats
-	out := cat.planJoinOrder(spec, false, &st)
+	out := cat.planJoinOrder(spec, DefaultJoinLimits(), false, &st)
 	if !strings.Contains(st.ChainOrderWhy, "joined to no other table") {
 		t.Errorf("declined with %q, want it to say jobs is joined to nothing", st.ChainOrderWhy)
 	}
 	if out.Left.Alias != "jobs" {
 		t.Errorf("declined but moved the FROM side to %q", out.Left.Alias)
+	}
+}
+
+// chainProbeFixture is a star of three INDEXED tables that have given up newest-first: one
+// small, two large. An index on the join key is what makes the candidates differ on records
+// touched, which is what the chain planner's hashRows tie-break cannot otherwise be told
+// apart from.
+func chainProbeFixture(tb testing.TB, big, small int) *Catalog {
+	tb.Helper()
+	cat, err := OpenCatalog(tb.TempDir())
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { cat.Close() })
+	cfg := ArchiveConfig{SegmentSize: 4096, Unordered: true, ValueAttrs: []string{"K"}}
+	mk := func(name string) *ArchiveTable {
+		t, cerr := cat.CreateArchiveTable(name, cfg)
+		if cerr != nil {
+			tb.Fatal(cerr)
+		}
+		return t
+	}
+	app := func(t *ArchiveTable, k int) {
+		ad := classad.New()
+		ad.InsertAttr("K", int64(k))
+		ad.InsertAttrString("Pad", strings.Repeat("x", 64))
+		if aerr := t.Append(ad); aerr != nil {
+			tb.Fatal(aerr)
+		}
+	}
+	sm, b1, b2 := mk("small"), mk("big1"), mk("big2")
+	for i := 0; i < big; i++ {
+		app(b1, i)
+		app(b2, i)
+	}
+	stride := big / small
+	for k := 0; k < small; k++ {
+		app(sm, k*stride)
+	}
+	return cat
+}
+
+// chainProbeSpec is that star written FROM the small table, so the chain as written holds
+// both large ones.
+func chainProbeSpec() JoinSpec {
+	return JoinSpec{
+		Left: JoinSide{Table: "small", Alias: "small"},
+		Steps: []JoinStep{
+			{
+				Kind: JoinInner,
+				Side: JoinSide{Table: "big1", Alias: "big1"},
+				Cond: []string{"small.K == big1.K"},
+				Equi: []JoinEqui{{Left: "small.K", Right: "K"}},
+			},
+			{
+				Kind: JoinInner,
+				Side: JoinSide{Table: "big2", Alias: "big2"},
+				Cond: []string{"small.K == big2.K"},
+				Equi: []JoinEqui{{Left: "small.K", Right: "K"}},
+			},
+		},
+	}
+}
+
+// The chain planner prices `fits` against the limits the join will RUN under, the same as
+// the build-side planner does. A chain holds every table but the one it reads FROM, so which
+// table that is decides whether the chain fits at all -- and a plan chosen against the
+// store's defaults can be one the caller's own budget then refuses.
+//
+// Written FROM the small table, both large tables are probed through their index and the
+// chain touches the fewest records -- while holding the most. That is the only shape where
+// this matters: wherever no index separates the candidates, every order touches the same
+// records and the tie-break already hashes the least.
+func TestChainOrderFitsAgainstTheLimitsTheJoinRunsUnder(t *testing.T) {
+	cat := chainProbeFixture(t, 8192, 32)
+	spec := chainProbeSpec()
+
+	// Anti-vacuity: under the store's own limits every order fits, the index decides, and
+	// the chain stays as written. Whatever moves below, the limit is what moved it.
+	var asIs JoinStats
+	cat.planJoinOrder(spec, DefaultJoinLimits(), false, &asIs)
+	if asIs.ChainFromAlias != "" {
+		t.Fatalf("the chain was re-planned under the default limits already: %s",
+			asIs.ChainOrderWhy)
+	}
+
+	var st JoinStats
+	seq, err := cat.Join(spec, JoinLimits{MaxHashRows: 10000}, &st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for range seq {
+		rows++
+	}
+	if st.Err != nil {
+		t.Fatalf("the chain did not run under its own limit: %v", st.Err)
+	}
+	if st.ChainFromAlias == "" || st.ChainFromAlias == "small" {
+		t.Fatalf("the chain was read FROM %q, so it still holds both large tables: %s",
+			st.ChainFromAlias, st.ChainOrderWhy)
+	}
+	if !strings.Contains(st.ChainOrderWhy, "more than one join may") {
+		t.Errorf("the reason %q does not say the chain would have held too much",
+			st.ChainOrderWhy)
+	}
+	if st.HashRows > 10000 {
+		t.Fatalf("the chain held %d rows against a limit of 10000", st.HashRows)
+	}
+	if rows != 32 {
+		t.Fatalf("the re-planned chain produced %d rows, expected one per row of the "+
+			"small table", rows)
 	}
 }

@@ -414,6 +414,14 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 // refusal cost the probe on exactly the shape it is most wanted for: a two-attribute key is
 // how jobs are identified, so the join that most wants an index was the one declining it.
 func (cat *Catalog) probeGateAll(sp *joinStepPlan, side JoinSide) (out, all []probeAttr, rows, segments int, why string) {
+	if sp.kind == joinRightOuter {
+		// The membership constraint admits only the rows whose key the streamed side
+		// holds, which is exactly a filter that drops the rows matching nothing -- and in
+		// this orientation the hashed side is the PRESERVED one, so those are the rows the
+		// LEFT join exists to keep. Narrowing it would silently answer a smaller query.
+		return nil, nil, 0, 0, "this side's unmatched rows are preserved, so its read may " +
+			"not be narrowed to the keys the streamed side holds"
+	}
 	if len(sp.equiSide) == 0 {
 		return nil, nil, 0, 0, "the condition has no equality to probe an index with"
 	}

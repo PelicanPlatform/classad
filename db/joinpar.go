@@ -103,22 +103,27 @@ type joinBatch[T any] struct {
 
 // runJoinParallel walks the scanned side across P goroutines, in scan order.
 //
-// It returns false WITHOUT yielding anything when it declines (no budget, nothing to gain),
-// and the caller walks serially. Once it has yielded it owns the read.
+// ran is false WITHOUT anything having been yielded when it declines (no budget, nothing to
+// gain), and the caller walks serially. Once it has yielded it owns the read.
+//
+// whole says the stream was walked to the end: no limit tripped, no consumer broke out, no
+// walker's own budget failed. It is what tells the caller whether a right-outer step's
+// leftover rows may be emitted -- an interrupted walk has not finished deciding what matched
+// (see emitUnmatchedPreserved).
 func runJoinParallel[T any](p *joinPlan, sem chan struct{}, stages []*joinStage,
 	scanSeq iter.Seq[*joinRow], stats *JoinStats,
 	mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool),
-	clone func(T) T, arena *rowArena[T], yield func(T) bool) bool {
+	clone func(T) T, arena *rowArena[T], yield func(T) bool) (ran, whole bool) {
 
 	if sem == nil || forceSerialJoinWalk || p.limits.MaxPairs <= 0 {
-		return false
+		return false, false
 	}
 	P := tryAcquireJoin(sem, joinWalkerCap())
 	if P < 2 {
 		for i := 0; i < P; i++ {
 			<-sem
 		}
-		return false // not enough budget to be worth splitting; the caller walks it
+		return false, false // not enough budget to be worth splitting; the caller walks it
 	}
 	defer func() {
 		for i := 0; i < P; i++ {
@@ -301,7 +306,10 @@ func runJoinParallel[T any](p *joinPlan, sem chan struct{}, stages []*joinStage,
 	for i := range walkerStats {
 		mergeJoinStats(stats, &walkerStats[i])
 	}
-	return true
+	// Merged first: a walker that tripped its own pair budget broke out of its chunk, so
+	// the stream was not walked in full even though the drainer never stopped. Its error
+	// does not reach stats until here.
+	return true, !stop && stats.Err == nil
 }
 
 // count is how many rows this batch holds.

@@ -151,10 +151,18 @@ func TestBuildSideSwapEligibility(t *testing.T) {
 		spec:      func() JoinSpec { return bsSpec("asmall", "abig") },
 		want:      true,
 	}, {
-		name: "a LEFT join preserves the side written first",
+		// A LEFT join's preserved side is the one written first, and it STAYS preserved
+		// when the sides are exchanged: the plan hashes it and emits what joined to
+		// nothing after the stream (joinRightOuter). So the rule here is the same one
+		// every other row-order rule is -- it may be swapped where the order is free.
+		name: "a LEFT join is exchanged like any other, and still preserves its side",
 		spec: func() JoinSpec { s := bsSpec("small", "big"); s.Kind = JoinLeft; return s },
+		want: true,
+	}, {
+		name: "a LEFT join over an ordered archive is not",
+		spec: func() JoinSpec { s := bsSpec("asmall", "abig"); s.Kind = JoinLeft; return s },
 		want: false,
-		why:  "LEFT join",
+		why:  "fixed order",
 	}, {
 		// A chain's FROM side is decided by joinchainorder.go, which asks a different
 		// question -- which of three or more tables to read FROM -- and answers it against
@@ -375,5 +383,58 @@ func TestBuildSideRecordsBeatMemoryWhenTheKeyIsIndexed(t *testing.T) {
 	}
 	if st.ProbeKeys == 0 {
 		t.Errorf("the probe did not fire, so this measured something else: %s", st.ProbeWhy)
+	}
+}
+
+// The planner prices `fits` against the limits the join will RUN under, not against the
+// store's own defaults. They differ whenever a caller asked for less, and this is the one
+// place the difference decides the plan: an orientation is being asked whether its hash will
+// be refused, and it is refused against the budget the join actually has.
+//
+// The shape is the one where the two answers disagree. An index covers the join key on the
+// large side, so on records touched the plan as written is the cheaper one and the cost model
+// keeps it -- right up until the caller says it may hold a thousand rows, at which point the
+// cheaper plan is one that does not run.
+func TestBuildSideFitsAgainstTheLimitsTheJoinRunsUnder(t *testing.T) {
+	cat := leftProbeFixture(t, 8192, 32)
+	spec := leftProbeSpec()
+
+	run := func(t *testing.T, limits JoinLimits) (int, JoinStats) {
+		t.Helper()
+		var st JoinStats
+		seq, err := cat.Join(spec, limits, &st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := 0
+		for range seq {
+			rows++
+		}
+		return rows, st
+	}
+
+	// Anti-vacuity: under the store's own limits both orientations fit, so the index
+	// decides and the sides stay as written. Whatever the lowered arm does below, it is
+	// the limit that did it.
+	if _, st := run(t, JoinLimits{}); st.BuildSideSwapped {
+		t.Fatalf("the sides were exchanged under the default limits already: %s", st.BuildSideWhy)
+	}
+
+	rows, st := run(t, JoinLimits{MaxHashRows: 1000})
+	if st.Err != nil {
+		t.Fatalf("the join did not run under its own limit: %v", st.Err)
+	}
+	if !st.BuildSideSwapped {
+		t.Fatalf("the sides were not exchanged, so the join held more than it was allowed "+
+			"to: %s", st.BuildSideWhy)
+	}
+	if !strings.Contains(st.BuildSideWhy, "exceed") {
+		t.Errorf("the reason %q does not say the hash would not have fit", st.BuildSideWhy)
+	}
+	if st.HashRows > 1000 {
+		t.Fatalf("the join held %d rows against a limit of 1000", st.HashRows)
+	}
+	if rows != 32 {
+		t.Fatalf("the join produced %d rows, expected one per row of the small side", rows)
 	}
 }
