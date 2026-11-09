@@ -79,7 +79,11 @@ type JoinSideExplain struct {
 // JoinStepExplain is one table folded into the accumulated row.
 type JoinStepExplain struct {
 	Alias string `json:"alias"`
-	// Kind is this step's join: "inner", "left" or "cross".
+	// Kind is this step's join: "inner", "left", "cross" -- or "right", which is a LEFT
+	// join the planner chose to run from the other end, hashing the preserved side and
+	// emitting its unmatched rows after the stream. "right" therefore always comes with
+	// Reordered, and the two together are the whole statement: the caller's LEFT join,
+	// read in the opposite order.
 	Kind string `json:"kind"`
 	// ProbeAttr is the attribute the step's table would be narrowed on, empty when it
 	// would not be. ProbeWhy says why not, and is empty exactly when ProbeAttr is set.
@@ -108,6 +112,8 @@ func joinKindName(k JoinKind) string {
 		return "left"
 	case JoinCross:
 		return "cross"
+	case joinRightOuter:
+		return "right"
 	}
 	return fmt.Sprintf("kind(%d)", int(k))
 }
@@ -119,6 +125,9 @@ func joinKindName(k JoinKind) string {
 // caller needs to know about.
 func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, error) {
 	limits := DefaultJoinLimits().clamp(want)
+	if err := validateJoinKinds(spec); err != nil {
+		return JoinExplain{}, err
+	}
 	asWritten, _, err := spec.chain()
 	if err != nil {
 		return JoinExplain{}, err
@@ -135,7 +144,7 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 	// derivation of it. unordered is false because this explains a plain Join; an
 	// aggregate gives up row order and may be planned more freely.
 	var stats JoinStats
-	planned := cat.planJoinOrder(spec, false, &stats)
+	planned := cat.planJoinOrder(spec, limits, false, &stats)
 	// Each planner records under its own names, and only the one that ran writes anything.
 	if out.Planner == "chain" {
 		out.OrderWhy = stats.ChainOrderWhy

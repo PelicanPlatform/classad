@@ -52,6 +52,7 @@ import (
 	"iter"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -68,6 +69,47 @@ const (
 	// JoinCross pairs every row with every row; its condition, if any, decides.
 	JoinCross
 )
+
+// joinRightOuter is a LEFT join with its sides exchanged: the preserved side is HASHED and
+// the other is streamed, so the unmatched preserved rows are the ones left over in the hash
+// when the stream has run out, and are emitted after it.
+//
+// It is not a kind a caller may ask for, and validateJoinKinds refuses it wherever a spec
+// enters. The planner is the only thing that produces it (joinbuildside.go), from a LEFT
+// join whose row order is free, and it does so to HOLD LESS: `A LEFT JOIN B` hashes B as
+// written, so a large B has to fit in MaxHashRows even when A is a hundred rows. Which side
+// is preserved is the caller's question and does not change; which side is held is the
+// planner's, and this is what lets it answer.
+//
+// It is deliberately NOT a right join in the SQL sense -- there is no `RIGHT JOIN` spelling
+// here and nothing produces this from one. It is an execution mode for the LEFT join the
+// caller wrote, which is why ExplainJoin reports the step as "right" only alongside
+// Reordered: the two together say "your LEFT join, run from the other end".
+//
+// It is always the ONLY step of a two-table join, because planBuildSide declines a chain and
+// planChainOrder reorders only inner steps. That is what makes the tail pass a row with one
+// side in it: there is no earlier side for a null-extended row to also carry.
+const joinRightOuter JoinKind = 3
+
+// validateJoinKinds refuses a kind that is not one of the three a caller may write.
+//
+// It guards joinRightOuter, which the planner introduces AFTER this runs and which means
+// something quite different from the kinds around it: a spec arriving with kind 3 would
+// otherwise be executed as a right-outer join over sides the caller wrote the other way
+// round. Everything above JoinCross used to behave as JoinInner -- no comparison in the
+// walk matched it -- so refusing it costs nothing a caller was relying on.
+func validateJoinKinds(spec JoinSpec) error {
+	ok := func(k JoinKind) bool { return k == JoinInner || k == JoinLeft || k == JoinCross }
+	if !ok(spec.Kind) {
+		return fmt.Errorf("join: unknown join kind %d", int(spec.Kind))
+	}
+	for i := range spec.Steps {
+		if !ok(spec.Steps[i].Kind) {
+			return fmt.Errorf("join: step %d has unknown join kind %d", i, int(spec.Steps[i].Kind))
+		}
+	}
+	return nil
+}
 
 // JoinSide is one side of a join: which table, under what alias, and what to push into its
 // own scan.
@@ -480,10 +522,13 @@ func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, unordered
 	if stats == nil {
 		stats = &JoinStats{}
 	}
+	if err := validateJoinKinds(spec); err != nil {
+		return nil, err
+	}
 	// Which side streams is decided before anything is compiled, so the whole pipeline
 	// below -- the plan, the probe, the pair loop -- sees one spec and needs to know
 	// nothing about the choice.
-	spec = cat.planJoinOrder(spec, unordered, stats)
+	spec = cat.planJoinOrder(spec, limits, unordered, stats)
 	p, err := compileJoin(spec, limits)
 	if err != nil {
 		return nil, err
@@ -836,7 +881,29 @@ type joinStage struct {
 	// each accumulated row is paired against all of them and the condition alone decides.
 	all    []*joinRow
 	hashed bool
+
+	// preserved, base and matched exist only for a joinRightOuter step, where the HASHED
+	// side is the one whose unmatched rows the join must still produce. They give every
+	// hashed row a dense index so the walk can record that it matched, and the tail pass
+	// can find the ones that did not.
+	//
+	// preserved is every row the side yielded, in one slice: the buckets' rows, bucket by
+	// bucket, and then the rows whose key was undefined. Those last ones are in no bucket
+	// and can match nothing, so they are exactly the rows a LEFT join exists to keep and
+	// the easiest ones to lose.
+	preserved []*joinRow
+	// base[k] is where bucket k's rows start in preserved, so the candidate at position i
+	// of that bucket is preserved[base[k]+i].
+	base map[string]int
+	// matched[i] says preserved[i] joined to something. ATOMIC because a parallel walk has
+	// P goroutines probing one hash: this is the only state a walker writes that is not its
+	// own. A plain []bool would be a data race whose symptom is a row that is sometimes
+	// null-extended and sometimes not.
+	matched []atomic.Bool
 }
+
+// tracksMatches reports that this stage has to record which of its hashed rows joined.
+func (st *joinStage) tracksMatches() bool { return st.matched != nil }
 
 // runJoin builds one hash per step and streams the FROM side through them, handing each
 // surviving combination to mk for the caller's row form.
@@ -871,7 +938,10 @@ func runJoin[T any](cat *Catalog, p *joinPlan, hashSeqs []iter.Seq[*joinRow], sc
 		if cat != nil {
 			sem = cat.joinSem
 		}
-		if runJoinParallel(p, sem, stages, scanSeq, stats, mk, clone, arena, yield) {
+		if ran, whole := runJoinParallel(p, sem, stages, scanSeq, stats, mk, clone, arena, yield); ran {
+			if whole {
+				emitUnmatchedPreserved(p, stages, stats, mk, yield)
+			}
 			return
 		}
 
@@ -890,6 +960,51 @@ func runJoin[T any](cat *Catalog, p *joinPlan, hashSeqs []iter.Seq[*joinRow], sc
 				return
 			}
 		}
+		// The stream is spent. A right-outer step's preserved rows that nothing joined to
+		// are still owed, and the hash is the only place left that knows which they are.
+		emitUnmatchedPreserved(p, stages, stats, mk, yield)
+	}
+}
+
+// emitUnmatchedPreserved yields the rows of a right-outer step's hashed side that joined to
+// nothing, each null-extended: the side's own member and no other.
+//
+// It runs ONLY after the stream has been walked in full. A walk that stopped early -- a
+// limit, a consumer that broke out -- has not finished deciding what matched, and emitting
+// the leftovers of a half-probed hash would hand back rows as unmatched that the rest of the
+// stream was about to match. So an interrupted join returns a prefix of its rows, which is
+// what every other early stop here does, rather than a prefix plus a wrong tail.
+//
+// The rows go through emitJoin, so the residual WHERE, MaxRows and the caller's LIMIT apply
+// to them exactly as they apply to a null-extended row the ordinary way round.
+func emitUnmatchedPreserved[T any](p *joinPlan, stages []*joinStage, stats *JoinStats,
+	mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool), yield func(T) bool) {
+	wk := newJoinWalk(p)
+	rows := wk.rows
+	for _, st := range stages {
+		if !st.tracksMatches() {
+			continue
+		}
+		clear(rows)
+		// Side 0 is nil for every row of this pass and stays nil, so what the splice
+		// cached for the last scan row is dropped once rather than per row.
+		wk.scanRow()
+		for i, r := range st.preserved {
+			if st.matched[i].Load() {
+				continue
+			}
+			// Checked BEFORE the row is formed, not after. Each of these is one row of
+			// its own -- there is no scan row whose matches have to come out together --
+			// so a limit already reached stops here rather than one row late.
+			if p.limit > 0 && stats.Rows >= p.limit {
+				return
+			}
+			rows[st.step.side] = r
+			if emitJoin(wk, p, rows, stats, mk, yield) {
+				return
+			}
+		}
+		rows[st.step.side] = nil
 	}
 }
 
@@ -900,6 +1015,11 @@ func buildStage(p *joinPlan, step *joinStepPlan, seq iter.Seq[*joinRow], stats *
 	if st.hashed {
 		st.buckets = map[string][]*joinRow{}
 	}
+	// A right-outer step keeps the rows its key leaves out of every bucket, because those
+	// are preserved rows that match nothing -- the tail pass has to emit them, and the hash
+	// is about to forget they existed.
+	rightOuter := step.kind == joinRightOuter
+	var noKey []*joinRow
 	for ad := range seq {
 		// MaxHashRows bounds what is HELD, and every step holds its own table, so the
 		// budget is spent across the chain rather than per step. A chain that would hold
@@ -916,11 +1036,46 @@ func buildStage(p *joinPlan, step *joinStepPlan, seq iter.Seq[*joinRow], stats *
 		}
 		k, ok := p.sideKey(step, ad)
 		if !ok {
-			continue // an undefined key equals nothing: ClassAd == propagates undefined
+			// An undefined key equals nothing: ClassAd == propagates undefined.
+			if rightOuter {
+				noKey = append(noKey, ad)
+			}
+			continue
 		}
 		st.buckets[k] = append(st.buckets[k], ad)
 	}
+	if rightOuter {
+		st.indexPreserved(noKey)
+	}
 	return st, nil
+}
+
+// indexPreserved lays the stage's hashed rows out densely and gives each one a slot in
+// matched, so the walk can mark what joined and the tail can find what did not.
+//
+// The layout is bucket by bucket, in whatever order the map iterates, followed by the rows
+// that had no key. Which order that is does not matter -- these rows are emitted after the
+// stream, and a plan that emits them at all is one the planner chose because row order was
+// already free (see joinbuildside.go).
+func (st *joinStage) indexPreserved(noKey []*joinRow) {
+	if !st.hashed {
+		// No equality to bucket on, so the rows are already one dense slice.
+		st.preserved = st.all
+		st.matched = make([]atomic.Bool, len(st.preserved))
+		return
+	}
+	n := len(noKey)
+	for _, rs := range st.buckets {
+		n += len(rs)
+	}
+	st.preserved = make([]*joinRow, 0, n)
+	st.base = make(map[string]int, len(st.buckets))
+	for k, rs := range st.buckets {
+		st.base[k] = len(st.preserved)
+		st.preserved = append(st.preserved, rs...)
+	}
+	st.preserved = append(st.preserved, noKey...)
+	st.matched = make([]atomic.Bool, len(st.preserved))
 }
 
 // emit forms the joined row, applies the post-filter and yields it. It reports only whether
@@ -1205,16 +1360,23 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 		}
 		st := stages[depth]
 		candidates := st.all
+		// base is where these candidates start in st.preserved, which is what turns a
+		// position in the bucket into the slot the match is recorded in. It is read only
+		// by a right-outer step, so an ordinary join never pays the second map lookup.
+		base := 0
 		if st.hashed {
 			k, ok := p.rowKey(st.step, rows)
 			if !ok {
 				candidates = nil // an undefined key matches nothing
 			} else {
 				candidates = st.buckets[k]
+				if st.tracksMatches() {
+					base = st.base[k]
+				}
 			}
 		}
 		matched := false
-		for _, r := range candidates {
+		for i, r := range candidates {
 			stats.Pairs++
 			if stats.Pairs > wk.pairBudget(p) {
 				stats.Err = fmt.Errorf("the join examined more than %d candidate pairs; "+
@@ -1232,6 +1394,14 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 			// conflating the two is a wrong answer: a matched row that WHERE drops
 			// must not come back as a null-extended one.
 			matched = true
+			// Recorded HERE, where the pair matched the ON condition, and not after the
+			// finished row has been through WHERE. That is the same line a LEFT join
+			// draws for its streamed side: a pair that matched and was then dropped by
+			// WHERE does not bring its preserved row back null-extended, because it
+			// matched. Marking after the post-filter would do exactly that.
+			if st.tracksMatches() && !st.matched[base+i].Load() {
+				st.matched[base+i].Store(true)
+			}
 			if walk(depth + 1) {
 				return true
 			}

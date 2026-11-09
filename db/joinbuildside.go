@@ -27,9 +27,27 @@ package db
 // archive reads newest-first and that is condor_history's order -- so swapping changes what
 // the caller sees. It is allowed only where there is no order to preserve: a mutable table,
 // which promises none; an archive whose config says so (ArchiveConfig.Unordered); or a
-// caller that discards order by construction, which is the grouped aggregate. A LEFT join is
-// never swapped either, for a different reason: its preserved side is the one written first,
-// so exchanging them asks a different question.
+// caller that discards order by construction, which is the grouped aggregate.
+//
+// A LEFT JOIN MAY BE SWAPPED, and what that takes is worth stating because exchanging its
+// sides is not the same operation as exchanging an inner join's. `A LEFT JOIN B` preserves
+// A, and preservation is a property of the QUERY, not of which side the executor happens to
+// hold -- so the swapped plan still has to produce A's unmatched rows. It does, from the
+// other end: the preserved side is hashed, the stream marks the rows it joins to, and what
+// is left unmarked when the stream runs out is emitted null-extended (joinRightOuter).
+//
+// That buys one thing and gives up another, and both are specific.
+//
+// It buys the HOLDING. As written, `A LEFT JOIN B` hashes B, so a hundred-row A against a
+// large B holds the large side -- and MaxHashRows refuses the join outright where the same
+// query the other way round would run in a few megabytes. That is the case this is for.
+//
+// It gives up the PROBE. The index probe narrows the hashed side to the key values the
+// streamed side holds, which is precisely a filter that drops the rows that match nothing --
+// the rows a LEFT join exists to keep. So a swapped LEFT join may not be probed (see
+// probeGateAll), and its swapped orientation is therefore priced at a full read of the
+// preserved side rather than at what an index would make it. A LEFT join can be exchanged
+// to hold less; it cannot be exchanged to read less.
 
 import (
 	"fmt"
@@ -66,7 +84,7 @@ var forceNoBuildSideSwap bool
 //
 // unordered says the caller discards row order whatever happens, which is true of the
 // grouped aggregate and of nothing else here.
-func (cat *Catalog) planBuildSide(spec JoinSpec, unordered bool, stats *JoinStats) JoinSpec {
+func (cat *Catalog) planBuildSide(spec JoinSpec, limits JoinLimits, unordered bool, stats *JoinStats) JoinSpec {
 	keep := func(format string, a ...any) JoinSpec {
 		stats.BuildSideWhy = fmt.Sprintf(format, a...)
 		return spec
@@ -76,16 +94,22 @@ func (cat *Catalog) planBuildSide(spec JoinSpec, unordered bool, stats *JoinStat
 		return keep("the build-side choice is disabled")
 	case len(spec.Steps) > 0:
 		return keep("a chain is read in the order its steps were written")
-	case spec.Kind != JoinInner && spec.Kind != JoinCross:
-		return keep("only an inner or cross join may exchange its sides: a LEFT join's " +
-			"preserved side is the one written first")
+	case spec.Kind != JoinInner && spec.Kind != JoinCross && spec.Kind != JoinLeft:
+		return keep("a join of kind %d does not have a second orientation to compare",
+			int(spec.Kind))
 	case !unordered && !cat.orderFree(spec.Left):
 		return keep("%s is read in a fixed order, which is the order the join's rows come "+
 			"out in; set the archive's Unordered to let the planner choose", spec.Left.Alias)
 	}
 
-	asWritten, ok1 := cat.orientationCost(spec.Left, spec.Right, spec.Equi, false)
-	swapped, ok2 := cat.orientationCost(spec.Right, spec.Left, spec.Equi, true)
+	// Both orientations of an inner join may narrow the side they hash. Only one of a LEFT
+	// join's may: swapped, the hashed side is the PRESERVED one, and narrowing it to the
+	// streamed side's keys would drop the unmatched rows the join is for. Pricing the
+	// swapped orientation as though it could be probed would recommend a swap for a saving
+	// the executor then refuses to make.
+	probeable := spec.Kind != JoinLeft
+	asWritten, ok1 := cat.orientationCost(spec.Left, spec.Right, spec.Equi, false, true, limits)
+	swapped, ok2 := cat.orientationCost(spec.Right, spec.Left, spec.Equi, true, probeable, limits)
 	if !ok1 || !ok2 {
 		return keep("one of the two orientations could not be priced")
 	}
@@ -148,8 +172,16 @@ func better(a, b int) bool { return float64(a)*buildSideMargin < float64(b) }
 // Cond and Post are expressions over the ALIASES, so they say the same thing whichever side
 // is read first and are left alone. Equi is the exception: its halves are positional, so
 // each one's halves exchange with the sides.
+//
+// A LEFT join changes KIND as well as order, because which rows survive is written in terms
+// of position: "keep every left row" means the side now read second. joinRightOuter is that
+// same sentence about the side now hashed, and saying it is what keeps the swap an exchange
+// of plans rather than of queries.
 func swapSides(spec JoinSpec) JoinSpec {
 	out := spec
+	if spec.Kind == JoinLeft {
+		out.Kind = joinRightOuter
+	}
 	out.Left, out.Right = spec.Right, spec.Left
 	out.Equi = make([]JoinEqui, len(spec.Equi))
 	for i, e := range spec.Equi {
@@ -170,7 +202,19 @@ type orientation struct {
 // The hashed side's read is priced at what an index probe would make it, when one applies:
 // that is the whole reason the orientations differ, so pricing both at a full read would
 // make the decision a coin toss between equal numbers.
-func (cat *Catalog) orientationCost(stream, hash JoinSide, equi []JoinEqui, swapped bool) (orientation, bool) {
+//
+// probeable is false where the executor will refuse to narrow the hashed side whatever the
+// indexes say -- which is a swapped LEFT join, whose hashed side is the preserved one. The
+// price then has to be the full read, because that is what will actually be paid.
+//
+// limits are the ones this join will RUN under, not the store's own. They differ whenever a
+// caller asked for less, and `fits` is the one place that difference changes the plan: an
+// orientation is being asked whether its hash will be refused, and it is refused against the
+// budget the join actually has. Pricing it against the store's default instead answered a
+// question about a join that was not the one running -- so a caller who lowered MaxHashRows
+// got a plan chosen for a limit it was not held to, and then the failure its own limit
+// caused.
+func (cat *Catalog) orientationCost(stream, hash JoinSide, equi []JoinEqui, swapped, probeable bool, limits JoinLimits) (orientation, bool) {
 	streamRows, ok := cat.sideReadSize(stream)
 	if !ok {
 		return orientation{}, false
@@ -180,23 +224,25 @@ func (cat *Catalog) orientationCost(stream, hash JoinSide, equi []JoinEqui, swap
 		return orientation{}, false
 	}
 	read := hashRows
-	for _, attr := range equiHashAttrs(equi, swapped) {
-		_, segments, indexed, _, statsOK := cat.joinSideStats(hash.Table, attr)
-		if !statsOK || !indexed {
-			continue
-		}
-		// The streamed side's ROWS bound its distinct keys, so this overstates the probe
-		// and understates its benefit -- the safe direction, since the gate that actually
-		// decides errs towards reading.
-		keys := min(streamRows, maxProbeKeys)
-		if lookups := segments * keys * probeLookupCost; lookups < read {
-			read = lookups
+	if probeable {
+		for _, attr := range equiHashAttrs(equi, swapped) {
+			_, segments, indexed, _, statsOK := cat.joinSideStats(hash.Table, attr)
+			if !statsOK || !indexed {
+				continue
+			}
+			// The streamed side's ROWS bound its distinct keys, so this overstates the
+			// probe and understates its benefit -- the safe direction, since the gate
+			// that actually decides errs towards reading.
+			keys := min(streamRows, maxProbeKeys)
+			if lookups := segments * keys * probeLookupCost; lookups < read {
+				read = lookups
+			}
 		}
 	}
 	return orientation{
 		total:    streamRows + read,
 		hashRows: hashRows,
-		fits:     hashRows <= DefaultJoinLimits().MaxHashRows,
+		fits:     hashRows <= limits.MaxHashRows,
 	}, true
 }
 

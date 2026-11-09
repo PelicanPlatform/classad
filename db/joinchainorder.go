@@ -74,11 +74,11 @@ var forceNoChainReorder bool
 // measured on that shape. A chain has a different one: which table to read FROM, which is
 // what feeds every step's probe. Running the chain planner over a two-table spec would
 // replace a measured decision with a re-derivation of it.
-func (cat *Catalog) planJoinOrder(spec JoinSpec, unordered bool, stats *JoinStats) JoinSpec {
+func (cat *Catalog) planJoinOrder(spec JoinSpec, limits JoinLimits, unordered bool, stats *JoinStats) JoinSpec {
 	if len(spec.Steps) > 0 {
-		return cat.planChainOrder(spec, unordered, stats)
+		return cat.planChainOrder(spec, limits, unordered, stats)
 	}
-	return cat.planBuildSide(spec, unordered, stats)
+	return cat.planBuildSide(spec, limits, unordered, stats)
 }
 
 // chainStar is a chain whose tables all join on one key: the sides, the attribute each one
@@ -106,7 +106,7 @@ type chainCond struct {
 }
 
 // planChainOrder returns spec with its tables in the order they should be read.
-func (cat *Catalog) planChainOrder(spec JoinSpec, unordered bool, stats *JoinStats) JoinSpec {
+func (cat *Catalog) planChainOrder(spec JoinSpec, limits JoinLimits, unordered bool, stats *JoinStats) JoinSpec {
 	keep := func(format string, a ...any) JoinSpec {
 		stats.ChainOrderWhy = fmt.Sprintf(format, a...)
 		return spec
@@ -128,7 +128,7 @@ func (cat *Catalog) planChainOrder(spec JoinSpec, unordered bool, stats *JoinSta
 	}
 	costs := make([]chainCost, len(star.sides))
 	for i := range star.sides {
-		costs[i] = star.chainCostFrom(i)
+		costs[i] = star.chainCostFrom(i, limits.MaxHashRows)
 	}
 	biggest := 0
 	for _, c := range costs {
@@ -496,7 +496,11 @@ type chainCost struct {
 // Every other table is priced at what an index probe would make its read, when one applies.
 // That is the whole reason the candidates differ -- without it every FROM side reads the
 // same records and the choice is a coin toss between equal numbers.
-func (star *chainStar) chainCostFrom(from int) chainCost {
+//
+// maxHashRows is the budget this join will RUN under, not the store's own, for the reason
+// orientationCost spells out: `fits` asks whether a plan's hash will be refused, and it is
+// refused against the limit the caller is held to.
+func (star *chainStar) chainCostFrom(from, maxHashRows int) chainCost {
 	streamRows := star.facts[from].rows
 	out := chainCost{streamRows: streamRows, total: streamRows}
 	for i := range star.sides {
@@ -507,7 +511,7 @@ func (star *chainStar) chainCostFrom(from int) chainCost {
 		out.total += read
 		out.hashRows += read
 	}
-	out.fits = out.hashRows <= DefaultJoinLimits().MaxHashRows
+	out.fits = out.hashRows <= maxHashRows
 	return out
 }
 

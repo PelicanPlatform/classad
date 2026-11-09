@@ -210,7 +210,7 @@ func TestBuildSideCostSeesACompositeKeyProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := cat.orientationCost(sides[0], sides[1], spec.Equi, false)
+	got, ok := cat.orientationCost(sides[0], sides[1], spec.Equi, false, true, DefaultJoinLimits())
 	if !ok {
 		t.Fatal("the orientation could not be priced")
 	}
