@@ -179,7 +179,7 @@ func (c *Client) JoinStats(ctx context.Context, jr JoinRequest, yield func(row s
 	o, feat := joinOpFor(jr, opJoin, opJoinChain, FeatJoin, FeatJoinChain)
 	want := c.wantJoinStats(rep)
 	if !c.SupportsNewer(feat) {
-		return ErrJoinUnsupported
+		return c.featureRefusal(feat, ErrJoinUnsupported)
 	}
 	err := c.streamEachTrailer(ctx, joinFrameOp(jr, o, false, false, want), yield,
 		stStreamJoinStats, rep.take)
