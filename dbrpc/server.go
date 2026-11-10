@@ -2218,12 +2218,12 @@ func (s *Server) maintainArchives(opts db.MaintainOptions, done <-chan struct{})
 func (s *Server) logRetrain(table string, res db.RetrainResult) {
 	took := res.Took.Round(time.Millisecond).String()
 	if res.Err != nil {
-		slog.Info("archive dictionary retrain declined", "archive", table, "err", res.Err.Error(),
-			"took", took)
+		s.logger().Info("archive dictionary retrain declined", "archive", table,
+			"err", res.Err.Error(), "took", took)
 		return
 	}
-	slog.Info("retrained archive dictionary", "archive", table, "dict_bytes", res.DictBytes,
-		"took", took)
+	s.logger().Info("retrained archive dictionary", "archive", table,
+		"dict_bytes", res.DictBytes, "took", took)
 }
 
 // logAutoTune reports what the maintenance pass's auto-tuner did to one table. A pass that
