@@ -297,6 +297,13 @@ func TestGroupAndAggShape(t *testing.T) {
 			aggs:  []AggSpec{{Func: AggCountDistinct, Arg: "Owner"}},
 			group: "", agg: "count distinct(owner)",
 		},
+		{
+			// The estimate and the count are different questions, so a report of what a
+			// table is being asked must not show them as one query.
+			name:  "an approximate distinct count is named apart from the exact one",
+			aggs:  []AggSpec{{Func: AggApproxCountDistinct, Arg: "Owner"}},
+			group: "", agg: "approx count distinct(owner)",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

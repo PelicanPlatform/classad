@@ -34,8 +34,8 @@ const (
 	// value per group while the scan runs -- fine for the attributes people group and
 	// count by (Owner, JobStatus, a host name), but not something to point at a
 	// unique-per-row attribute over a large history. There is deliberately no silent
-	// switch to a sketch: a query written COUNT(DISTINCT ...) gets a true count, and an
-	// approximate one would have to be asked for by name.
+	// switch to a sketch: a query written COUNT(DISTINCT ...) gets a true count, and the
+	// approximate one is asked for by name (AggApproxCountDistinct).
 	AggCountDistinct
 	// AggUser is a user-defined aggregate, named by AggSpec.UserFunc and registered with
 	// RegisterAggregate. It sits past AggMax on purpose: that is what routes a request
@@ -80,6 +80,43 @@ const (
 	// list-valued aggregate turns a reduction back into the row stream it was reducing, one
 	// cell at a time.
 	AggList
+
+	// AggApproxCountDistinct is COUNT(DISTINCT col) answered from a HyperLogLog built during
+	// the scan: an ESTIMATE of the number of distinct defined values of the argument in the
+	// group, in a fixed amount of memory per group.
+	//
+	// IT IS ASKED FOR BY NAME, and that is the whole reason it is a second function rather
+	// than a size threshold inside the first one. A query written COUNT(DISTINCT ...) is a
+	// query for a count, and answering it with a number that is close would be wrong rather
+	// than fast -- wrong in a way nothing in the result says, since an estimate and a count
+	// are the same digits. So AggCountDistinct is always exact, nothing routes to the sketch
+	// on its own judgement, and a caller that would rather have the estimate says so here.
+	//
+	// WHAT IT COSTS AND WHAT IT BUYS. The exact function holds one entry per distinct value
+	// per group for the duration of the scan, so its state grows with its own answer; this
+	// holds approxDistinctRegisters one-byte registers per group whatever the cardinality --
+	// 16 KiB at the fixed precision -- for a relative standard error of ApproxDistinctRelErr,
+	// about 0.81%. That trade is worth making over a unique-per-row attribute on a large
+	// history, where the exact count is a memory bound nobody can state in advance, and is
+	// worth nothing at all over Owner or JobStatus, where the exact set is smaller than the
+	// sketch and right.
+	//
+	// THE ERROR IS A STANDARD DEVIATION, not an interval: roughly a third of groups land
+	// further out, and a single group can be several multiples away. A caller putting the
+	// number in front of someone owes them the word "approximately"; see
+	// ApproxDistinctRelErr.
+	//
+	// It composes with everything the exact function does -- a WHERE constraint, a GROUP BY
+	// including a bucketed time series, a per-aggregate FILTER -- because the sketch is built
+	// from the rows that reach the aggregate rather than read from a per-segment summary that
+	// knows nothing about any of the three. The persisted per-segment sketches cover a whole
+	// segment and an indexed attribute, so they could serve none of the three; the sketch
+	// this builds is the one that composes.
+	//
+	// It sits past AggMax, which routes a request carrying it onto the extended opcodes, so a
+	// server too old to know it refuses the query instead of returning "undefined" for the
+	// column.
+	AggApproxCountDistinct
 )
 
 // ErrListAggregateNeedsBound reports a list-valued aggregate asked for where no bound on it
@@ -352,6 +389,13 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 		if a.Func == AggCountDistinct && a.Arg == "*" {
 			return nil, fmt.Errorf("COUNT(DISTINCT *) is not meaningful; name an attribute")
 		}
+		// The approximate form has the same hole in it: a row is not a value, so there is
+		// nothing for the sketch to hash. Refused rather than counted as rows, which is the
+		// one reading an unrefused APPROX_COUNT_DISTINCT(*) could plausibly be given and is
+		// not what it says.
+		if a.Func == AggApproxCountDistinct && a.Arg == "*" {
+			return nil, fmt.Errorf("APPROX_COUNT_DISTINCT(*) is not meaningful; name an attribute")
+		}
 		// LIST(*) has the same problem COUNT(DISTINCT *) has: the rows of a group are
 		// not a value, so there is nothing for the list to hold. Refused rather than
 		// read as "the whole row", which is a thing this cannot produce.
@@ -522,6 +566,11 @@ type aggAcc struct {
 	vals []classad.Value     // argument values for SUM/AVG/MIN/MAX
 	seen map[string]struct{} // distinct defined argument values (COUNT DISTINCT)
 	user Accumulator         // a user-defined aggregate's own state (AggUser)
+	// approx is the HyperLogLog standing in for seen when the caller asked for the estimate
+	// (AggApproxCountDistinct). It is a separate field rather than a union with seen because
+	// one request can carry both forms over the same attribute -- which is how a caller
+	// checks what the estimate costs it on its own data.
+	approx *approxDistinctAcc
 	// elided counts the values a bounded aggregate did not keep (AggList past its cap).
 	// Counted rather than merely dropped, because a cut list and a short one are the same
 	// bytes and the caller has to be able to tell them apart.
@@ -563,6 +612,15 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value, maxList int) {
 			}
 			a.seen[GroupValueText(v)] = struct{}{}
 		}
+	case AggApproxCountDistinct:
+		// Hashed on that same rendering, so the estimate is an estimate OF the exact count
+		// and not of some neighbouring partition of the values.
+		if defined {
+			if a.approx == nil {
+				a.approx = newApproxDistinctAcc()
+			}
+			a.approx.addText(GroupValueText(v))
+		}
 	default:
 		a.vals = append(a.vals, v) // the library aggregates skip undefined / coerce
 	}
@@ -578,6 +636,13 @@ func (a *aggAcc) result(spec AggSpec) string {
 		return strconv.Itoa(a.defN)
 	case AggCountDistinct:
 		return strconv.Itoa(len(a.seen))
+	case AggApproxCountDistinct:
+		// A group that saw no defined value renders 0 without a sketch ever existing, which
+		// is the same answer the exact form gives and is exact there too.
+		if a.approx == nil {
+			return "0"
+		}
+		return strconv.FormatUint(a.approx.estimate(), 10)
 	case AggSum:
 		return ValueText(classad.Sum(a.vals))
 	case AggAvg:

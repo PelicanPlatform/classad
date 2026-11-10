@@ -329,6 +329,10 @@ func aggFuncName(f AggFunc) string {
 		return "count"
 	case db.AggCountDistinct:
 		return "count distinct"
+	case db.AggApproxCountDistinct:
+		// Named apart from the exact one, so a report of what a table is being asked cannot
+		// show an estimate and a count as the same query.
+		return "approx count distinct"
 	case db.AggSum:
 		return "sum"
 	case db.AggAvg:

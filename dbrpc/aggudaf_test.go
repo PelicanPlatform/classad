@@ -474,6 +474,10 @@ func TestUnnamedAggregatesKeepTheirFrames(t *testing.T) {
 		{"plain", []AggSpec{{Func: AggCount, Arg: "*"}}, aggSpecBase},
 		{"filtered", []AggSpec{{Func: AggCount, Arg: "*", Filter: "JobStatus == 2"}}, aggSpecFiltered},
 		{"countdistinct", []AggSpec{{Func: AggCountDistinct, Arg: "Owner"}}, aggSpecFiltered},
+		// The approximate twin rides the same frame: a server that does not know the
+		// function has to refuse the opcode rather than answer the column with something
+		// else, and that refusal is the extended frame's.
+		{"approxcountdistinct", []AggSpec{{Func: AggApproxCountDistinct, Arg: "Owner"}}, aggSpecFiltered},
 		{"named", []AggSpec{{Func: db.AggUser, UserFunc: "p95", Arg: "Cpus"}}, aggSpecNamed},
 		{"mixed", []AggSpec{
 			{Func: AggCount, Arg: "*"},

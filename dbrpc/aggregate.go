@@ -30,6 +30,11 @@ const (
 	// AggCountDistinct is COUNT(DISTINCT col). It rides the extended opcodes (see
 	// anyFiltered), since an older server would not recognize the function.
 	AggCountDistinct = db.AggCountDistinct
+	// AggApproxCountDistinct is COUNT(DISTINCT col) answered from a per-group HyperLogLog:
+	// an ESTIMATE, within db.ApproxDistinctRelErr of the count as a standard deviation. It
+	// rides the extended opcodes for the same reason AggCountDistinct does, so a server that
+	// does not know it refuses rather than answering the column with something else.
+	AggApproxCountDistinct = db.AggApproxCountDistinct
 )
 
 // Aggregate runs a server-side GROUP BY: the server buckets the constraint match
