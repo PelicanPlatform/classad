@@ -56,6 +56,34 @@ type JoinExplain struct {
 	// Limits are what the join would actually run under: the store's own, lowered to the
 	// caller's where the caller asked for less.
 	Limits JoinLimits `json:"limits"`
+
+	// EstHashRows is an UPPER BOUND on the rows this plan would hold: every side but the
+	// streamed one, each at what its own read is estimated to visit. It is the quantity
+	// MaxHashRows bounds, and since the planner chooses which side to hash in order to
+	// stay under that bound, it is the number that says whether the plan runs at all.
+	//
+	// A BOUND and not a prediction, and the gap can be enormous: measured on a selective
+	// side joined to an indexed one, this is 8192 where 32 rows are held. An index probe
+	// narrows a hashed side to the key values the streamed side turns out to hold, and how
+	// many that is cannot be known without reading the streamed side, which this does not
+	// do. A step reported as probe-eligible (ProbeAttr) may therefore hold a small fraction
+	// of its share of this.
+	//
+	// Being a bound rather than an estimate is what makes it worth publishing, because it
+	// is sound in the direction that matters. At or under MaxHashRows it is a GUARANTEE:
+	// the plan cannot be refused for holding too much, since what is held is at most this.
+	// Over it, the plan is refused unless a probe narrows one of the sides, and HashWhy
+	// names the sides that might. An estimate 256x out would be worse than no number at
+	// all; a bound 256x out still answers "will this run".
+	//
+	// 0 means a hashed side could not be sized at all, and HashWhy names it. A partial sum
+	// is not reported: it would read as a bound on the plan and is not one.
+	EstHashRows int `json:"estHashRows,omitempty"`
+	// HashWhy states EstHashRows against the limit in words: within it, over it, or not
+	// known. A plan over the limit is one the join will REFUSE, unless a probe narrows one
+	// of the sides enough -- the single case where this report cannot be definite, and it
+	// says so by naming the sides that might.
+	HashWhy string `json:"hashWhy,omitempty"`
 }
 
 // JoinSideExplain is one table of the join and how it would be read.
@@ -93,8 +121,14 @@ type JoinStepExplain struct {
 	// one constraint may carry.
 	ProbeAttr string `json:"probeAttr,omitempty"`
 	ProbeWhy  string `json:"probeWhy,omitempty"`
-	// EstRecords is the size the probe decision priced this table's read at, which is what
-	// narrowing would avoid. 0 when the decision declined before a size was needed.
+	// EstRecords is the size this table's read is estimated to visit: the whole table
+	// unless the side carries a constraint of its own. It is both what narrowing this step
+	// would avoid and, since every step holds its own table, this step's share of the
+	// plan's EstHashRows.
+	//
+	// 0 only when the side could not be sized at all. It is filled in even where the probe
+	// decision declined before it needed a size, because "how much does this step hold" is
+	// asked of every step and not only of the ones an index could narrow.
 	EstRecords int `json:"estRecords,omitempty"`
 	// Cond and Equi are the step's conditions AS PLANNED. A reordered chain re-attaches
 	// its conditions to different steps, so these are not always what the caller wrote --
@@ -182,6 +216,10 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 	// this is its own answer rather than a second opinion about it.
 	out.Reordered = stats.BuildSideSwapped || stats.ChainFromAlias != ""
 
+	// What the plan would HOLD, accumulated as the steps are described. Every side but the
+	// streamed one is hashed and every step is one of those sides, so the steps are exactly
+	// the sides this has to add up.
+	held, probeable, unsized := 0, []string(nil), []string(nil)
 	for i := range steps {
 		sp := p.steps[i]
 		attrs, all, rows, _, why := cat.probeGateAll(sp, sides[sp.side])
@@ -198,8 +236,24 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 			names = set.attrs
 		}
 		attr := strings.Join(names, ", ")
+		alias := p.aliases[sp.side]
+		// A gate that declined before it needed a size leaves rows at 0, which is not an
+		// answer to "how much does this step hold". Ask for the size directly: it is the
+		// same number the planner priced the side at, and it costs index statistics rather
+		// than records.
+		if rows == 0 {
+			if sized, ok := cat.sideReadSize(sides[sp.side]); ok {
+				rows = sized
+			} else {
+				unsized = append(unsized, alias)
+			}
+		}
+		held += rows
+		if attr != "" {
+			probeable = append(probeable, alias)
+		}
 		out.Steps = append(out.Steps, JoinStepExplain{
-			Alias:      p.aliases[sp.side],
+			Alias:      alias,
 			Kind:       joinKindName(steps[i].Kind),
 			ProbeAttr:  attr,
 			ProbeWhy:   why,
@@ -208,5 +262,32 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 			Equi:       steps[i].Equi,
 		})
 	}
+	out.EstHashRows, out.HashWhy = explainHashBound(held, limits.MaxHashRows, probeable, unsized)
 	return out, nil
+}
+
+// explainHashBound puts the plan's hold against the limit in words.
+//
+// It reports no number at all when a side could not be sized, because the sum of the rest
+// would read as a bound on the whole plan and is not one -- it bounds the part that happened
+// to be measurable, which is a different and much weaker claim.
+func explainHashBound(held, maxHashRows int, probeable, unsized []string) (int, string) {
+	if len(unsized) > 0 {
+		return 0, fmt.Sprintf("%s could not be sized, so what this plan holds is not known",
+			strings.Join(unsized, ", "))
+	}
+	if held <= maxHashRows {
+		return held, fmt.Sprintf("the plan holds at most ~%d rows, within the %d this join "+
+			"may hold", held, maxHashRows)
+	}
+	// Over the limit. Whether that is fatal turns on the one thing this cannot see: an
+	// index probe narrows a hashed side to the keys the streamed side actually holds, and
+	// counting those means reading it.
+	if len(probeable) > 0 {
+		return held, fmt.Sprintf("the plan holds up to ~%d rows, more than the %d this join "+
+			"may hold; it will be refused unless an index probe narrows %s far enough",
+			held, maxHashRows, strings.Join(probeable, ", "))
+	}
+	return held, fmt.Sprintf("the plan holds ~%d rows, more than the %d this join may hold, "+
+		"and no step can be narrowed by an index: it will be refused", held, maxHashRows)
 }
