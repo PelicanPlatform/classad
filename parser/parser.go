@@ -54,6 +54,17 @@ func ParseExpr(input string) (ast.Expr, error) {
 //     checks for the end of the input, so it ignores whatever follows one:
 //     "1 ? 2 : 3 4" is 1 ? 2 : 3. ParseExprOld does the same.
 func ParseExprOld(input string) (ast.Expr, error) {
+	// A lone string literal is the single most common input on the job_queue.log
+	// and CEDAR ingest paths, and needs neither the lexer nor the grammar.
+	if lit, ok := loneOldStringLiteral(input); ok {
+		return &ast.StringLiteral{Value: lit}, nil
+	}
+	return parseExprOldFull(input)
+}
+
+// parseExprOldFull is ParseExprOld through the lexer and the grammar, for every
+// input the fast path declines.
+func parseExprOldFull(input string) (ast.Expr, error) {
 	expr, failAt, err := parseExprAt(input, true)
 	if err == nil || failAt <= 0 || failAt >= len(input) {
 		return expr, err

@@ -20,3 +20,34 @@ func BenchmarkParseExpr(b *testing.B) {
 		}
 	}
 }
+
+// oldExprBenchCases are the values ParseExprOld sees per attribute on the
+// job_queue.log and CEDAR ingest paths: mostly lone strings, some of them with
+// backslashes, mixed with the numbers and expressions that are not strings.
+var oldExprBenchCases = map[string][]string{
+	"PlainString":     {`"vanilla"`, `"froth.cs.wisc.edu"`, `"user@example.com"`},
+	"BackslashString": {`"C:\Users\x"`, `"warlock21\.beocat\.ksu\.edu"`, `"testing\,\ more"`},
+	"EscapedQuote":    {`"a\"b"`, `"say \"hi\" now"`},
+	"LongString":      {`"osdf:///chtc/staging/c/ckoch5/tests/space-comma/some-rather-long-file-name.dat"`},
+	"Int":             {`0`, `1234567`, `-42`},
+	"Expr": {
+		`(TARGET.RequestCpus <= Cpus) && (TARGET.RequestMemory <= Memory)`,
+		`ifThenElse(State =?= "Claimed", RemoteOwner, "none")`,
+	},
+}
+
+func BenchmarkParseExprOld(b *testing.B) {
+	for _, name := range []string{"PlainString", "BackslashString", "EscapedQuote", "LongString", "Int", "Expr"} {
+		cases := oldExprBenchCases[name]
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				for _, s := range cases {
+					if _, err := ParseExprOld(s); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}
