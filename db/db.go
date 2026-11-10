@@ -469,6 +469,31 @@ type MaintainOptions struct {
 	// covered as it grows. 0 leaves it off.
 	SchemaScanHotTopN int
 
+	// ArchiveRetrainInterval, when > 0, retrains an ARCHIVE's compression dictionary that
+	// often. 0 leaves it off. DefaultArchiveRetrainInterval is the recommended cadence.
+	//
+	// Off by default, for the reason ArchiveIndexMinDemand and ArchiveSchemaScanHotTopN are:
+	// the FIRST retrain of an inline archive reads and rewrites its whole history once, so
+	// turning it on is a decision about an existing deployment rather than something an
+	// upgrade should start doing. Steady-state cost is far lower -- see
+	// DefaultArchiveRetrainInterval for what each half of that is.
+	//
+	// An interval rather than a per-pass bool (unlike Retrain, above) because the cadence
+	// that suits it is much longer than the one that suits the rest of the pass, and because
+	// the caller would otherwise have to keep the clock itself.
+	//
+	// The clock is per-process. It starts when the archive is opened, not at the zero time,
+	// so a daemon that restarts often defers a retrain rather than running one on every
+	// start; nothing persists the last-retrain time (CodecStats.LastRetrain is per-process
+	// too), so a restart resets it -- in the conservative direction.
+	ArchiveRetrainInterval time.Duration
+
+	// OnRetrain, when set, is called after ArchiveTable.Maintain attempts a dictionary
+	// retrain -- only when one was attempted, and whether or not it succeeded. Training
+	// legitimately declines on small or homogeneous data, which is a Result with Err set and
+	// the existing dictionary left in place, not a failure of the pass.
+	OnRetrain func(RetrainResult) `json:"-"`
+
 	// OnAutoTune, when set, is called with what the pass's auto-tuner changed -- once per
 	// pass, only when it changed something. Nil (the default) is the previous behaviour.
 	//
@@ -482,6 +507,52 @@ type MaintainOptions struct {
 	// Called synchronously, on the maintenance goroutine, holding nothing the callback can
 	// reach. It must not call back into the table.
 	OnAutoTune func(AutoTuneResult) `json:"-"`
+}
+
+// RetrainResult is what one dictionary retrain did (MaintainOptions.OnRetrain).
+type RetrainResult struct {
+	// DictBytes is the size of the dictionary trained, 0 when training declined.
+	DictBytes int
+	// Took is how long the attempt ran, declined or not.
+	Took time.Duration
+	// Err is why training declined, nil on success. The archive keeps the dictionary it
+	// already had and tries again after the interval.
+	Err error
+}
+
+// DefaultArchiveSampleMax is the ad sample an archive's maintenance pass takes when
+// MaintainOptions.SampleMax is unset. Lower than the mutable default because sampling an
+// archive decompresses records.
+const DefaultArchiveSampleMax = 2000
+
+// DefaultArchiveRetrainInterval is the recommended cadence for
+// MaintainOptions.ArchiveRetrainInterval, which is off unless set.
+//
+// A day, because the thing it tracks moves on that scale: an archive's records drift as the
+// workload does, and unlike a mutable table nothing else ever revisits its dictionary -- no
+// compaction, no rewrite -- so without this a history table keeps whatever dictionary it
+// happened to be given early in life.
+//
+// WHAT IT COSTS, which is two different things. A retrain on an append-only table does not
+// re-compress sealed segments the way it does on a mutable one: it trains, registers the
+// dictionary and points new writes at it, and old segments keep the dictionary they were
+// written under, which recovery reconstructs. But it also interns any sealed segment still
+// in inline form, and interning reseals that segment. On an archive that has never been
+// interned -- the default, since nothing here sets InternAtSeal -- the first retrain
+// therefore rewrites the whole history. Interning is one-way per segment, so later retrains
+// skip what is already done and cost the sample and the registration alone.
+//
+// That asymmetry is why this is opt-in rather than on by default, and why Rewrite stays out
+// of the maintenance pass altogether: Rewrite re-encodes every segment on EVERY call.
+const DefaultArchiveRetrainInterval = 24 * time.Hour
+
+// ArchiveRetrainEvery resolves ArchiveRetrainInterval: how often to retrain, and false when
+// retraining is off.
+func (o MaintainOptions) ArchiveRetrainEvery() (time.Duration, bool) {
+	if o.ArchiveRetrainInterval <= 0 {
+		return 0, false
+	}
+	return o.ArchiveRetrainInterval, true
 }
 
 // DefaultArchiveIndexBackfillBytes is the per-pass index backfill budget when

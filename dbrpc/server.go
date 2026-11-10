@@ -2171,29 +2171,26 @@ func respBad(reqID uint64) []byte { return resp(reqID, stBadReq) }
 // nothing merging, the count only rises, and the symptom does not appear until a restart.
 //
 // The work is deliberately narrow -- merge cold runs, rebuild indexes left stale by an
-// interrupted pass, carry the index set to older segments within a per-pass budget, and apply
-// the demand-driven tuning that does not re-encode anything.
-// Retraining and rewriting are excluded: both re-encode the whole archive, which is not
-// something to do on a timer. The hot-set refresh is excluded from that reasoning because it
-// rewrites nothing: it changes what future records are written under, and the merge pass
-// above carries it to older records as it folds their segments together.
+// interrupted pass, carry the index set to older segments within a per-pass budget, apply the
+// demand-driven tuning, and on a much longer cadence retrain the dictionary. What they have in
+// common is that none of them re-encodes the archive.
+//
+// REWRITING is excluded because it does: it re-encodes every segment in place, which at
+// history scale is hours of I/O for a gain that is usually small. Retraining is not the same
+// operation on an append-only table, although it is on a mutable one -- there it recompacts
+// every shard, here it trains, registers the dictionary and points new writes at it, then
+// stops. Sealed segments keep the dictionary they were written under, which recovery
+// reconstructs, and adopt the new one only when something else rewrites them. The hot-set
+// refresh is outside this reasoning for its own reason: it rewrites nothing at all, only what
+// future records are written under, and the merge above carries it to older records as it
+// folds their segments together.
+// maintainArchives runs the append-only side of a maintenance pass. Archive tables are a
+// separate catalog namespace, so the loop over cat.Tables() above does not reach them.
+//
+// The pass itself is ArchiveTable.Maintain, beside DB.Maintain: what this adds is the loop,
+// the serialisation against any other pass on this server, and the logging -- db reports
+// through callbacks rather than logging, so the table's name is attached here.
 func (s *Server) maintainArchives(opts db.MaintainOptions, done <-chan struct{}) {
-	// Resolve the sample bound ONCE, for the whole pass, as DB.Maintain does. Each step used
-	// to default it for itself or not at all, and an unset SampleMax therefore meant two
-	// different things inside one pass: diagSampleMax for the schema scan and the hot-set
-	// refresh, and 4096 for the index tuner and the group derivation, because collections'
-	// AutoTune and GroupSchemas both substitute their own maxDistinctSample for a
-	// non-positive bound. Neither step was ever unsampled, so this is not a dark pass -- it
-	// is two sample sizes where there should be one, with the steps that sample an archive's
-	// records silently drawing the larger of them.
-	//
-	// The pass's own default is the one kept: sampling an archive decompresses records, and
-	// the two steps that were drawing 4096 were taking it from a library fallback rather than
-	// asking for it. A caller that wants a different bound sets SampleMax, which every step
-	// has always honoured.
-	if opts.SampleMax <= 0 {
-		opts.SampleMax = diagSampleMax
-	}
 	for _, name := range s.cat.ArchiveTables() {
 		// Between archives, as the table loop above does. A daemon mounting three
 		// history-scale archives otherwise pays for all three before it notices the stop.
@@ -2206,93 +2203,27 @@ func (s *Server) maintainArchives(opts db.MaintainOptions, done <-chan struct{})
 		if !ok {
 			continue
 		}
+		o := opts // per-archive, so each hook can name the archive it fired for
+		o.OnAutoTune = func(res db.AutoTuneResult) { s.logAutoTune(name, "archive", res) }
+		o.OnRetrain = func(res db.RetrainResult) { s.logRetrain(name, res) }
 		s.maintainMu.Lock()
-		// Between the STEPS of one archive's pass, not only between archives. Each step below
-		// honours StopMaintenance internally, but none of them knows it is one of seven: a stop
-		// landing in the merge used to still pay for the reindex, the index backfill, the group
-		// derivation, the schema scan (whose columnarize is the longest of the lot), the hot-set
-		// refresh and the index auto-tune. stopping is checked before each expensive step; the
-		// archive's own flag is used rather than done, because that is what Close sets and what
-		// the steps themselves read, so the two can never disagree.
-		stopping := a.MaintenanceStopping
-		// ArchiveMergeDisabled gates the MERGE, and only the merge. It used to return from
-		// the whole function, which was the same statement when the pass was a merge and the
-		// reindex that follows one; every step added since -- hot-set refresh, index
-		// auto-tune, the schema scan, the group derivation, the demand checkpoint -- was
-		// silently switched off with it. None of those re-encode the archive, which is what
-		// the knob's name is about, and the one that changes future writes has its own switch
-		// in ArchiveHotRefreshDisabled.
-		if !opts.ArchiveMergeDisabled && !stopping() {
-			// Below its trigger watermark this is a segment count and a comparison, so the
-			// common case costs nothing.
-			a.MergePass(opts.ArchiveMerge)
-		}
-		// A merge leaves its output without a sidecar, and an interrupted reindex leaves
-		// segments stale; either way queries fall back to scanning until it is rebuilt. Not
-		// gated on the merge: a pass interrupted before the knob was set leaves the same
-		// stale segments behind, and they stay stale until something rebuilds them.
-		if stale, _ := a.StaleIndexSegments(); stale > 0 && !stopping() {
-			a.Reindex()
-		}
-		// Carry the index set to older segments that predate it, a budgeted slice per pass,
-		// newest first. Reindex stops at the backfill horizon, so without this an index added
-		// to a large history only ever reaches its newest segments.
-		if budget, ok := opts.ArchiveIndexBackfillBudget(); ok && !stopping() {
-			if pending, _ := a.IndexBackfillPending(); pending > 0 {
-				a.BackfillIndexes(budget)
-			}
-		}
-		// Derive and checkpoint the candidate group schemas on the ARCHIVE's cadence, which is
-		// far longer than a mutable table's -- so the stability gate's several derivations span
-		// days rather than minutes. That is the intended shape: an archive's structure should be
-		// established over the period it actually changes on.
-		//
-		// BEFORE the schema scan, as DB.Maintain does it: the gate reads the derivation
-		// history that this call appends to, so deriving afterwards means the scan's
-		// auto-promotion never sees the current pass and a qualifying group waits one extra
-		// review interval -- a day on an archive -- to be committed. One derivation per pass
-		// either way; the history still accumulates on the pass cadence and no faster.
-		if opts.ArchiveSchemaScanHotTopN > 0 && !stopping() {
-			a.GroupSchemas(opts.SampleMax, 0)
-		}
-		// The per-segment columnar accelerator, off unless configured (see
-		// ArchiveSchemaScanHotTopN): the first build reads the whole history once. After that
-		// this only extends coverage to segments sealed since, including those a merge just
-		// produced.
-		if opts.ArchiveSchemaScanHotTopN > 0 && !stopping() {
-			a.BuildAndEnableSchemaScan(opts.SampleMax, opts.ArchiveSchemaScanHotTopN)
-		}
-		// Re-rank the hot header from accumulated read demand. This is the one archive pass
-		// that reads nothing back: the hot header is per record, so sealed segments keep --
-		// and still read correctly under -- the set they were written with, and nothing is
-		// rebuilt here. A sample and a pointer swap, which is why it runs on the shared
-		// HotTopN instead of a threshold of its own.
-		//
-		// It is placed after the merge deliberately. A merge re-encodes the records it folds
-		// together under the current hot set, so the ordering decides which set this pass's
-		// merged output carries: refreshing first would apply a set chosen from demand that
-		// the merge has not yet been measured against. Refreshing after means the NEXT pass's
-		// merge carries it, which is the conservative order.
-		if opts.HotTopN > 0 && !opts.ArchiveHotRefreshDisabled && !stopping() {
-			a.RefreshHotSet(opts.SampleMax, opts.HotTopN)
-		}
-		// Add the indexes observed demand justifies. Off unless a threshold is configured:
-		// an archive index is paid for by reading history back, so it is not something to
-		// start doing to an existing deployment on an upgrade.
-		if opts.ArchiveIndexMinDemand > 0 && !stopping() {
-			s.logAutoTune(name, "archive", a.AutoTune(db.AutoTuneOptions{
-				SampleMax: opts.SampleMax,
-				MinDemand: opts.ArchiveIndexMinDemand,
-				Reindex:   true,
-			}))
-		}
-		// Age and checkpoint the recorded query demand. An archive needs this more than a
-		// mutable table does: indexing one is paid for by decompressing history, so the
-		// decision wants evidence gathered over days, which is longer than a daemon can be
-		// relied on to stay up.
-		a.SaveDemand()
+		a.Maintain(o)
 		s.maintainMu.Unlock()
 	}
+}
+
+// logRetrain reports what a pass's dictionary retrain did. A decline is Info, not Warn: small
+// or homogeneous data legitimately has no dictionary worth training, the archive keeps the one
+// it had, and the next interval tries again.
+func (s *Server) logRetrain(table string, res db.RetrainResult) {
+	took := res.Took.Round(time.Millisecond).String()
+	if res.Err != nil {
+		slog.Info("archive dictionary retrain declined", "archive", table, "err", res.Err.Error(),
+			"took", took)
+		return
+	}
+	slog.Info("retrained archive dictionary", "archive", table, "dict_bytes", res.DictBytes,
+		"took", took)
 }
 
 // logAutoTune reports what the maintenance pass's auto-tuner did to one table. A pass that
