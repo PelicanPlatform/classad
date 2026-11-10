@@ -412,6 +412,22 @@ type MaintainOptions struct {
 	// that changes what future writes look like is governed by ArchiveHotRefreshDisabled.
 	ArchiveMerge         MergeOptions
 	ArchiveMergeDisabled bool
+	// ArchiveRotateDisabled turns off RETENTION on archive tables: the step that drops whole
+	// sealed segments falling outside ArchiveConfig.Retention (max segments / max bytes /
+	// max age), plus the early drain of records a change feed has consumed (SetGCFloor).
+	//
+	// On by default, unlike the other archive steps that are off until configured, because
+	// it is the only step in the pass that bounds the table's SIZE, and because it cannot
+	// act on an archive that has not asked for it: retention is per-archive configuration
+	// and the zero Retention keeps everything, so an archive with none configured drops
+	// nothing no matter how often the pass runs. An embedder that configured retention and
+	// never wired up a rotation loop of its own was getting unbounded growth from a policy
+	// it had already written down.
+	//
+	// The switch exists because the step is the one irreversible thing the pass does. An
+	// operator who wants the bounds enforced on a schedule of their own -- a quiet hour, a
+	// snapshot taken first -- turns it off here and calls ArchiveTable.Rotate themselves.
+	ArchiveRotateDisabled bool
 	// ArchiveIndexBackfillBytes is the per-pass budget, in stored segment bytes, for carrying
 	// the current index set to sealed archive segments that lack postings for an indexed
 	// attribute -- the ones beyond ArchiveConfig.IndexBackfillBytes when the index was added.
@@ -494,6 +510,14 @@ type MaintainOptions struct {
 	// the existing dictionary left in place, not a failure of the pass.
 	OnRetrain func(RetrainResult) `json:"-"`
 
+	// OnRotate, when set, is called after ArchiveTable.Maintain rotates the archive to its
+	// retention bounds -- only when the rotation dropped something or failed, so the usual
+	// pass over an archive that is within its bounds (or has none configured) says nothing.
+	//
+	// Called synchronously, on the maintenance goroutine, holding nothing the callback can
+	// reach. It must not call back into the table.
+	OnRotate func(RotateResult) `json:"-"`
+
 	// OnAutoTune, when set, is called with what the pass's auto-tuner changed -- once per
 	// pass, only when it changed something. Nil (the default) is the previous behaviour.
 	//
@@ -507,6 +531,18 @@ type MaintainOptions struct {
 	// Called synchronously, on the maintenance goroutine, holding nothing the callback can
 	// reach. It must not call back into the table.
 	OnAutoTune func(AutoTuneResult) `json:"-"`
+}
+
+// RotateResult is what one retention rotation did (MaintainOptions.OnRotate).
+type RotateResult struct {
+	// Dropped is how many whole sealed segments fell outside retention and were released.
+	Dropped int
+	// Took is how long the rotation ran.
+	Took time.Duration
+	// Err is a failure to release a dropped segment's file (munmap/unlink), nil on success.
+	// The segments are already out of service when it happens, so it leaks a file rather
+	// than corrupting one, and it does not stop the rest of the maintenance pass.
+	Err error
 }
 
 // RetrainResult is what one dictionary retrain did (MaintainOptions.OnRetrain).

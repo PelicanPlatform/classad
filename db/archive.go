@@ -50,6 +50,13 @@ type ArchiveTable struct {
 	// MaintainOptions.ArchiveRetrainInterval.
 	retrainMu   sync.Mutex
 	lastRetrain time.Time
+
+	// nowFn is the wall clock (unix seconds) the maintenance pass hands to Rotate for
+	// age-based retention. The storage layer keeps no clock of its own -- Rotate takes the
+	// time as an argument precisely so it does not -- and Maintain has to supply one.
+	// Overridable in tests, which is the only way to put a fixture on the far side of a
+	// MaxAge ceiling without making the test wait.
+	nowFn func() float64
 }
 
 // StopMaintenance asks any maintenance pass running on this archive to stop at its next safe
@@ -344,7 +351,8 @@ func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*Arc
 	}
 	t := &ArchiveTable{a: a, cfg: newConfigFile(dir, archiveConfigFile, cfg), enc: enc, sealedIndexes: sealedIndexes,
 		// The retrain clock starts now, not at the zero time: see ArchiveTable.lastRetrain.
-		lastRetrain: time.Now()}
+		lastRetrain: time.Now(),
+		nowFn:       func() float64 { return float64(time.Now().Unix()) }}
 	// The index set above was rebuilt from the config as human-created; re-mark the ones
 	// the tuner made. This adds no index (they are already present) -- it only restores
 	// provenance.
@@ -1694,9 +1702,10 @@ func (t *ArchiveTable) GCFloor() float64 { return t.a.GCFloor() }
 // segment costs a memory mapping at open plus a second for its sidecar, exhausting
 // vm.max_map_count stops the daemon STARTING, and the symptom does not appear until a restart.
 //
-// The work is deliberately narrow -- merge cold runs, rebuild indexes left stale by an
-// interrupted pass, carry the index set to older segments within a per-pass budget, apply the
-// demand-driven tuning, and, if asked, retrain the dictionary on a much longer clock.
+// The work is deliberately narrow -- drop whole segments past the configured retention, merge
+// cold runs, rebuild indexes left stale by an interrupted pass, carry the index set to older
+// segments within a per-pass budget, apply the demand-driven tuning, and, if asked, retrain
+// the dictionary on a much longer clock.
 //
 // REWRITING is not among them. It re-encodes every segment in place on every call, which at
 // history scale is hours of I/O for a gain that is usually small, so it stays an explicit
@@ -1723,13 +1732,34 @@ func (t *ArchiveTable) Maintain(opts MaintainOptions) {
 		opts.SampleMax = DefaultArchiveSampleMax
 	}
 	// Between the STEPS of one archive's pass, not only between archives. Each step below
-	// honours StopMaintenance internally, but none of them knows it is one of seven: a stop
+	// honours StopMaintenance internally, but none of them knows it is one of eight: a stop
 	// landing in the merge used to still pay for the reindex, the index backfill, the group
 	// derivation, the schema scan (whose columnarize is the longest of the lot), the hot-set
 	// refresh and the index auto-tune. stopping is checked before each expensive step; the
 	// archive's own flag is used rather than done, because that is what Close sets and what
 	// the steps themselves read, so the two can never disagree.
 	stopping := t.MaintenanceStopping
+	// FIRST, before anything that reads or rewrites a segment. Every step below costs work
+	// per live segment -- the merge re-encodes them, the reindex and the backfill read them
+	// back through the decompressor, the schema scan columnarizes them, a retrain interns
+	// them -- so doing any of that to a segment this same pass is about to drop is pure
+	// waste.
+	//
+	// It is also the order that keeps the policy honest. A merge folds adjacent segments
+	// together, and the merged segment's zone map takes the NEWEST value of each attribute
+	// it absorbed; an expiring segment merged into a younger one therefore comes out on the
+	// young side of the MaxAge ceiling and is kept. Merging first would silently extend
+	// retention past what was configured, and by a margin nobody could predict from the
+	// policy. Rotating first means a segment is judged against the bounds in the shape it
+	// was sealed in.
+	//
+	// Nothing later in the pass depends on what was dropped: each step re-reads the live
+	// segment set (StaleIndexSegments, IndexBackfillPending, the samples), and Rotate raises
+	// the watch append floor inside the same critical section that drops the segments, so a
+	// catch-up can never observe a drop without it.
+	if !opts.ArchiveRotateDisabled && !stopping() {
+		t.maybeRotate(opts)
+	}
 	// ArchiveMergeDisabled gates the MERGE, and only the merge. It used to return from
 	// the whole function, which was the same statement when the pass was a merge and the
 	// reindex that follows one; every step added since -- hot-set refresh, index
@@ -1815,6 +1845,24 @@ func (t *ArchiveTable) Maintain(opts MaintainOptions) {
 	// over days rather than paying every pass.
 	if !stopping() {
 		t.maybeRetrain(opts)
+	}
+}
+
+// maybeRotate drops the sealed segments that fall outside this archive's retention bounds
+// (see MaintainOptions.ArchiveRotateDisabled), reporting through OnRotate only when it
+// dropped something or failed -- an archive inside its bounds, or with no retention
+// configured at all, is the common case and has nothing to say.
+//
+// A failure is reported and the pass CONTINUES. The error Rotate returns is a munmap or
+// unlink failure on a segment that has already been taken out of the live set, so it leaks a
+// file rather than corrupting one; the records are gone from the table either way. Returning
+// here would cost the whole rest of the pass -- the merge that bounds the segment count, the
+// reindex that queries depend on -- for a condition none of them care about.
+func (t *ArchiveTable) maybeRotate(opts MaintainOptions) {
+	start := time.Now()
+	dropped, err := t.Rotate(t.nowFn())
+	if (dropped > 0 || err != nil) && opts.OnRotate != nil {
+		opts.OnRotate(RotateResult{Dropped: dropped, Took: time.Since(start), Err: err})
 	}
 }
 
