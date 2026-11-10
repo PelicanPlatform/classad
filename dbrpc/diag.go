@@ -84,8 +84,34 @@ const defaultSchemaHotTopN = 32
 // hot set from read demand.
 const defaultAnalyzeHotTopN = 32
 
-// diagJSON gathers a table's diagnostics into JSON.
-func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
+// diagTable is the diagnostic surface a mutable table and an archive answer identically, so
+// the fields they share are gathered ONCE. Fifteen of the seventeen reported fields come from
+// here; a kind adds only what is genuinely its own (an archive's retention, zone maps and
+// index backfill; a mutable table's drop suggestions). Two builders over one struct is how the
+// archive came to report no index suggestions although it records the demand behind them, and
+// how an operator was told it had no hot set while it had one.
+//
+// This is the move schemaScanTable already makes for the schema.* actions.
+type diagTable interface {
+	Stats() db.Stats
+	OpStats() db.OpStats
+	HotAttrs() []string
+	IndexedAttrs() (categorical, value []string)
+	IndexSizes() db.IndexSizes
+	CodecStats(sampleMax int) db.CodecStats
+	SuggestIndexes(sampleMax int) []db.IndexSuggestion
+	EncryptionEnabled() bool
+	EncryptedAttrNames() []string
+	SchemaScanInfo() db.SchemaScanInfo
+	GroupSchemaDrift() db.GroupSchemaDrift
+	GroupSchemaChanges() []db.GroupSchemaChange
+	GroupSchemaLastAgreement() (db.GroupSchemaLastAgreement, bool)
+	SidecarSizes() db.SidecarSizes
+	StaleIndexSegments() (stale, sealed int)
+}
+
+// diagCommon fills every field both table kinds answer. The caller adds its own.
+func diagCommon(t diagTable) Diagnostics {
 	cat, val := t.IndexedAttrs()
 	d := Diagnostics{
 		Stats:              t.Stats(),
@@ -96,58 +122,40 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		IndexSizes:         t.IndexSizes(),
 		Codec:              t.CodecStats(diagSampleMax),
 		Suggestions:        t.SuggestIndexes(diagSampleMax),
-		DropSuggestions:    t.SuggestDrops(diagSampleMax),
 		EncryptionEnabled:  t.EncryptionEnabled(),
 		EncryptedAttrs:     t.EncryptedAttrNames(),
 		SchemaScan:         t.SchemaScanInfo(),
 		GroupDrift:         t.GroupSchemaDrift(),
 		GroupChanges:       t.GroupSchemaChanges(),
-		// Reported for a mutable table as well as an archive: it has sidecars too, and without them
-		// its .stats could not account for its on-disk footprint the way an archive's could.
-		SidecarSizes: t.SidecarSizes(),
+		SidecarSizes:       t.SidecarSizes(),
 	}
 	if ag, ok := t.GroupSchemaLastAgreement(); ok {
 		d.GroupAgreement = &ag
 	}
 	d.StaleIndexSegments, d.SealedSegments = t.StaleIndexSegments()
+	return d
+}
+
+// diagJSON gathers a mutable table's diagnostics into JSON: the shared surface plus the drop
+// suggestions, which only a mutable table offers (see ArchiveTable.SuggestIndexes for why an
+// archive is not told which index to remove).
+func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
+	d := diagCommon(t)
+	d.DropSuggestions = t.SuggestDrops(diagSampleMax)
 	return json.Marshal(d)
 }
 
-// archiveDiagJSON assembles the diagnostics for an append-only archive (history) table, from
-// the same stat surface as a mutable table plus the retention bounds -- so `.stats history`
-// reads like `.stats <table>` (storage bytes, segments, codec, op timings) instead of just a
-// row count.
+// archiveDiagJSON gathers an append-only archive's diagnostics into JSON: the shared surface --
+// so `.stats history` reads like `.stats <table>`, storage bytes, segments, codec and op
+// timings rather than a row count -- plus the three things only an archive has, its retention
+// bounds, its zone maps and the index backfill still owed to its older segments.
 func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
-	cat, val := a.IndexedAttrs()
+	d := diagCommon(a)
 	ret := a.Retention()
-	stale, sealed := a.StaleIndexSegments()
-	d := Diagnostics{
-		Stats:              a.Stats(),
-		OpStats:            a.OpStats(),
-		CategoricalIndexes: cat,
-		ValueIndexes:       val,
-		IndexSizes:         a.IndexSizes(),
-		Codec:              a.CodecStats(diagSampleMax),
-		Archive:            true,
-		Retention:          &ret,
-		SidecarSizes:       a.SidecarSizes(),
-		ZoneAttrs:          a.ZoneAttrs(),
-		SealedSegments:     sealed,
-		StaleIndexSegments: stale,
-		SchemaScan:         a.SchemaScanInfo(),
-		GroupDrift:         a.GroupSchemaDrift(),
-		GroupChanges:       a.GroupSchemaChanges(),
-		// The same three a mutable table reports, with the same meaning: an archive resolves its data
-		// key as a mutable table does, so it seals the same attributes and reports encryption at rest
-		// on the same terms.
-		Hot:               a.HotAttrs(),
-		EncryptionEnabled: a.EncryptionEnabled(),
-		EncryptedAttrs:    a.EncryptedAttrNames(),
-	}
+	d.Archive = true
+	d.Retention = &ret
+	d.ZoneAttrs = a.ZoneAttrs()
 	d.BackfillPendingSegments, d.BackfillPendingBytes = a.IndexBackfillPending()
-	if ag, ok := a.GroupSchemaLastAgreement(); ok {
-		d.GroupAgreement = &ag
-	}
 	return json.Marshal(d)
 }
 

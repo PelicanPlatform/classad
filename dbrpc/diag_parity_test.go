@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -25,11 +27,12 @@ import (
 // kindSpecificFields are the fields that legitimately belong to one kind. Everything else must be
 // populated for both, or listed here with a reason.
 var kindSpecificFields = map[string]string{
-	"Archive":         "the discriminator itself",
-	"Retention":       "rotation bounds; a mutable table does not rotate",
-	"ZoneAttrs":       "zone maps are an append-only construct",
-	"Suggestions":     "GAP, not a design: ArchiveTable has no SuggestIndexes yet",
-	"DropSuggestions": "GAP, not a design: ArchiveTable has no SuggestDrops yet",
+	"Archive":   "the discriminator itself",
+	"Retention": "rotation bounds; a mutable table does not rotate",
+	"ZoneAttrs": "zone maps are an append-only construct",
+	"DropSuggestions": "an archive is not told which index to remove: dropping one is cheap and " +
+		"re-adding it reads history back through the decompressor, so naming one for a human to drop " +
+		"puts an irreversible-in-practice trade in front of someone who did not ask for it",
 }
 
 func TestDiagnosticsFieldsPopulatedForBothKinds(t *testing.T) {
@@ -89,11 +92,34 @@ func TestDiagnosticsFieldsPopulatedForBothKinds(t *testing.T) {
 	if !arch.BuildAndEnableSchemaScan(2000, 16) {
 		t.Log("archive: schema scan not enabled")
 	}
+	// Index suggestions come from RECORDED DEMAND, so a fixture that never queries reports none --
+	// for either kind, which would compare zero against zero and pass. Query an attribute NEITHER
+	// table indexes, on both, so a suggestion is the right answer on both.
+	demandQueries(t, "mutable", func(c string) (iter.Seq[*classad.ClassAd], error) { return d.Query(c) })
+	demandQueries(t, "archive", func(c string) (iter.Seq[*classad.ClassAd], error) { return arch.Query(c) })
 
 	mutable := mustDiag(t, func() ([]byte, error) { return s.diagJSON(d) })
 	archive := mustDiag(t, func() ([]byte, error) { return s.archiveDiagJSON(arch) })
 	if !archive.Archive {
 		t.Fatal("the archive diagnostics do not identify themselves as an archive")
+	}
+	// The precondition for the Suggestions comparison below, asserted rather than assumed: if the
+	// demand stopped being recorded, or JobStatus became indexed by the fixture, both sides would
+	// report nothing and the comparison would hold vacuously.
+	for _, k := range []struct {
+		name string
+		d    Diagnostics
+	}{{"mutable", mutable}, {"archive", archive}} {
+		if !suggests(k.d.Suggestions, demandAttr) {
+			t.Fatalf("%s: nothing suggested for %s after %d queries filtering on it, so this fixture "+
+				"no longer exercises index suggestions (got %+v)", k.name, demandAttr, demandRounds,
+				k.d.Suggestions)
+		}
+	}
+	// An archive reports no drop suggestions, ever -- see kindSpecificFields.
+	if len(archive.DropSuggestions) != 0 {
+		t.Errorf("archive suggested dropping %+v; an archive is not told which index to remove",
+			archive.DropSuggestions)
 	}
 
 	verified := 0
@@ -128,8 +154,8 @@ func TestDiagnosticsFieldsPopulatedForBothKinds(t *testing.T) {
 	// A RATCHET at the number this fixture reaches today. If a change legitimately removes a field,
 	// lower it deliberately; if a change quietly stops populating one, this fails instead of the
 	// comparison above silently having nothing to compare.
-	if verified < 10 {
-		t.Errorf("only %d fields were populated on both sides (want >= 10); this fixture is no longer "+
+	if verified < 12 {
+		t.Errorf("only %d fields were populated on both sides (want >= 12); this fixture is no longer "+
 			"exercising the payload", verified)
 	}
 	t.Logf("%d fields verified populated for both kinds", verified)
@@ -165,6 +191,39 @@ func TestArchiveReportsEncryptionAtRest(t *testing.T) {
 		s.Close()
 		cat.Close()
 	}
+}
+
+// demandAttr is an attribute NEITHER table indexes and every ad carries, so filtering on it is
+// demand for an index that does not exist -- which is what SuggestIndexes reports. demandRounds is
+// enough probes to clear any evidence floor on the tracker.
+const (
+	demandAttr   = "JobStatus"
+	demandRounds = 40
+)
+
+// demandQueries runs the probes that teach a table what it is missing an index on. The iterator is
+// drained: demand is recorded by the scan, so a query that is never ranged over records nothing.
+func demandQueries(t *testing.T, kind string, query func(string) (iter.Seq[*classad.ClassAd], error)) {
+	t.Helper()
+	for i := 0; i < demandRounds; i++ {
+		seq, err := query(fmt.Sprintf("%s == %d", demandAttr, i%6))
+		if err != nil {
+			t.Fatalf("%s: demand query: %v", kind, err)
+		}
+		for range seq { //nolint:revive // the scan is the point; the rows are not
+		}
+	}
+}
+
+// suggests reports whether attr is among the suggestions, matched as ClassAd attribute names
+// compare -- without regard to case.
+func suggests(sugg []db.IndexSuggestion, attr string) bool {
+	for _, s := range sugg {
+		if strings.EqualFold(s.Attr, attr) {
+			return true
+		}
+	}
+	return false
 }
 
 func mustDiag(t *testing.T, build func() ([]byte, error)) Diagnostics {
