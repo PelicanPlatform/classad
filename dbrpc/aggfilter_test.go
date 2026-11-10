@@ -268,3 +268,53 @@ func TestCountDistinctUnsupportedServer(t *testing.T) {
 		t.Errorf("the deprecated alias should still match")
 	}
 }
+
+// TestApproxCountDistinctOverRPC checks the approximate distinct count end to end, beside the
+// exact one it is a companion to and under the same per-aggregate filter. At this cardinality
+// the sketch's small-range estimator is exact, so the two columns must read identically: a
+// disagreement here is a fault in the plumbing, not the error bar.
+func TestApproxCountDistinctOverRPC(t *testing.T) {
+	c, cleanup := testPair(t)
+	defer cleanup()
+	seedStatusMix(t, c)
+
+	rows, err := c.Aggregate(context.Background(), "true", []string{"Owner"}, []AggSpec{
+		{Func: AggCountDistinct, Arg: "JobStatus"},
+		{Func: AggApproxCountDistinct, Arg: "JobStatus"},
+		{Func: AggCountDistinct, Arg: "JobStatus", Filter: "Cpus > 1"},
+		{Func: AggApproxCountDistinct, Arg: "JobStatus", Filter: "Cpus > 1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("no rows; the comparison would be vacuous")
+	}
+	for _, r := range rows {
+		if r.Values[0] != r.Values[1] {
+			t.Errorf("%s: COUNT(DISTINCT JobStatus) = %s, approximate = %s",
+				r.Group[0], r.Values[0], r.Values[1])
+		}
+		if r.Values[2] != r.Values[3] {
+			t.Errorf("%s under the filter: COUNT(DISTINCT JobStatus) = %s, approximate = %s",
+				r.Group[0], r.Values[2], r.Values[3])
+		}
+	}
+}
+
+// TestApproxCountDistinctUnsupportedServer checks that the approximate function is gated like
+// the exact one. An older server decodes the frame, matches no function and answers the column
+// "undefined" -- a wrong answer dressed as a missing one -- so the client refuses the opcode.
+func TestApproxCountDistinctUnsupportedServer(t *testing.T) {
+	c, cleanup := testPairOps(t, func(o op) bool {
+		return o != opAggregateFiltered && o != opArchiveAggregateFiltered
+	})
+	defer cleanup()
+	seedStatusMix(t, c)
+
+	_, err := c.Aggregate(context.Background(), "true", nil,
+		[]AggSpec{{Func: AggApproxCountDistinct, Arg: "JobStatus"}})
+	if !errors.Is(err, ErrExtendedAggregateUnsupported) {
+		t.Errorf("err = %v, want ErrExtendedAggregateUnsupported", err)
+	}
+}
