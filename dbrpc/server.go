@@ -2170,10 +2170,10 @@ func respBad(reqID uint64) []byte { return resp(reqID, stBadReq) }
 // vm.max_map_count stops the daemon STARTING, and the condition is not self-correcting: with
 // nothing merging, the count only rises, and the symptom does not appear until a restart.
 //
-// The work is deliberately narrow -- merge cold runs, rebuild indexes left stale by an
-// interrupted pass, carry the index set to older segments within a per-pass budget, apply the
-// demand-driven tuning, and on a much longer cadence retrain the dictionary. What they have in
-// common is that none of them re-encodes the archive.
+// The work is deliberately narrow -- drop whole segments past the configured retention, merge
+// cold runs, rebuild indexes left stale by an interrupted pass, carry the index set to older
+// segments within a per-pass budget, apply the demand-driven tuning, and on a much longer
+// cadence retrain the dictionary.
 //
 // REWRITING is excluded because it does: it re-encodes every segment in place, which at
 // history scale is hours of I/O for a gain that is usually small. Retraining is not the same
@@ -2206,10 +2206,28 @@ func (s *Server) maintainArchives(opts db.MaintainOptions, done <-chan struct{})
 		o := opts // per-archive, so each hook can name the archive it fired for
 		o.OnAutoTune = func(res db.AutoTuneResult) { s.logAutoTune(name, "archive", res) }
 		o.OnRetrain = func(res db.RetrainResult) { s.logRetrain(name, res) }
+		o.OnRotate = func(res db.RotateResult) { s.logRotate(name, res) }
 		s.maintainMu.Lock()
 		a.Maintain(o)
 		s.maintainMu.Unlock()
 	}
+}
+
+// logRotate reports what a pass's retention rotation dropped. Only a rotation that dropped
+// something or failed reaches here, so an archive sitting inside its bounds -- or with no
+// retention configured -- is silent.
+//
+// A failure is Warn and not fatal to the pass: the segments are already out of the live set,
+// so what failed is releasing their files, and the pass carries on without them.
+func (s *Server) logRotate(table string, res db.RotateResult) {
+	took := res.Took.Round(time.Millisecond).String()
+	if res.Err != nil {
+		s.logger().Warn("archive rotation failed", "archive", table,
+			"err", res.Err.Error(), "segments_dropped", res.Dropped, "took", took)
+		return
+	}
+	s.logger().Info("rotated archive", "archive", table,
+		"segments_dropped", res.Dropped, "took", took)
 }
 
 // logRetrain reports what a pass's dictionary retrain did. A decline is Info, not Warn: small
