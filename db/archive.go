@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -40,6 +42,14 @@ type ArchiveTable struct {
 	// sealedIndexes names the configured indexes this open left out because the sealing policy
 	// names their attribute (see openArchiveTable).
 	sealedIndexes []string
+
+	// lastRetrain is when a maintenance pass last retrained this archive's dictionary, set to
+	// the time of the OPEN rather than the zero time so the first pass after a restart defers
+	// a retrain instead of running one. Nothing persists it -- CodecStats.LastRetrain is
+	// per-process too -- so a restart resets the clock, in the conservative direction. See
+	// MaintainOptions.ArchiveRetrainInterval.
+	retrainMu   sync.Mutex
+	lastRetrain time.Time
 }
 
 // StopMaintenance asks any maintenance pass running on this archive to stop at its next safe
@@ -332,7 +342,9 @@ func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*Arc
 	if err != nil {
 		return nil, err
 	}
-	t := &ArchiveTable{a: a, cfg: newConfigFile(dir, archiveConfigFile, cfg), enc: enc, sealedIndexes: sealedIndexes}
+	t := &ArchiveTable{a: a, cfg: newConfigFile(dir, archiveConfigFile, cfg), enc: enc, sealedIndexes: sealedIndexes,
+		// The retrain clock starts now, not at the zero time: see ArchiveTable.lastRetrain.
+		lastRetrain: time.Now()}
 	// The index set above was rebuilt from the config as human-created; re-mark the ones
 	// the tuner made. This adds no index (they are already present) -- it only restores
 	// provenance.
@@ -1668,6 +1680,175 @@ func (t *ArchiveTable) SetGCFloor(floor float64) { t.a.SetGCFloor(floor) }
 
 // GCFloor returns the current runtime GC watermark (0 when unset).
 func (t *ArchiveTable) GCFloor() float64 { return t.a.GCFloor() }
+
+// Maintain runs one maintenance pass over this archive, as DB.Maintain does for a mutable
+// table. Both kinds are driven from the same MaintainOptions; the STEPS differ, because what
+// an append log needs maintaining is not what a mutable store needs, and that difference is
+// the point rather than drift.
+//
+// It lives here, beside DB.Maintain, rather than in whatever is driving the schedule. Until it
+// did, an archive was maintained only by callers that happened to implement the pass
+// themselves, so an embedder that opened a catalog and maintained its tables got nothing on
+// the archive side -- no merge, no reindex, no tuning -- and the archive's segment count only
+// grew. An append-only table never compacts, so that is not self-correcting: every sealed
+// segment costs a memory mapping at open plus a second for its sidecar, exhausting
+// vm.max_map_count stops the daemon STARTING, and the symptom does not appear until a restart.
+//
+// The work is deliberately narrow -- merge cold runs, rebuild indexes left stale by an
+// interrupted pass, carry the index set to older segments within a per-pass budget, apply the
+// demand-driven tuning, and, if asked, retrain the dictionary on a much longer clock.
+//
+// REWRITING is not among them. It re-encodes every segment in place on every call, which at
+// history scale is hours of I/O for a gain that is usually small, so it stays an explicit
+// operator action. Retraining is in the pass but off unless configured, because it is cheap in
+// the steady state and expensive exactly once -- see DefaultArchiveRetrainInterval.
+//
+// Reports through MaintainOptions.OnAutoTune and OnRetrain rather than logging: nothing in this
+// package logs, so the caller decides what is worth saying and names the table it happened to.
+func (t *ArchiveTable) Maintain(opts MaintainOptions) {
+	// Resolve the sample bound ONCE, for the whole pass, as DB.Maintain does. Each step used
+	// to default it for itself or not at all, and an unset SampleMax therefore meant two
+	// different things inside one pass: DefaultArchiveSampleMax for the schema scan and the
+	// hot-set refresh, and 4096 for the index tuner and the group derivation, because
+	// collections' AutoTune and GroupSchemas both substitute their own maxDistinctSample for
+	// a non-positive bound. Neither step was ever unsampled, so this was not a dark pass -- it
+	// was two sample sizes where there should be one, with the steps that sample an archive's
+	// records silently drawing the larger of them.
+	//
+	// The archive's own default is the one kept: sampling an archive decompresses records, and
+	// the two steps that were drawing 4096 were taking it from a library fallback rather than
+	// asking for it. A caller that wants a different bound sets SampleMax, which every step
+	// has always honoured.
+	if opts.SampleMax <= 0 {
+		opts.SampleMax = DefaultArchiveSampleMax
+	}
+	// Between the STEPS of one archive's pass, not only between archives. Each step below
+	// honours StopMaintenance internally, but none of them knows it is one of seven: a stop
+	// landing in the merge used to still pay for the reindex, the index backfill, the group
+	// derivation, the schema scan (whose columnarize is the longest of the lot), the hot-set
+	// refresh and the index auto-tune. stopping is checked before each expensive step; the
+	// archive's own flag is used rather than done, because that is what Close sets and what
+	// the steps themselves read, so the two can never disagree.
+	stopping := t.MaintenanceStopping
+	// ArchiveMergeDisabled gates the MERGE, and only the merge. It used to return from
+	// the whole function, which was the same statement when the pass was a merge and the
+	// reindex that follows one; every step added since -- hot-set refresh, index
+	// auto-tune, the schema scan, the group derivation, the demand checkpoint -- was
+	// silently switched off with it. None of those re-encode the archive, which is what
+	// the knob's name is about, and the one that changes future writes has its own switch
+	// in ArchiveHotRefreshDisabled.
+	if !opts.ArchiveMergeDisabled && !stopping() {
+		// Below its trigger watermark this is a segment count and a comparison, so the
+		// common case costs nothing.
+		t.MergePass(opts.ArchiveMerge)
+	}
+	// A merge leaves its output without a sidecar, and an interrupted reindex leaves
+	// segments stale; either way queries fall back to scanning until it is rebuilt. Not
+	// gated on the merge: a pass interrupted before the knob was set leaves the same
+	// stale segments behind, and they stay stale until something rebuilds them.
+	if stale, _ := t.StaleIndexSegments(); stale > 0 && !stopping() {
+		t.Reindex()
+	}
+	// Carry the index set to older segments that predate it, a budgeted slice per pass,
+	// newest first. Reindex stops at the backfill horizon, so without this an index added
+	// to a large history only ever reaches its newest segments.
+	if budget, ok := opts.ArchiveIndexBackfillBudget(); ok && !stopping() {
+		if pending, _ := t.IndexBackfillPending(); pending > 0 {
+			t.BackfillIndexes(budget)
+		}
+	}
+	// Derive and checkpoint the candidate group schemas on the ARCHIVE's cadence, which is
+	// far longer than a mutable table's -- so the stability gate's several derivations span
+	// days rather than minutes. That is the intended shape: an archive's structure should be
+	// established over the period it actually changes on.
+	//
+	// BEFORE the schema scan, as DB.Maintain does it: the gate reads the derivation
+	// history that this call appends to, so deriving afterwards means the scan's
+	// auto-promotion never sees the current pass and a qualifying group waits one extra
+	// review interval -- a day on an archive -- to be committed. One derivation per pass
+	// either way; the history still accumulates on the pass cadence and no faster.
+	if opts.ArchiveSchemaScanHotTopN > 0 && !stopping() {
+		t.GroupSchemas(opts.SampleMax, 0)
+	}
+	// The per-segment columnar accelerator, off unless configured (see
+	// ArchiveSchemaScanHotTopN): the first build reads the whole history once. After that
+	// this only extends coverage to segments sealed since, including those a merge just
+	// produced.
+	if opts.ArchiveSchemaScanHotTopN > 0 && !stopping() {
+		t.BuildAndEnableSchemaScan(opts.SampleMax, opts.ArchiveSchemaScanHotTopN)
+	}
+	// Re-rank the hot header from accumulated read demand. This is the one archive pass
+	// that reads nothing back: the hot header is per record, so sealed segments keep --
+	// and still read correctly under -- the set they were written with, and nothing is
+	// rebuilt here. A sample and a pointer swap, which is why it runs on the shared
+	// HotTopN instead of a threshold of its own.
+	//
+	// It is placed after the merge deliberately. A merge re-encodes the records it folds
+	// together under the current hot set, so the ordering decides which set this pass's
+	// merged output carries: refreshing first would apply a set chosen from demand that
+	// the merge has not yet been measured against. Refreshing after means the NEXT pass's
+	// merge carries it, which is the conservative order.
+	if opts.HotTopN > 0 && !opts.ArchiveHotRefreshDisabled && !stopping() {
+		t.RefreshHotSet(opts.SampleMax, opts.HotTopN)
+	}
+	// Add the indexes observed demand justifies. Off unless a threshold is configured:
+	// an archive index is paid for by reading history back, so it is not something to
+	// start doing to an existing deployment on an upgrade.
+	if opts.ArchiveIndexMinDemand > 0 && !stopping() {
+		res := t.AutoTune(AutoTuneOptions{
+			SampleMax: opts.SampleMax,
+			MinDemand: opts.ArchiveIndexMinDemand,
+			Reindex:   true,
+		})
+		if res.Changed && opts.OnAutoTune != nil {
+			opts.OnAutoTune(res)
+		}
+	}
+	// Age and checkpoint the recorded query demand. An archive needs this more than a
+	// mutable table does: indexing one is paid for by decompressing history, so the
+	// decision wants evidence gathered over days, which is longer than a daemon can be
+	// relied on to stay up.
+	t.SaveDemand()
+	// LAST, and on its own much longer clock. It is the only step here that samples and
+	// trains rather than reading what is already recorded, so it is the one worth
+	// deferring when a stop has arrived -- and the one whose cost is worth spreading
+	// over days rather than paying every pass.
+	if !stopping() {
+		t.maybeRetrain(opts)
+	}
+}
+
+// maybeRetrain retrains this archive's compression dictionary if its interval has elapsed (see
+// MaintainOptions.ArchiveRetrainInterval). It is the archive's only defence against keeping
+// whatever dictionary it was given early in life: nothing else revisits one, because an append
+// log never compacts.
+func (t *ArchiveTable) maybeRetrain(opts MaintainOptions) {
+	every, on := opts.ArchiveRetrainEvery()
+	if !on {
+		return
+	}
+	t.retrainMu.Lock()
+	if time.Since(t.lastRetrain) < every {
+		t.retrainMu.Unlock()
+		return
+	}
+	// Claim the slot BEFORE the slow part, so a second pass arriving while this one trains
+	// cannot start a retrain of its own. The claim stands whether or not training succeeds: an
+	// archive whose data keeps declining should wait out the interval rather than retry, and
+	// pay the sample, on every pass.
+	t.lastRetrain = time.Now()
+	t.retrainMu.Unlock()
+
+	start := time.Now()
+	// 0 is no record-count bound, leaving the sampler's own byte budget to decide how much to
+	// draw. That is what the trainer actually consumes, and it makes the cost independent of
+	// how fat this table's ads happen to be: a fixed count of 2000 is a few hundred KB of job
+	// ads or tens of MB of slot ads, where the byte budget is the same work either way.
+	n, err := t.RetrainDict(0)
+	if opts.OnRetrain != nil {
+		opts.OnRetrain(RetrainResult{DictBytes: n, Took: time.Since(start), Err: err})
+	}
+}
 
 // SaveDemand checkpoints the archive's recorded query demand so index decisions survive a
 // restart, ageing it by the time since the last checkpoint. See collections.SaveDemand.
