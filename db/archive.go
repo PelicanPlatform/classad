@@ -1673,6 +1673,19 @@ func (t *ArchiveTable) GCFloor() float64 { return t.a.GCFloor() }
 // restart, ageing it by the time since the last checkpoint. See collections.SaveDemand.
 func (t *ArchiveTable) SaveDemand() { t.a.SaveDemand() }
 
+// SuggestIndexes reports the attributes observed query demand would justify indexing, ordered
+// by demand, from the same tracker AutoTune acts on. Advisory: nothing is added by reporting
+// it. See DB.SuggestIndexes.
+//
+// There is no ArchiveTable.SuggestDrops. An archive's cheap direction and expensive direction
+// are the wrong way round for an absence of evidence, for the reason AutoTune gives below:
+// dropping an index is cheap and re-adding one reads history back through the decompressor.
+// Naming an index for a human to drop puts that trade in front of someone who did not ask for
+// it, which is the half of the asymmetry the add suggestions do not carry.
+func (t *ArchiveTable) SuggestIndexes(sampleMax int) []IndexSuggestion {
+	return t.a.SuggestIndexes(sampleMax)
+}
+
 // AutoTune adds indexes the observed query demand justifies, persisting the result so the
 // backfill it just paid for is not thrown away and re-paid on the next restart.
 //

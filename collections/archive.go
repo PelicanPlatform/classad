@@ -868,6 +868,12 @@ func (a *Archive) SaveDemand() { a.c.SaveDemand() }
 // AutoTune applies demand-driven index changes to the archive. See Collection.AutoTune.
 func (a *Archive) AutoTune(opts AutoTuneOptions) AutoTuneResult { return a.c.AutoTune(opts) }
 
+// SuggestIndexes reports the attributes observed demand would justify indexing, from the same
+// tracker AutoTune acts on. See Collection.SuggestIndexes.
+func (a *Archive) SuggestIndexes(sampleMax int) []IndexSuggestion {
+	return a.c.SuggestIndexes(sampleMax)
+}
+
 // MarkAutoIndexes records existing indexes as auto-created, restoring the provenance a
 // saved config carries without rebuilding anything. See Collection.MarkAutoIndexes.
 func (a *Archive) MarkAutoIndexes(names []string) { a.c.MarkAutoIndexes(names) }
