@@ -365,3 +365,32 @@ func TestArchiveCatchUpNoDeltaRecords(t *testing.T) {
 		t.Errorf("open segment ended at used=%d upto=%d; the reads did not catch it up", used, upto)
 	}
 }
+
+// TestArchiveCatchUpSkipsAnUnindexedStore pins the guard that keeps a store nobody asked to
+// index unindexed. A read cannot reach it: planReadQuery calls catch-up only once it has an
+// index-usable probe, and a store with no index configured never has one. So the guard answers
+// for the direct callers, where building an index nobody configured would walk and decode every
+// record of the store on the first call.
+func TestArchiveCatchUpSkipsAnUnindexedStore(t *testing.T) {
+	a, _ := catchUpArchive(t, ArchiveOptions{SegmentSize: 1 << 20}, 2000)
+	if a.c.spec.Load().any() {
+		t.Fatal("fixture configured an index; this test is about a store with none")
+	}
+	_, used, upto := activeSegState(t, a.c)
+	if used <= indexCatchUpBytes {
+		t.Fatalf("the active segment holds %d bytes, under the %d-byte threshold, so it would be "+
+			"left alone whatever the guard did", used, indexCatchUpBytes)
+	}
+	if upto != -1 {
+		t.Fatalf("an unindexed store's active segment already carries an index covering %d bytes", upto)
+	}
+
+	before := IndexCatchUps()
+	a.c.catchUpIndexes()
+	if got := IndexCatchUps(); got != before {
+		t.Errorf("catch-up indexed %d segments of a store with no index configured", got-before)
+	}
+	if _, _, after := activeSegState(t, a.c); after != -1 {
+		t.Errorf("catch-up built an index covering %d bytes on a store with no index configured", after)
+	}
+}
