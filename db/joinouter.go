@@ -65,7 +65,8 @@ var joinOuterDrivenMode = outerDrivenAuto
 //
 // Three columns per cell, one per fan-out of 1, 8 and 64. They barely move, and that is the
 // result: the crossover against the hash is the PAIRS a join produces over the inner side's
-// rows -- about 50% -- and not the ratio of the two sides' row counts. An earlier sweep read
+// rows -- about 50% on this fixture, and the sweeps below say what that figure depends on --
+// and not the ratio of the two sides' row counts. An earlier sweep read
 // it as the latter because it held fan-out at 1, where a key count and a pair count are the
 // same number.
 //
@@ -77,35 +78,47 @@ var joinOuterDrivenMode = outerDrivenAuto
 // key count where the probe is not. Below 5% the probe narrows to the same rows in one query
 // and wins on the per-batch overhead this pays.
 //
-// So there is a band -- from about 5% of the inner side's rows in pairs to about 50% -- where
-// this path beats both. What is missing is not the measurement but the ESTIMATE: engaging on
+// So there is a band -- from about 5% of the inner side's rows in pairs to the crossover
+// measured below -- where this path beats both. What is missing is not the measurement but the ESTIMATE: engaging on
 // it needs the pair count before any row is read, and a pair count is the FROM side's distinct
 // keys times the inner side's rows per key, neither of which the plan holds. The FROM side's
 // keys are counted by planIndexProbes, which already holds that side to collect them, so the
 // number exists -- one step later than the decision is made now. Until that is wired, the
 // default stays on the memory bounds, which are structural and need no estimate.
 //
-// WHAT THAT TABLE DOES NOT TRANSFER, and it is the number most likely to be quoted. The
-// crossover against the hash is ~50% of the inner side's rows ON THAT FIXTURE, whose segments
-// are 64 KiB and so carry about 670 rows each. The archive default is 8 MiB, about 50,000
-// rows, and the crossover moves with rows per segment until it saturates:
+// WHAT THAT TABLE DOES NOT TRANSFER, and it is the number most likely to be quoted: ~50% is
+// the crossover ON THAT FIXTURE, whose segments are 64 KiB and carry about 670 rows. The
+// archive default is 8 MiB. Two sweeps vary one axis each, at fan-out 64, so that what moves
+// the ratio can be told from what moves with it.
 //
-//	rows/segment   5%      20%     50%     80%    crossover
-//	         666   0.20x   0.51x   1.07x   1.40x    ~47%
-//	      10,526   0.18x   0.45x   0.81x   1.02x    ~79%
-//	      30,769   0.15x   0.40x   0.80x   1.02x    ~80%
+// Table size, at a fixed 2 MiB segment (12,500 to 21,000 rows each, 2 to 19 segments):
 //
-// The last two rows differ 2x in table size and agree, so it is rows per segment rather than
-// table size, and it has saturated well before the production figure. Key ORDER moves it back:
-// at 10,526 rows per segment, appending the inner side's keys fully shuffled rather than in
-// order takes the crossover from ~70% to ~45%, because the batch's [lo,hi] span then rules out
-// no segment. That is a 1.5x effect and not the ~75x that zone tiling alone suffers, because
-// the index inside a surviving segment visits the matching rows whatever the order.
+//	inner rows    5%      20%     80%
+//	    25,000   0.06x   0.27x   0.92x
+//	   100,000   0.07x   0.27x   0.95x
+//	   400,000   0.07x   0.28x   0.95x
 //
-// So the band that holds across EVERY condition measured -- three rows-per-segment values,
-// three fan-outs, three key orderings -- is pairs below about 20-25% of the inner side's rows,
-// where this path ran between 0.40x and 0.58x. A default should be built on that, not on the
-// fixture-specific 50%.
+// Sixteen times the table and the ratio does not move. Pairs over inner rows is the axis; the
+// two sides' absolute sizes are not, and neither is a segment count between 2 and 19.
+//
+// Segment size, at a fixed 400,000-row inner side:
+//
+//	rows/segment   segments    5%      20%     80%
+//	         681        587   0.10x   0.35x   1.24x
+//	      21,053         19   0.08x   0.27x   0.95x
+//
+// This one moves, and only at the top of the range: 0.02x apart at 5% of pairs, 0.26x at 80%.
+// The cost is per BATCH and per SEGMENT -- every batch walks the zone map of every segment to
+// find the ones its key span can reach -- so it is paid against however few rows a batch keeps,
+// and 587 segments pay it 30 times over against 19. It is a segment COUNT effect rather than a
+// rows-per-segment one, which is why the first sweep sees none of it at 2 to 19 segments.
+//
+// So the crossover against the hash is ~80% of the inner side's rows in pairs at production
+// segment sizes, not the ~50% this fixture shows, and the margin below it is wide: 0.07x at
+// 5% of pairs and 0.27x at 20%, consistently, across every table size measured.
+//
+// Every ratio above is a measured point. A crossover quoted as a percentage is interpolated
+// between two of them, so it is stated as a rough figure and never carried into a comparison.
 //
 // The last column is worth its own look: it is what a caller really gets, and at fan-out 64
 // the planner picks the probe at every ratio, including 80%, where the probe takes 177 ms
