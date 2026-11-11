@@ -19,10 +19,22 @@ import (
 // delta, rebuilt by merging the key's version chain. A queue mirror with a few thousand updates
 // since its last compaction paid that for every lookup, including one the postings prove empty.
 //
+// An append log has the same tail for a different reason. Its indexes are built at a SEAL
+// (Archive.afterAppend reindexes once the seal counter moves), and a seal also opens the next
+// active segment, so what that reindex covers of the new segment is the one record that did not
+// fit in the old one. Everything appended until the next seal -- up to a whole segment, 8 MiB by
+// default -- is uncovered tail, and every indexed read decompresses and matches all of it. The
+// active segment also has no zone map, so it is not prunable either: a probe whose key every
+// sealed segment's zone map rules out still pays the open segment in full, and what that costs
+// depends only on how long ago the last seal happened.
+//
 // So an indexed read first brings the indexes of the segments it is about to walk up to their
 // current end (catchUpIndexes). That costs one decode of each new record -- less than the walk it
 // replaces costs for each one -- and is paid once, by the first read after the writes, rather
-// than by every read until the next Reindex.
+// than by every read until the next Reindex or seal.
+//
+// Only the covered prefix moves. An index covers [0, upto) and the tail is walked (index.go), so
+// a longer prefix is more selective and never a different answer.
 
 // indexCatchUpBytes is the uncovered tail a segment may carry before an indexed read extends its
 // index. Extending re-summarizes every posting of the segment, a cost that does not shrink with
@@ -44,13 +56,24 @@ func IndexCatchUps() int64 { return indexCatchUps.Load() }
 // index under the current configuration -- the write target a rotation opened after the last
 // Reindex -- so a store nobody has asked to index stays unindexed.
 //
+// An append-only shard is held to be indexed whatever its segments currently carry, because it
+// has already asked: a collection with any index configured indexes every segment of an append
+// log as it seals, without a caller scheduling anything. Waiting for a segment to seal before its
+// successor becomes eligible would leave the first segment of a new archive -- the only one a
+// young archive has -- walked in full by every read.
+//
+// Its one unsealed segment is the only target it can offer. Sealed segments carry their index in
+// an immutable sidecar, which is skipped below, and an append log never supersedes a record, so
+// the bytes below the snapshotted write cursor are immutable while the build reads them off-lock.
+//
 // It runs only when no other index build holds reindexMu, so a read never waits behind a Reindex;
 // one that finds it busy walks the tails, exactly as it did before this existed.
 func (c *Collection) catchUpIndexes() {
 	spec := c.spec.Load()
-	if !spec.any() || c.appendOnly() {
-		return // an archive indexes each segment as it seals (Archive.afterAppend)
+	if !spec.any() {
+		return
 	}
+	appendOnly := c.appendOnly()
 	type target struct {
 		seg     *segment
 		used    int
@@ -59,7 +82,7 @@ func (c *Collection) catchUpIndexes() {
 	var tgts []target
 	for _, sh := range c.shards {
 		sh.mu.RLock()
-		indexed := false
+		indexed := appendOnly
 		for _, seg := range sh.segs {
 			if seg == nil {
 				continue
