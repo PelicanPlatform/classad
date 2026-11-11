@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"iter"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -57,6 +58,20 @@ type WatchEvent struct {
 	Key    []byte
 	Ad     *classad.ClassAd
 	Cursor []byte
+	// Stamp names this change in a clock shared by every shard, so two readers of the same
+	// collection give the same change the same number and a consumer needing a single
+	// comparable version (a Kubernetes resourceVersion, say) can take it from here rather
+	// than inventing one. It is NOT a position: resuming is Cursor's job.
+	//
+	// Live events carry it. Catch-up data events do not, for the same reason they carry no
+	// cursor; WatchSynced carries the collection's watermark, which is where a catch-up's
+	// version comes from.
+	//
+	// Stamps from one shard strictly increase. ACROSS shards they are comparable but not
+	// delivery-ordered -- two shards publish independently -- so a consumer that needs a
+	// non-decreasing version takes a running maximum. WatchWatermark is the value that is
+	// closed across every shard.
+	Stamp uint64
 }
 
 // --- opaque cursor: {epoch, perShardSeq[]} ---
@@ -236,20 +251,55 @@ func (sh *shard) journalDeleteLocked(key []byte, seq uint64) {
 // commitSeq under the shard lock -- so every watcher covers it in catch-up and drops
 // its live event, and it can never hold a cursor back.
 
+// pendingPub is a tracked commit: the sequence it was issued, and the stamp that names
+// it in the shard's clock (see stampLocked).
+type pendingPub struct {
+	seq   uint64
+	stamp uint64
+}
+
 type pubOrder struct {
 	n       atomic.Int32 // len(pending), for publish's no-watcher fast path
 	mu      sync.Mutex
-	pending []uint64 // tracked seqs not yet fully published, ascending
-	done    uint64   // highest seq fully published
+	pending []pendingPub // tracked commits not yet fully published, ascending by seq
+	done    uint64       // highest seq fully published
+	// doneStamp is the stamp of the highest seq fully published, and last is the highest
+	// stamp this shard has handed out. They are separate because a stamp is assigned when
+	// a commit is tracked and retired when it finishes publishing, so the newest stamp
+	// assigned is usually ahead of the newest one that has gone out.
+	doneStamp uint64
+	last      uint64
 }
 
 // throughLocked is the highest seq whose events have all been handed to the hub (or
 // need not be: untracked, or a seq that published nothing). Caller holds o.mu.
 func (o *pubOrder) throughLocked() uint64 {
 	if len(o.pending) > 0 {
-		return o.pending[0] - 1
+		return o.pending[0].seq - 1
 	}
 	return o.done
+}
+
+// stampThroughLocked is this shard's closed watermark: the highest stamp at or below
+// which every event has been handed to the hub. Stamps are assigned in sequence order
+// under the shard write lock, so everything still pending is at or above pending[0], and
+// one below it is the furthest this shard can vouch for. Caller holds o.mu.
+func (o *pubOrder) stampThroughLocked() uint64 {
+	if len(o.pending) > 0 {
+		return o.pending[0].stamp - 1
+	}
+	return o.doneStamp
+}
+
+// stampLocked issues the next stamp: wall-clock microseconds, forced past the last one so
+// a shard's stamps strictly increase whatever the clock does. Caller holds o.mu.
+func (o *pubOrder) stampLocked() uint64 {
+	st := nowMicros()
+	if st <= o.last {
+		st = o.last + 1
+	}
+	o.last = st
+	return st
 }
 
 // trackPublishLocked registers a commit at seq that will publish, reporting whether it
@@ -261,7 +311,10 @@ func (sh *shard) trackPublishLocked(seq uint64) bool {
 	}
 	o := &sh.pub
 	o.mu.Lock()
-	o.pending = append(o.pending, seq) // seqs are issued in order under the shard lock
+	// seqs are issued in order under the shard lock, and the stamp is taken here so it
+	// orders the same way -- a commit's place in the clock is fixed when the commit is,
+	// not when it finishes publishing (which races with every other publisher).
+	o.pending = append(o.pending, pendingPub{seq: seq, stamp: o.stampLocked()})
 	o.n.Add(1)
 	o.mu.Unlock()
 	return true
@@ -277,11 +330,12 @@ func (sh *shard) trackPublishLocked(seq uint64) bool {
 // event so that event can be sent in the same critical section that retires the seq:
 // only then may its cursor name the seq itself.
 type seqPublisher struct {
-	sh   *shard
-	seq  uint64
-	on   bool
-	has  bool
-	held rawEvent
+	sh    *shard
+	seq   uint64
+	stamp uint64
+	on    bool
+	has   bool
+	held  rawEvent
 }
 
 // beginPublish starts publishing the events committed at seq. Must run after the
@@ -289,7 +343,23 @@ type seqPublisher struct {
 // beginPublish must be paired with end.
 func (sh *shard) beginPublish(seq uint64) seqPublisher {
 	on := sh.hub != nil && (sh.hub.active.Load() || sh.pub.n.Load() > 0)
-	return seqPublisher{sh: sh, seq: seq, on: on}
+	p := seqPublisher{sh: sh, seq: seq, on: on}
+	if on {
+		o := &sh.pub
+		o.mu.Lock()
+		// An untracked commit (the hub went active after it) has no stamp of its own. Its
+		// events are dropped by every watcher as at or below their S_reg, so the value
+		// only has to be one that cannot pull the clock backwards.
+		p.stamp = o.last
+		for _, e := range o.pending {
+			if e.seq == seq {
+				p.stamp = e.stamp
+				break
+			}
+		}
+		o.mu.Unlock()
+	}
+	return p
 }
 
 // add queues one event of this commit. key, ad must stay valid until end.
@@ -305,9 +375,22 @@ func (p *seqPublisher) add(key, ad []byte, codec Codec, deleted bool) {
 		o.mu.Unlock()
 		p.sh.hub.send(p.held)
 	}
-	p.held = rawEvent{shard: p.sh.idx, seq: p.seq, key: key, ad: ad, codec: codec, deleted: deleted}
+	p.held = rawEvent{shard: p.sh.idx, seq: p.seq, stamp: p.stamp, key: key, ad: ad, codec: codec, deleted: deleted}
+	if h := publishMidHook; h != nil {
+		h()
+	}
 	p.has = true
 }
+
+// publishMidHook runs inside a commit's publish, after an event has gone to the hub and
+// while the commit's seq is still pending. Nil in production.
+//
+// It exists because the watermark's safety property -- that it never names a version an
+// in-flight commit will be stamped at or below -- is invisible from outside: every
+// synchronous write has finished publishing by the time it returns, so a test sampling
+// between writes finds nothing in flight and cannot tell a correct watermark from one that
+// covers the commit it is in the middle of.
+var publishMidHook func()
 
 // end sends the last event and retires the seq, atomically with respect to every other
 // publisher of the shard: none can compute a through at or above this seq until this
@@ -318,8 +401,8 @@ func (p *seqPublisher) end() {
 	}
 	o := &p.sh.pub
 	o.mu.Lock()
-	for i, s := range o.pending {
-		if s == p.seq {
+	for i, e := range o.pending {
+		if e.seq == p.seq {
 			o.pending = append(o.pending[:i], o.pending[i+1:]...)
 			o.n.Add(-1)
 			break
@@ -327,6 +410,7 @@ func (p *seqPublisher) end() {
 	}
 	if p.seq > o.done {
 		o.done = p.seq
+		o.doneStamp = p.stamp
 	}
 	if p.has {
 		p.held.through = o.throughLocked()
@@ -336,11 +420,59 @@ func (p *seqPublisher) end() {
 	p.has, p.held = false, rawEvent{}
 }
 
+// WatchWatermark is the collection's closed watch clock: every change at or below it has
+// been handed to every attached watcher, and no later change will be stamped at or below
+// it. It is the version a catch-up has caught up TO, and the one value here that is both
+// comparable across shards and non-decreasing in delivery order.
+//
+// It is the minimum over the shards, because a change is only covered when EVERY shard has
+// published past it. That makes an idle shard the limit: one with nothing to publish would
+// otherwise pin the whole collection at its last write. A shard with nothing in flight is
+// therefore advanced to the current reading first -- safe because its next commit takes a
+// stamp past whatever it was advanced to, under the same lock.
+//
+// Returns 0 when the collection has no watch (Options.WatchHistory == 0).
+func (c *Collection) WatchWatermark() uint64 {
+	if c.hub == nil {
+		return 0
+	}
+	now := nowMicros()
+	wm := uint64(math.MaxUint64)
+	for _, sh := range c.shards {
+		o := &sh.pub
+		o.mu.Lock()
+		if len(o.pending) == 0 {
+			// Nothing in flight, so every stamp this shard has issued has already gone to
+			// the hub and it can vouch for all of them -- which doneStamp alone does not
+			// say, because a burst forces stamps past each other and past the clock.
+			// Claiming the present on top is what keeps a quiet shard from holding the
+			// whole collection back; the next commit here takes a stamp past it.
+			if now > o.last {
+				o.last = now
+			}
+			if o.last > o.doneStamp {
+				o.doneStamp = o.last
+			}
+		}
+		if st := o.stampThroughLocked(); st < wm {
+			wm = st
+		}
+		o.mu.Unlock()
+	}
+	if wm == math.MaxUint64 {
+		return 0
+	}
+	return wm
+}
+
 // --- live subscription hub ---
 
 type rawEvent struct {
 	shard int
 	seq   uint64
+	// stamp is the publishing shard's clock reading for this commit (see
+	// pubOrder.stampLocked). Unlike seq it is comparable across shards.
+	stamp uint64
 	key   []byte
 	// ad is the raw stored bytes: codec-compressed and, for encrypted attributes,
 	// sealed with THIS node's data key. It is an internal, node-local representation.
@@ -533,7 +665,7 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 		if !c.runCatchup(&plan, seqs, sReg, yield, redact) {
 			return
 		}
-		if !yield(WatchEvent{Kind: WatchSynced, Cursor: encodeCursor(c.hub.epoch, sReg)}) {
+		if !yield(WatchEvent{Kind: WatchSynced, Stamp: c.WatchWatermark(), Cursor: encodeCursor(c.hub.epoch, sReg)}) {
 			return
 		}
 
@@ -570,13 +702,13 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 						if !ok {
 							continue
 						}
-						if !yield(WatchEvent{Kind: WatchUpsert, Key: ce.key, Ad: ad, Cursor: encodeCursor(c.hub.epoch, vec)}) {
+						if !yield(WatchEvent{Kind: WatchUpsert, Key: ce.key, Ad: ad, Stamp: raw.stamp, Cursor: encodeCursor(c.hub.epoch, vec)}) {
 							return
 						}
 					}
 					continue
 				}
-				ev := WatchEvent{Key: raw.key, Cursor: encodeCursor(c.hub.epoch, vec)}
+				ev := WatchEvent{Key: raw.key, Stamp: raw.stamp, Cursor: encodeCursor(c.hub.epoch, vec)}
 				if raw.deleted {
 					if c.watchHidden(raw.key) {
 						continue // structural delete: hidden
