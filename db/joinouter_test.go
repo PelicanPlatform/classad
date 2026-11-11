@@ -260,26 +260,6 @@ func TestOuterDrivenDeclinesWithoutAValueIndex(t *testing.T) {
 	}
 }
 
-// TestOuterDrivenDeclinesAConstrainedInnerSide covers the gate that keeps the join from
-// widening to rows the caller excluded: a lookup resolves the key and nothing else, so a
-// side carrying its own constraint cannot be served by one.
-func TestOuterDrivenDeclinesAConstrainedInnerSide(t *testing.T) {
-	cat := outerFixture(t, 512, 32, 0, true)
-	spec := outerSpec(JoinInner)
-	spec.Right.Constraint = "ExitCode == 0"
-	var got []string
-	var gst *JoinStats
-	withOuterDriven(func() { got, gst = drainOrdered(t, cat, spec, JoinLimits{}) })
-	if gst.OuterDrivenBatches != 0 {
-		t.Fatalf("the path ran %d batches against a constrained side", gst.OuterDrivenBatches)
-	}
-	// And the constraint still did its work, so the decline is a decline and not a skip.
-	want, _ := drainOrdered(t, cat, spec, JoinLimits{})
-	if len(got) != len(want) {
-		t.Errorf("constrained join returned %d rows with the gate on, %d with it off", len(got), len(want))
-	}
-}
-
 // stringKeyFixture joins on a STRING attribute that is named in ValueAttrs. The archive
 // accepts that, and reports the attribute as indexed through both IndexedAttrs and
 // ZoneAttrs, while every query on it visits each record -- a value index serves numbers.
@@ -964,5 +944,228 @@ func TestOuterDrivenStopsAtTheCallersLimit(t *testing.T) {
 		t.Errorf("the limit stopped after %d batches and the unlimited join took %d; "+
 			"the limit is not ending the batch loop", limited.OuterDrivenBatches,
 			full.OuterDrivenBatches)
+	}
+}
+
+// A constrained inner side used to decline the path outright, which is most real joins: a
+// query that reads all of history and narrows it afterwards is not one anybody writes. These
+// pin that the constraint rides into the batch rather than being dropped or applied late.
+
+// innerConstraints are the shapes a side's constraint takes, chosen by how the STORE sees
+// them rather than by how they read: on the key's own index, on an attribute with no index
+// at all, on one the side does not carry, and matching nothing.
+var innerConstraints = []struct {
+	name  string
+	expr  string
+	empty bool // matches no inner row at all, so an INNER join is expected to return none
+}{
+	{name: "on the key's own index", expr: "ClusterId > 1000"},
+	{name: "on an unindexed attribute", expr: "ExitCode == 3"},
+	{name: "both halves", expr: "ClusterId > 1000 && ExitCode == 3"},
+	{name: "matching nothing", expr: "ExitCode == 99", empty: true},
+	// UNDEFINED, not FALSE: hist carries no Owner. A record matches only on boolean TRUE,
+	// so this matches nothing -- and it is here because an index on an attribute the side
+	// does not carry is the shape most likely to be mishandled by a lookup.
+	{name: "on an attribute the side lacks", expr: `Owner == "alice"`, empty: true},
+}
+
+func constrainedSpec(kind JoinKind, constraint string) JoinSpec {
+	spec := outerSpec(kind)
+	spec.Right.Constraint = constraint
+	return spec
+}
+
+// TestOuterDrivenConstrainedInnerSideAgreesWithTheHash is the correctness half. A batch that
+// dropped the constraint would join rows the query excluded; one that applied it to the wrong
+// rows would drop rows it owed. Both show up as disagreement with the hash path, row for row
+// and in order.
+//
+// LEFT is here for the case the INNER kind cannot see: a FROM row whose key exists in the
+// inner side but whose every inner row the constraint excludes is owed a null extension, not
+// a drop. A path that confused "the constraint matched nothing" with "the key matched
+// nothing" answers that one wrong and INNER never notices.
+func TestOuterDrivenConstrainedInnerSideAgreesWithTheHash(t *testing.T) {
+	for _, c := range innerConstraints {
+		for _, kind := range []JoinKind{JoinInner, JoinLeft} {
+			t.Run(fmt.Sprintf("%s/kind%d", c.name, kind), func(t *testing.T) {
+				cat := outerFixture(t, 2048, 128, 17, true)
+				spec := constrainedSpec(kind, c.expr)
+
+				var want []string
+				var wst *JoinStats
+				withoutOuterDriven(func() { want, wst = drainOrdered(t, cat, spec, JoinLimits{}) })
+				if wst.Err != nil {
+					t.Fatalf("hash join stopped early: %v", wst.Err)
+				}
+				if wst.OuterDrivenBatches != 0 {
+					t.Fatalf("the baseline ran batched (%d batches)", wst.OuterDrivenBatches)
+				}
+
+				var got []string
+				var gst *JoinStats
+				withOuterDriven(func() { got, gst = drainOrdered(t, cat, spec, JoinLimits{}) })
+				if gst.Err != nil {
+					t.Fatalf("outer-driven join stopped early: %v", gst.Err)
+				}
+				// No skip on a decline. Admitting a constrained side is the change under
+				// test, so a decline here is the failure, not a reason to measure nothing.
+				if gst.OuterDrivenBatches == 0 {
+					t.Fatalf("the outer-driven path declined constraint %q", c.expr)
+				}
+				if len(got) != len(want) {
+					t.Fatalf("outer-driven returned %d rows, hash returned %d", len(got), len(want))
+				}
+				if i := firstDiff(got, want); i >= 0 {
+					t.Fatalf("row %d: outer-driven %q, hash %q", i, got[i], want[i])
+				}
+				// A LEFT join always returns at least its FROM rows, so a count alone cannot
+				// tell "the constraint matched nothing" from "the constraint was dropped".
+				if kind == JoinInner && (len(want) == 0) != c.empty {
+					t.Fatalf("constraint %q joined %d rows; expected empty=%v", c.expr, len(want), c.empty)
+				}
+			})
+		}
+	}
+}
+
+// TestOuterDrivenConstraintNarrowsTheLookupItself is the reason the constraint is passed to
+// LookupKeysWhere rather than applied to its results. A batch's hold is the rows it keeps, so
+// if the constraint reached the store the hold shrinks with it; if the batch looked up every
+// row for its keys and filtered afterwards, the hold would be the same either way.
+func TestOuterDrivenConstraintNarrowsTheLookupItself(t *testing.T) {
+	cat := outerFixture(t, 4096, 256, 0, true)
+
+	var wide, narrow *JoinStats
+	withOuterDriven(func() { _, wide = drainOrdered(t, cat, outerSpec(JoinInner), JoinLimits{}) })
+	withOuterDriven(func() {
+		_, narrow = drainOrdered(t, cat, constrainedSpec(JoinInner, "ExitCode == 3"), JoinLimits{})
+	})
+	for _, st := range []*JoinStats{wide, narrow} {
+		if st.Err != nil {
+			t.Fatalf("join stopped early: %v", st.Err)
+		}
+		if st.OuterDrivenBatches == 0 {
+			t.Fatal("a run was not batched, so its hold is the hash path's and says nothing")
+		}
+	}
+	if narrow.HashRows >= wide.HashRows {
+		t.Fatalf("a batch held %d rows under ExitCode == 3 and %d unconstrained; the "+
+			"constraint did not reach the lookup", narrow.HashRows, wide.HashRows)
+	}
+}
+
+// TestOuterDrivenDeclinesConstraintsItCannotPlan pins the two gates that admit a constrained
+// side. A constraint that does not parse is not quietly dropped -- the scan paths reject it
+// downstream where a parse error reports as one -- and a constraint that turns the batch's
+// query into something other than an index walk makes this path strictly worse than reading
+// the side once.
+func TestOuterDrivenDeclinesConstraintsItCannotPlan(t *testing.T) {
+	t.Run("does not parse", func(t *testing.T) {
+		// The decline is not observable as a batch count, because the join never runs: the
+		// scan path rejects the constraint and reports it AS a parse error. That is the
+		// behaviour being pinned -- the alternative is a path that drops what it cannot
+		// parse and answers a different query without saying so.
+		cat := outerFixture(t, 2048, 128, 0, true)
+		var st JoinStats
+		var err error
+		withOuterDriven(func() { _, err = cat.Join(constrainedSpec(JoinInner, "ExitCode == "), JoinLimits{}, &st) })
+		if err == nil {
+			t.Fatal("an unparseable constraint joined without error")
+		}
+		if !strings.Contains(err.Error(), "parse") {
+			t.Fatalf("error does not name the parse failure: %v", err)
+		}
+		if st.OuterDrivenBatches != 0 {
+			t.Fatalf("ran %d batches on a constraint that does not parse", st.OuterDrivenBatches)
+		}
+	})
+	t.Run("plans as a union", func(t *testing.T) {
+		cat := outerFixture(t, 2048, 128, 0, true)
+		var st *JoinStats
+		withOuterDriven(func() {
+			_, st = drainOrdered(t, cat, constrainedSpec(JoinInner, `ExitCode == 3 || Owner == "bob"`), JoinLimits{})
+		})
+		if st.OuterDrivenBatches != 0 {
+			t.Fatalf("took the batched path on a union plan (%d batches)", st.OuterDrivenBatches)
+		}
+	})
+}
+
+// TestOuterDrivenAdmitsAConstraintOnTheKeyItself is the sentinel's own test. planOuterDriven
+// explains a batch query built on key 0, and a constraint on the key attribute contradicts
+// that sentinel and plans "empty" while the same constraint against a batch's real keys plans
+// "indexed". Reading that as the constraint's answer would decline the most ordinary narrowing
+// there is.
+func TestOuterDrivenAdmitsAConstraintOnTheKeyItself(t *testing.T) {
+	cat := outerFixture(t, 2048, 128, 0, true)
+	var st *JoinStats
+	var got []string
+	withOuterDriven(func() {
+		got, st = drainOrdered(t, cat, constrainedSpec(JoinInner, "ClusterId > 1000"), JoinLimits{})
+	})
+	if st.Err != nil {
+		t.Fatalf("join stopped early: %v", st.Err)
+	}
+	if st.OuterDrivenBatches == 0 {
+		t.Fatal("declined a constraint on the key attribute; the sentinel key was read as the answer")
+	}
+	if len(got) == 0 {
+		t.Fatal("joined no rows")
+	}
+}
+
+// TestOuterDrivenConstrainedInnerSideOnKeysThatAreNotIntegers is the second site the
+// constraint has to reach. A batch whose keys are not all integers cannot use LookupKeysWhere
+// and builds its own query instead, and a constraint carried into one of those two and not
+// the other is a join that answers correctly only for the key kinds the fixtures happen to
+// use -- which is how the string keys were missed.
+func TestOuterDrivenConstrainedInnerSideOnKeysThatAreNotIntegers(t *testing.T) {
+	kinds := []struct {
+		name   string
+		putKey func(ad *classad.ClassAd, i int)
+	}{
+		{"reals", func(ad *classad.ClassAd, i int) { ad.InsertAttrFloat("ClusterId", float64(i)+0.5) }},
+		{"strings", func(ad *classad.ClassAd, i int) {
+			ad.InsertAttrString("ClusterId", fmt.Sprintf("key%d", i))
+		}},
+		{"mixed", func(ad *classad.ClassAd, i int) {
+			if i%2 == 0 {
+				ad.InsertAttr("ClusterId", int64(i))
+				return
+			}
+			ad.InsertAttrFloat("ClusterId", float64(i)+0.5)
+		}},
+	}
+	for _, k := range kinds {
+		t.Run(k.name, func(t *testing.T) {
+			cat := keyFixture(t, 300, k.putKey)
+			spec := constrainedSpec(JoinInner, "ExitCode == 3")
+
+			var want []string
+			var wst *JoinStats
+			withoutOuterDriven(func() { want, wst = drainOrdered(t, cat, spec, JoinLimits{}) })
+			if wst.Err != nil {
+				t.Fatalf("hash join stopped early: %v", wst.Err)
+			}
+			if len(want) == 0 {
+				t.Fatal("the baseline joined no rows, so agreeing with it proves nothing")
+			}
+
+			var got []string
+			var gst *JoinStats
+			withOuterDriven(func() { got, gst = drainOrdered(t, cat, spec, JoinLimits{}) })
+			if gst.Err != nil {
+				t.Fatalf("outer-driven join stopped early: %v", gst.Err)
+			}
+			if gst.OuterDrivenBatches == 0 {
+				t.Fatalf("the outer-driven path declined %s keys with a constraint", k.name)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("outer-driven returned %d rows, hash returned %d", len(got), len(want))
+			}
+			if i := firstDiff(got, want); i >= 0 {
+				t.Fatalf("row %d: outer-driven %q, hash %q", i, got[i], want[i])
+			}
+		})
 	}
 }

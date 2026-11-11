@@ -119,6 +119,11 @@ type outerDriven struct {
 	keyAttr string // the inner side's half of the equality, a bare attribute
 	rowAttr string // the FROM side's half, likewise
 	step    *joinStepPlan
+	// where is the inner side's own constraint, parsed, or nil when the side asked for
+	// everything. It rides INTO each batch's lookup rather than filtering the lookup's
+	// results, so a batch reads only the rows it will keep and the store can drop a
+	// record on an index before decoding it.
+	where ast.Expr
 }
 
 // planOuterDriven decides whether a join can be driven from its FROM side.
@@ -151,11 +156,22 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 		return nil, false
 	}
 	side := sides[step.side]
-	if constraintOf(side) != "true" {
-		// The side's own constraint says which of its rows the caller asked for, and a
-		// lookup resolves the key and nothing else. Applying one without the other widens
-		// the join to rows the query excluded.
-		return nil, false
+	// The side's own constraint says which of its rows the caller asked for, and a bare key
+	// lookup resolves the key and nothing else -- so a batch that dropped it would widen the
+	// join to rows the query excluded. The batch carries it instead.
+	//
+	// A constraint that does not parse declines the path rather than being ignored. The scan
+	// paths reject it downstream, where the parse error is reported as a parse error; a path
+	// that quietly ran without it would answer a different query from the one asked.
+	var where ast.Expr
+	if c := constraintOf(side); c != "true" {
+		q, perr := vm.Parse(c)
+		if perr != nil {
+			return nil, false
+		}
+		if where = q.Expr(); where == nil {
+			return nil, false
+		}
 	}
 	t, ok := cat.ArchiveTable(side.Table)
 	if !ok {
@@ -174,6 +190,26 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 	// disagree with what the batch does, because it is the same query.
 	if ex := t.a.ExplainQuery(collections.BatchKeyQuery(keyAttr, []int64{0})); ex.Plan != "indexed" {
 		return nil, false
+	}
+	// With a constraint there is a second question, because what a batch runs is the key AND
+	// the constraint, and a constraint can defeat an index the key alone was served by. It is
+	// asked separately rather than instead, since each gate catches what the other misses: a
+	// key no index serves can still plan well once a constraint narrows it, and a key an index
+	// serves can still end in a scan once one is conjoined.
+	//
+	// The admitted plans are named rather than the refused ones. "indexed" is the batch doing
+	// what this path exists to do. "empty" is an artefact of the sentinel key and not an answer
+	// about the constraint at all: a constraint on the key attribute itself -- ClusterId > 100
+	// -- contradicts the sentinel and folds to nothing, where the same constraint against a
+	// batch's real keys plans "indexed". Everything else is declined, "indexed-union" among
+	// them: a union over an OR is index-driven and probably fine here, but nothing has measured
+	// what a batch costs on one, and an unmeasured plan is not a plan this path should take.
+	if where != nil {
+		switch ex := t.a.ExplainQuery(collections.BatchKeyQueryWhere(keyAttr, []int64{0}, where)); ex.Plan {
+		case "indexed", "empty":
+		default:
+			return nil, false
+		}
 	}
 	// A batch has to be able to hold what it looks up. MaxHashRows bounds rows held, and
 	// this path holds a batch's matches rather than a side -- so a limit below the batch
@@ -215,7 +251,7 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 			return nil, false
 		}
 	}
-	return &outerDriven{arch: t.a, keyAttr: keyAttr, rowAttr: rowAttr, step: step}, true
+	return &outerDriven{arch: t.a, keyAttr: keyAttr, rowAttr: rowAttr, step: step, where: where}, true
 }
 
 // constraintOf is a side's constraint with the empty spelling folded into the true one, so a
@@ -315,7 +351,7 @@ func numericKey(v classad.Value) (float64, bool) {
 // `member(attr, {...})` over the values themselves. It is the same shape LookupKeys compiles
 // internally, built from an AST rather than text so the values become literals with no
 // formatting round trip to disagree about.
-func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string) *vm.Query {
+func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string, where ast.Expr) *vm.Query {
 	elems := make([]ast.Expr, 0, len(ints)+len(reals)+len(strs))
 	for _, n := range ints {
 		elems = append(elems, &ast.IntegerLiteral{Value: n})
@@ -326,10 +362,14 @@ func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string) *v
 	for _, str := range strs {
 		elems = append(elems, &ast.StringLiteral{Value: str})
 	}
-	return vm.Compile(&ast.FunctionCall{
+	member := &ast.FunctionCall{
 		Name: "member",
 		Args: []ast.Expr{ast.NewAttributeReference(attr, ast.NoScope), &ast.ListLiteral{Elements: elems}},
-	})
+	}
+	if where == nil {
+		return vm.Compile(member)
+	}
+	return vm.Compile(&ast.BinaryOp{Op: "&&", Left: where, Right: member})
 }
 
 // stage builds the hash for ONE batch: the inner rows the batch's keys reach, bucketed the
@@ -343,9 +383,9 @@ func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*
 	}
 	var ads iter.Seq[*classad.ClassAd]
 	if fast {
-		ads = od.arch.LookupKeys(od.keyAttr, ints)
+		ads = od.arch.LookupKeysWhere(od.keyAttr, ints, od.where)
 	} else {
-		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals, strs))
+		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals, strs, od.where))
 	}
 	held := 0
 	for ad := range ads {
