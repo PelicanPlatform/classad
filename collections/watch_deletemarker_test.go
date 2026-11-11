@@ -435,8 +435,8 @@ func TestWatchResumesAcrossRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := range 40 {
-			if err := c.Put([]byte(fmt.Sprintf("key-%06d", i)), padAd(t, i)); err != nil {
-				t.Fatal(err)
+			if perr := c.Put([]byte(fmt.Sprintf("key-%06d", i)), padAd(t, i)); perr != nil {
+				t.Fatal(perr)
 			}
 		}
 		_, cursor := collectCatchUp(t, c, nil)
@@ -445,8 +445,8 @@ func TestWatchResumesAcrossRestart(t *testing.T) {
 				t.Fatalf("Delete of key-%06d found nothing to remove", i)
 			}
 		}
-		if err := c.Close(); err != nil {
-			t.Fatal(err)
+		if cerr := c.Close(); cerr != nil {
+			t.Fatal(cerr)
 		}
 
 		c, err = Open(opts)

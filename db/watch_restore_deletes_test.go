@@ -25,12 +25,12 @@ func TestWatchRetainSeqsResumesDeletesAcrossReopen(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := range 40 {
-			ad, err := classad.Parse(fmt.Sprintf("[ ClusterId = %d; JobStatus = 2 ]", i))
-			if err != nil {
-				t.Fatal(err)
+			ad, perr := classad.Parse(fmt.Sprintf("[ ClusterId = %d; JobStatus = 2 ]", i))
+			if perr != nil {
+				t.Fatal(perr)
 			}
-			if err := db.Put(fmt.Sprintf("%d.0", i), ad); err != nil {
-				t.Fatal(err)
+			if perr := db.Put(fmt.Sprintf("%d.0", i), ad); perr != nil {
+				t.Fatal(perr)
 			}
 		}
 		seq, err := db.Watch(context.Background(), nil)
@@ -40,13 +40,13 @@ func TestWatchRetainSeqsResumesDeletesAcrossReopen(t *testing.T) {
 		_, _, cursor := drainArchiveCatchup(t, seq)
 
 		for i := range deletes {
-			ok, err := db.Delete(fmt.Sprintf("%d.0", i))
-			if err != nil || !ok {
-				t.Fatalf("Delete(%d.0) = %v, %v", i, ok, err)
+			ok, derr := db.Delete(fmt.Sprintf("%d.0", i))
+			if derr != nil || !ok {
+				t.Fatalf("Delete(%d.0) = %v, %v", i, ok, derr)
 			}
 		}
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
+		if cerr := db.Close(); cerr != nil {
+			t.Fatal(cerr)
 		}
 
 		db, err = OpenConfig(cfg)
