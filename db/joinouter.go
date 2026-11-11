@@ -179,18 +179,41 @@ func constraintOf(s JoinSide) string {
 	return "true"
 }
 
-// batchKeys is the batch's distinct keys, and whether every one of them is an integer.
+// batchKeys is the batch's distinct keys, and whether the fast lookup can serve them.
 //
-// Keys are collected as ClassAd values and folded the way the hash's bucket key folds them,
-// so that two FROM rows whose keys compare equal produce one lookup key. A row whose key is
-// undefined contributes nothing: ClassAd equality propagates undefined, so it matches no
-// inner row on either path.
-func (od *outerDriven) batchKeys(batch []*joinRow) (ints []int64, reals []float64, allInt bool) {
+// Keys are collected as ClassAd values and folded the way the hash's bucket key folds them
+// (appendKeyValue), so that two FROM rows whose keys compare equal produce one lookup key.
+// That contract admits FOUR kinds -- bool, integer, real and string -- and this must admit
+// exactly the same four. A kind dropped here is not a slower join: the inner rows carrying it
+// are never looked up, so an INNER join loses those pairs and a LEFT join null-extends rows
+// that had a match. A row whose key is any other kind contributes nothing, which is right
+// because appendKeyValue gives it no bucket either, so it matches nothing on either path.
+//
+// Strings fold to lower case, as appendKeyValue folds them, because ClassAd compares strings
+// case-insensitively -- and so does the member() the lookup compiles to, which is what lets
+// the folded literal stand for every casing of it.
+//
+// fast reports that every key is an integer, which is the only case the zone-hoisted
+// LookupKeys can serve: its keys are int64, so a real would be truncated into a key that
+// matches the wrong rows, and a string has no numeric span to hoist at all.
+func (od *outerDriven) batchKeys(batch []*joinRow) (ints []int64, reals []float64, strs []string, fast bool) {
 	seenI := map[int64]bool{}
 	seenR := map[float64]bool{}
-	allInt = true
+	seenS := map[string]bool{}
 	for _, r := range batch {
 		v := r.eval(od.rowAttr)
+		if v.IsString() {
+			str, err := v.StringValue()
+			if err != nil {
+				continue // claims a kind and will not produce it: no bucket either
+			}
+			str = strings.ToLower(str)
+			if !seenS[str] {
+				seenS[str] = true
+				strs = append(strs, str)
+			}
+			continue
+		}
 		f, ok := numericKey(v)
 		if !ok {
 			continue
@@ -202,13 +225,12 @@ func (od *outerDriven) batchKeys(batch []*joinRow) (ints []int64, reals []float6
 			}
 			continue
 		}
-		allInt = false
 		if !seenR[f] {
 			seenR[f] = true
 			reals = append(reals, f)
 		}
 	}
-	return ints, reals, allInt
+	return ints, reals, strs, len(reals) == 0 && len(strs) == 0
 }
 
 // numericKey folds a key value into the one numeric space the hash's bucket key uses, so this
@@ -241,17 +263,20 @@ func numericKey(v classad.Value) (float64, bool) {
 	return 0, false
 }
 
-// mixedKeyQuery is the constraint a batch stands for when its keys are not all integers:
+// mixedKeyQuery is the constraint a batch stands for when the fast lookup cannot serve it:
 // `member(attr, {...})` over the values themselves. It is the same shape LookupKeys compiles
 // internally, built from an AST rather than text so the values become literals with no
 // formatting round trip to disagree about.
-func mixedKeyQuery(attr string, ints []int64, reals []float64) *vm.Query {
-	elems := make([]ast.Expr, 0, len(ints)+len(reals))
+func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string) *vm.Query {
+	elems := make([]ast.Expr, 0, len(ints)+len(reals)+len(strs))
 	for _, n := range ints {
 		elems = append(elems, &ast.IntegerLiteral{Value: n})
 	}
 	for _, f := range reals {
 		elems = append(elems, &ast.RealLiteral{Value: f})
+	}
+	for _, str := range strs {
+		elems = append(elems, &ast.StringLiteral{Value: str})
 	}
 	return vm.Compile(&ast.FunctionCall{
 		Name: "member",
@@ -263,16 +288,16 @@ func mixedKeyQuery(attr string, ints []int64, reals []float64) *vm.Query {
 // way buildStage buckets a whole side, so the walk above cannot tell the difference.
 func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*joinStage, int, error) {
 	st := &joinStage{step: od.step, hashed: true, buckets: map[string][]*joinRow{}}
-	ints, reals, allInt := od.batchKeys(batch)
-	keys := len(ints) + len(reals)
+	ints, reals, strs, fast := od.batchKeys(batch)
+	keys := len(ints) + len(reals) + len(strs)
 	if keys == 0 {
 		return st, 0, nil // every key in the batch was undefined: nothing to look up
 	}
 	var ads iter.Seq[*classad.ClassAd]
-	if allInt {
+	if fast {
 		ads = od.arch.LookupKeys(od.keyAttr, ints)
 	} else {
-		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals))
+		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals, strs))
 	}
 	held := 0
 	for ad := range ads {

@@ -775,3 +775,195 @@ func heapNowForTest() uint64 {
 	runtime.ReadMemStats(&m)
 	return m.HeapAlloc
 }
+
+// keyFixture builds a join whose key attribute carries whatever values keyOf returns, so the
+// batched path can be put down its non-integer route. The inner side indexes the key.
+func keyFixture(t testing.TB, n int, putKey func(ad *classad.ClassAd, i int)) *Catalog {
+	t.Helper()
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cat.Close() })
+	hist, err := cat.CreateArchiveTable("hist", ArchiveConfig{
+		SegmentSize: 4096,
+		ValueAttrs:  []string{"ClusterId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := cat.CreateArchiveTable("jobs", ArchiveConfig{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= n; i++ {
+		ad := classad.New()
+		putKey(ad, i)
+		ad.InsertAttr("ExitCode", int64(i%7))
+		if aerr := hist.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+		aj := classad.New()
+		putKey(aj, i)
+		aj.InsertAttrString("Owner", "alice")
+		if aerr := jobs.Append(aj); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	return cat
+}
+
+// TestOuterDrivenKeysThatAreNotIntegers puts the path down its other key route.
+//
+// A batch whose keys are all integers is handed to LookupKeys, which is the zone-hoisted
+// lookup this path exists for. A batch holding a real cannot be: LookupKeys takes int64 keys,
+// so the fractional ones would be truncated into keys that match the wrong rows. The fallback
+// is an ordinary member() query over the values themselves, and the bar for it is the same as
+// for the fast route -- the same rows the hash returns, in the same order.
+func TestOuterDrivenKeysThatAreNotIntegers(t *testing.T) {
+	kinds := []struct {
+		name   string
+		putKey func(ad *classad.ClassAd, i int)
+	}{
+		// Halves, so int64(f) != f for every key and the whole batch takes the fallback.
+		{"reals", func(ad *classad.ClassAd, i int) {
+			ad.InsertAttrFloat("ClusterId", float64(i)+0.5)
+		}},
+		// Every other key fractional: the batch is MIXED, so ints and reals must both
+		// reach the query or half the matches go missing.
+		{"mixed", func(ad *classad.ClassAd, i int) {
+			if i%2 == 0 {
+				ad.InsertAttr("ClusterId", int64(i))
+				return
+			}
+			ad.InsertAttrFloat("ClusterId", float64(i)+0.5)
+		}},
+	}
+	for _, k := range kinds {
+		t.Run(k.name, func(t *testing.T) {
+			cat := keyFixture(t, 300, k.putKey)
+			want, wst := drainOrdered(t, cat, outerSpec(JoinInner), JoinLimits{})
+			if wst.Err != nil {
+				t.Fatalf("hash join stopped early: %v", wst.Err)
+			}
+			if wst.OuterDrivenBatches != 0 {
+				t.Fatalf("the baseline ran batched (%d batches); it is meant to be the hash",
+					wst.OuterDrivenBatches)
+			}
+			if len(want) == 0 {
+				t.Fatal("the fixture joined nothing, so neither arm is being measured")
+			}
+			var got []string
+			var gst *JoinStats
+			withOuterDriven(func() { got, gst = drainOrdered(t, cat, outerSpec(JoinInner), JoinLimits{}) })
+			if gst.Err != nil {
+				t.Fatalf("batched join stopped early: %v", gst.Err)
+			}
+			if gst.OuterDrivenBatches == 0 {
+				t.Fatal("the batched arm ran no batches, so it is the hash arm twice")
+			}
+			if firstDiff(got, want) != -1 {
+				t.Errorf("batched returned %d rows, hash %d; first difference at %d",
+					len(got), len(want), firstDiff(got, want))
+			}
+		})
+	}
+}
+
+// firstDiff is where two row lists part, or -1. Reported instead of both lists because the
+// lists are long and the index is what says whether a whole route went missing or one row did.
+func firstDiff(a, b []string) int {
+	for i := 0; i < min(len(a), len(b)); i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	if len(a) != len(b) {
+		return min(len(a), len(b))
+	}
+	return -1
+}
+
+// TestOuterDrivenKeysTheBatchCannotLookUp pins what happens to a FROM row whose key is not a
+// number at all.
+//
+// Such a row contributes NOTHING to the batch -- a value index holds numbers, so there is no
+// key to look up -- and the risk is that "contributes no key" quietly becomes "matches
+// everything" or "is dropped from the output". An INNER join must lose the row because it
+// matches nothing on either path, and a LEFT join must still null-extend it. Both are the
+// hash path's answer, which is the only answer this path may give.
+func TestOuterDrivenKeysTheBatchCannotLookUp(t *testing.T) {
+	// Half the FROM rows carry a string key. They match no inner row on either path, so the
+	// two arms must agree about them for opposite reasons: the hash buckets the string and
+	// finds nothing, this folds it out of the batch entirely.
+	strKey := func(ad *classad.ClassAd, i int) {
+		if i%2 == 0 {
+			ad.InsertAttrString("ClusterId", fmt.Sprintf("c%d", i))
+			return
+		}
+		ad.InsertAttr("ClusterId", int64(i))
+	}
+	for _, kind := range []JoinKind{JoinInner, JoinLeft} {
+		t.Run(fmt.Sprintf("kind%d", kind), func(t *testing.T) {
+			cat := keyFixture(t, 200, strKey)
+			want, wst := drainOrdered(t, cat, outerSpec(kind), JoinLimits{})
+			if wst.Err != nil {
+				t.Fatalf("hash join stopped early: %v", wst.Err)
+			}
+			if wst.OuterDrivenBatches != 0 {
+				t.Fatalf("the baseline ran batched (%d batches)", wst.OuterDrivenBatches)
+			}
+			var got []string
+			var gst *JoinStats
+			withOuterDriven(func() { got, gst = drainOrdered(t, cat, outerSpec(kind), JoinLimits{}) })
+			if gst.Err != nil {
+				t.Fatalf("batched join stopped early: %v", gst.Err)
+			}
+			if gst.OuterDrivenBatches == 0 {
+				t.Fatal("the batched arm ran no batches, so it is the hash arm twice")
+			}
+			if d := firstDiff(got, want); d != -1 {
+				t.Errorf("batched returned %d rows, hash %d; first difference at %d",
+					len(got), len(want), d)
+			}
+			// A LEFT join owes a row for every FROM row, matched or not. Without this the
+			// test would pass on two arms that both silently dropped the string-keyed half.
+			if kind == JoinLeft && len(want) != 200 {
+				t.Fatalf("the LEFT join returned %d rows for 200 FROM rows; the unmatched "+
+					"half is not being null-extended, so neither arm is being tested on it",
+					len(want))
+			}
+		})
+	}
+}
+
+// TestOuterDrivenStopsAtTheCallersLimit checks that a LIMIT ends the join part way through
+// the FROM side rather than after it.
+//
+// This path reads the FROM side in batches, so a limit reached inside one batch has to stop
+// the next batch being staged at all. A limit honoured only at the end would still return the
+// right rows, and would read the whole inner side to do it.
+func TestOuterDrivenStopsAtTheCallersLimit(t *testing.T) {
+	cat := outerFixture(t, 4096, 1024, 0, true)
+	spec := outerSpec(JoinInner)
+	spec.Limit = 5
+	var full, limited *JoinStats
+	var got []string
+	withOuterDriven(func() {
+		_, full = drainOrdered(t, cat, outerSpec(JoinInner), JoinLimits{})
+		got, limited = drainOrdered(t, cat, spec, JoinLimits{})
+	})
+	if full.OuterDrivenBatches == 0 || limited.OuterDrivenBatches == 0 {
+		t.Fatalf("not the batched path: %d batches unlimited, %d limited",
+			full.OuterDrivenBatches, limited.OuterDrivenBatches)
+	}
+	if len(got) != 5 {
+		t.Fatalf("the limited join returned %d rows, want 5", len(got))
+	}
+	// The point of the limit: fewer batches staged, not just fewer rows yielded.
+	if limited.OuterDrivenBatches >= full.OuterDrivenBatches {
+		t.Errorf("the limit stopped after %d batches and the unlimited join took %d; "+
+			"the limit is not ending the batch loop", limited.OuterDrivenBatches,
+			full.OuterDrivenBatches)
+	}
+}
