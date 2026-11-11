@@ -50,20 +50,46 @@ const (
 
 var joinOuterDrivenMode = outerDrivenAuto
 
-// Where the two paths cross on SPEED is measured but not yet acted on, because the
-// measurement is not yet against the right opponent.
+// Where the three paths cross on SPEED is measured, and the default still does not act on
+// it, for a reason the measurement itself supplies.
 //
-// TestOuterDrivenCrossoverAgainstTheHash sweeps the FROM side against the inner one and finds
-// a ratio rather than a row count -- 0.28x and 0.27x at ~0.3% of the inner side, 1.09x and
-// 1.75x at 20%, unchanged when the inner side grew fourfold. That would argue for taking this
-// path on selectivity alone, somewhere near 5%.
+// TestOuterDrivenAgainstTheIndexProbe runs this path against BOTH incumbents -- the hash and
+// the index probe (db/joinprobe.go) -- sweeping fan-out, how many inner rows share a key, at
+// a fixed inner side of 20,000 rows over 30 segments:
 //
-// It does not, yet. That benchmark reports ProbeKeys of 0 on every row: its baseline is the
-// build-side plan -- hash the small FROM side, stream the inner one -- and not the index
-// probe (db/joinprobe.go), which is the plan that would actually run against a selective FROM
-// side and which narrows the hashed side with the same index this path looks keys up in.
-// Beating the weaker of two incumbents is not evidence for replacing the stronger one, so the
-// default stays on the memory bounds until the comparison is made against the probe.
+//	pairs/inner   b/hash                b/probe              what the planner picks
+//	       0.3%   0.01x 0.05x 0.09x     1.41x 3.73x 4.36x    probe
+//	         5%   0.10x 0.15x 0.21x     0.12x 0.34x 0.74x    probe, probe, hash
+//	        20%   0.42x 0.47x 0.53x     0.02x 0.07x 0.41x    probe, probe, hash
+//	        80%   1.43x 1.47x 1.57x     0.01x 0.04x 0.16x    hash
+//
+// Three columns per cell, one per fan-out of 1, 8 and 64. They barely move, and that is the
+// result: the crossover against the hash is the PAIRS a join produces over the inner side's
+// rows -- about 50% -- and not the ratio of the two sides' row counts. An earlier sweep read
+// it as the latter because it held fan-out at 1, where a key count and a pair count are the
+// same number.
+//
+// Against the probe this path wins from 5% up and loses below it. That is the shape of the
+// two mechanisms: the probe folds every key into ONE membership constraint, so past the
+// store's pushdown estimate (collections, maxPushdownFrac) the index union is abandoned and
+// the constraint becomes a predicate over a full scan -- 613 ms against the hash's 24 ms at
+// 4,000 keys. Batching at 64 keys never reaches that estimate, so this path is linear in the
+// key count where the probe is not. Below 5% the probe narrows to the same rows in one query
+// and wins on the per-batch overhead this pays.
+//
+// So there is a band -- from about 5% of the inner side's rows in pairs to about 50% -- where
+// this path beats both. What is missing is not the measurement but the ESTIMATE: engaging on
+// it needs the pair count before any row is read, and a pair count is the FROM side's distinct
+// keys times the inner side's rows per key, neither of which the plan holds. The FROM side's
+// keys are counted by planIndexProbes, which already holds that side to collect them, so the
+// number exists -- one step later than the decision is made now. Until that is wired, the
+// default stays on the memory bounds, which are structural and need no estimate.
+//
+// The last column is worth its own look: it is what a caller really gets, and at fan-out 64
+// the planner picks the probe at every ratio, including 80%, where the probe takes 177 ms
+// against the hash's 19 ms and this path's 28 ms. The probe's gate prices distinct keys
+// against segments and never sees how many rows a key reaches, so fan-out is invisible to it.
+// That is the probe's bug, not this path's, and it is filed separately.
 
 // outerDriven is a join the batched path can run, and what it needs to run it.
 type outerDriven struct {
