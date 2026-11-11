@@ -250,16 +250,43 @@ func TestAppendQuoteStringBytesMatchesString(t *testing.T) {
 // any case must be single-quoted (it would otherwise re-lex as a literal), while a
 // normal identifier and a keyword-like-but-longer name stay bare.
 func TestQuoteAttributeNameReserved(t *testing.T) {
-	quoted := []string{"true", "True", "TRUE", "false", "undefined", "UnDefined", "error", "is", "IS", "isnt", "IsNt"}
+	quoted := []string{"true", "True", "TRUE", "false", "undefined", "UnDefined", "error", "is", "IS", "isnt", "IsNt", "parent", "Parent", "PARENT"}
 	for _, name := range quoted {
 		if got := QuoteAttributeName(name); got != "'"+name+"'" {
 			t.Errorf("QuoteAttributeName(%q) = %q, want it single-quoted", name, got)
 		}
 	}
-	bare := []string{"Cpus", "Memory", "TARGET", "trueish", "iso", "iss", "error_", "_is", "Requirements"}
+	bare := []string{"Cpus", "Memory", "TARGET", "trueish", "iso", "iss", "error_", "_is", "Requirements", "parents", "paren"}
 	for _, name := range bare {
 		if got := QuoteAttributeName(name); got != name {
 			t.Errorf("QuoteAttributeName(%q) = %q, want bare", name, got)
 		}
+	}
+}
+
+// TestQuoteAttributeNameIsASCII locks the character set a BARE attribute name
+// may use to the reference unparser's: identifierNeedsQuoting tests
+// isalpha/isalnum in the C locale (src/classad/sink.cpp), so a non-ASCII
+// letter needs quoting however much it looks like one.
+//
+// unicode.IsLetter accepted it and left the name bare, which is text
+// HTCondor's own lexer does not read as an identifier at all -- so an ad
+// carrying such a name was rendered in a form HTCondor could not parse back.
+func TestQuoteAttributeNameIsASCII(t *testing.T) {
+	for _, name := range []string{"ԅ", "café", "Ångstrom", "aµb", "中文"} {
+		got := QuoteAttributeName(name)
+		if got != "'"+name+"'" {
+			t.Errorf("QuoteAttributeName(%q) = %q, want it single-quoted", name, got)
+		}
+	}
+	// ASCII identifiers are unaffected, digits included after the first byte.
+	for _, name := range []string{"a", "_", "A1", "a_1B", "_0"} {
+		if got := QuoteAttributeName(name); got != name {
+			t.Errorf("QuoteAttributeName(%q) = %q, want bare", name, got)
+		}
+	}
+	// A leading digit still needs quoting.
+	if got := QuoteAttributeName("1a"); got != "'1a'" {
+		t.Errorf("QuoteAttributeName(\"1a\") = %q, want it single-quoted", got)
 	}
 }

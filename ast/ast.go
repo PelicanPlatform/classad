@@ -4,7 +4,6 @@ package ast
 import (
 	"fmt"
 	"strings"
-	"unicode"
 )
 
 // QuoteAttributeName renders an attribute name so it re-parses: a valid bare
@@ -217,12 +216,17 @@ func isBareAttributeName(name string) bool {
 	if name == "" {
 		return false
 	}
-	for i, r := range name {
-		if i == 0 {
-			if !unicode.IsLetter(r) && r != '_' {
-				return false
-			}
-		} else if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+	// ASCII only, which is what the reference unparser's
+	// identifierNeedsQuoting tests (isalpha/isalnum in the C locale,
+	// src/classad/sink.cpp). unicode.IsLetter would accept a non-ASCII
+	// letter and leave the name UNQUOTED -- text HTCondor's own lexer
+	// does not read as an identifier at all.
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case i > 0 && c >= '0' && c <= '9':
+		default:
 			return false
 		}
 	}
@@ -245,6 +249,12 @@ func isReservedWord(name string) bool {
 		return strings.EqualFold(name, "true") || strings.EqualFold(name, "isnt")
 	case 5:
 		return strings.EqualFold(name, "false") || strings.EqualFold(name, "error")
+	case 6:
+		// The lexical-parent scope keyword. It is in the reference
+		// unparser's list (src/classad/sink.cpp) and was missing here, so
+		// an attribute called `parent` was written bare where HTCondor
+		// quotes it.
+		return strings.EqualFold(name, "parent")
 	case 9:
 		return strings.EqualFold(name, "undefined")
 	}
