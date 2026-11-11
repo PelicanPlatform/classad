@@ -552,6 +552,46 @@ func TestListProjection(t *testing.T) {
 	}
 }
 
+// TestListProjectionIsRecursive covers a list element that is itself a list.
+//
+// The projection maps the SAME operation over each element, so a nested list
+// is projected in turn rather than failing as a non-ad: {{}}.A is { {} }, and
+// {{1}}.A is { {error} }. Returning a flat error element for it made every
+// config macro over a nested list differ from condor_config.
+func TestListProjectionIsRecursive(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		want string
+	}{
+		{`[ P = {{}}.A ]`, "{  }"},
+		{`[ P = {{1}}.A ]`, "{ error }"},
+		{`[ P = {{{}}}.A ]`, "{ {  } }"},
+		{`[ P = {{[A=1]}}.A ]`, "{ 1 }"},
+		{`[ P = {[A=1],{[A=2]}}.A ]`, "{ 2 }"}, // P is { 1,{ 2 } }
+	} {
+		ad, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.src, err)
+		}
+		p := ad.EvaluateAttr("P")
+		if !p.IsList() {
+			t.Fatalf("%s: P = %v, want a list", tc.src, p.Type())
+		}
+		got, _ := p.ListValue()
+		if len(got) == 0 {
+			t.Fatalf("%s: P is empty", tc.src)
+		}
+		// The element of interest is the last one: the nested list.
+		last, ok := got[len(got)-1].Unparse()
+		if !ok {
+			t.Fatalf("%s: last element does not unparse", tc.src)
+		}
+		if last != tc.want {
+			t.Errorf("%s: last element = %s, want %s", tc.src, last, tc.want)
+		}
+	}
+}
+
 // TestSizeCountsWithoutEvaluating guards that size() of a list counts elements
 // without evaluating them, so size({C}) is 1 even when element C would cycle
 // (C = size(A); A = {C}). Previously size materialized the lazy list and the

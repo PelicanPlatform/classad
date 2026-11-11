@@ -1164,15 +1164,20 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 	// the enclosing scope), {1,2,3}.A is {error,error,error} (a non-ad element
 	// selects to error), and {}.A is the empty list.
 	if recordVal.IsList() {
-		elems := recordVal.listElementsPropagating(e)
-		results := make([]Value, len(elems))
-		for i, el := range elems {
-			results[i] = e.selectAttr(el, sel.Attr)
-		}
-		return NewListValue(results)
+		return e.projectList(recordVal, sel.Attr)
 	}
 
 	return e.selectAttr(recordVal, sel.Attr)
+}
+
+// projectList maps a select over a list's elements.
+func (e *Evaluator) projectList(listVal Value, attr string) Value {
+	elems := listVal.listElementsPropagating(e)
+	results := make([]Value, len(elems))
+	for i, el := range elems {
+		results[i] = e.selectAttr(el, attr)
+	}
+	return NewListValue(results)
 }
 
 // listElementsPropagating evaluates a list value's elements WITHOUT recovering
@@ -1196,7 +1201,8 @@ func (v Value) listElementsPropagating(parent *Evaluator) []Value {
 }
 
 // selectAttr resolves record.attr for an already-evaluated record value (a
-// single element of a `.` select). A non-ad record is an error.
+// single element of a `.` select). A list is projected in turn; any other
+// non-ad record is an error.
 func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
 	// undefined/error elements propagate (so {undefined,[A=1]}.A is
 	// {undefined,1}); any other non-ad element selects to error.
@@ -1205,6 +1211,12 @@ func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
 	}
 	if recordVal.IsError() {
 		return NewErrorValue()
+	}
+	// A list element is projected in turn, so the mapping is recursive:
+	// {{}}.A is { {} } (the inner list has nothing to map over) and
+	// {{1}}.A is { { error } }, not a flat error element.
+	if recordVal.IsList() {
+		return e.projectList(recordVal, attr)
 	}
 	if !recordVal.IsClassAd() {
 		return NewErrorValue()
