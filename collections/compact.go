@@ -993,19 +993,26 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			if recIsMarker(seg.data, o) {
 				// Carry an in-window checkpoint forward (to history). A dictionary or columnar
 				// record is rebuilt by whatever writes the destination, never copied.
+				//
+				// The body comes across verbatim. A delete marker is a time checkpoint whose
+				// body continues past the millis with the key it deletes, and that key is the
+				// only durable evidence the delete happened -- rebuilding the marker from its
+				// millis alone would keep the sequence and silently drop the key.
 				if seq > retain && recIsTimeMarker(seg.data, o) {
+					body := recAd(seg.data, o)
 					markerReserve := 0
 					if intern {
 						markerReserve = reserve
 					}
-					if hcur == nil || hcur.used+recordLen(0, 8)+markerReserve > len(hcur.data) {
+					need := recordLen(0, len(body)) + markerReserve
+					if hcur == nil || hcur.used+need > len(hcur.data) {
 						finalizeInterned(hcur, &hcurStream) // no-op unless interning
-						hcur = newDst(&histSegs, recordLen(0, 8)+markerReserve, target)
+						hcur = newDst(&histSegs, need, target)
 						if intern {
 							hcurStream = newStream()
 						}
 					}
-					hcur.appendMarker(seq, recMarkerMillis(seg.data, o))
+					hcur.appendMarkerBody(seq, body)
 				}
 				off += int(total)
 				continue

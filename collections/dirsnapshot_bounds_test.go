@@ -278,9 +278,10 @@ func TestDirSnapshotReopenKeepsGarbageAndSkips(t *testing.T) {
 
 // TestDirSnapshotAcceptedAfterSegmentRewrite: deleting a key whose current record is a delta leaves
 // that delta as its bucket's head, and columnarizing the segment drops superseded deltas and moves
-// every other offset; when nothing else of the key is in that segment the head is not evicted, so
-// the directory names bytes that are no longer that record. The snapshot
-// leaves such heads out, and the reopen takes it.
+// every other offset. The rewrite carries the segment's delete markers across, and the key index
+// files each one under the key it deletes, so the key is still accounted for in the rewritten
+// segment and its head is evicted rather than left naming bytes that are no longer that record.
+// The snapshot must survive the reopen either way.
 func TestDirSnapshotAcceptedAfterSegmentRewrite(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14, DeltaMax: 8, GroupSchemaCount: -1}
@@ -317,8 +318,10 @@ func TestDirSnapshotAcceptedAfterSegmentRewrite(t *testing.T) {
 	if columnarSegmentsForTest(c) == 0 {
 		t.Fatal("fixture: nothing columnarized")
 	}
-	if staleDirEntries(c) == 0 {
-		t.Fatal("fixture: no directory head went stale, so this does not test the rewrite case")
+	// Carrying the markers is what keeps these heads accounted for: without it this fixture
+	// leaves 37 directory entries naming bytes that are no longer their record.
+	if n := staleDirEntries(c); n != 0 {
+		t.Errorf("%d directory heads name bytes that are no longer their record", n)
 	}
 	ads := getAll(c, n)
 	if err := c.Close(); err != nil {

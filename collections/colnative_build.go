@@ -378,6 +378,10 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	if b := segDictBlob(src); b != nil {
 		total += recordLen(0, len(b))
 	}
+	// Room for the markers carried below. A delete marker is the only durable evidence that a
+	// key went away, so a rewrite that dropped it would leave a resuming watcher unable to
+	// learn of the delete at all.
+	forEachCarriedMarker(src, func(_ uint64, body []byte) { total += recordLen(0, len(body)) })
 
 	// Staged under the prefix recovery ignores: until commitSegmentRewrite renames it, a crash
 	// must leave the original segment as the one the directory names. An in-memory shard gets a
@@ -411,6 +415,19 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			return nil, nil, nil
 		}
 		newOffs = append(newOffs, no)
+	}
+	// Markers come across verbatim, after the records. They are keyless and every scan skips
+	// them, so their position does not matter; that they are here at all does.
+	markersOK := true
+	forEachCarriedMarker(src, func(seq uint64, body []byte) {
+		if markersOK && !dst.appendMarkerBody(seq, body) {
+			markersOK = false
+		}
+	})
+	if !markersOK {
+		dst.retire()
+		dst.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
+		return nil, nil, nil
 	}
 	// An interned segment's records key their attributes by ids that only mean anything against
 	// that segment's dictionary, and the remnants were copied verbatim -- so the dictionary has to
