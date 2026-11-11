@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -74,10 +75,16 @@ func outerSpec(kind JoinKind) JoinSpec {
 
 // withOuterDriven turns the gated path on for one call. The gate is the production default
 // (see joinOuterDrivenEnabled), so every test of this path has to set it.
-func withOuterDriven(fn func()) {
-	old := joinOuterDrivenEnabled
-	joinOuterDrivenEnabled = true
-	defer func() { joinOuterDrivenEnabled = old }()
+func withOuterDriven(fn func()) { withOuterDrivenMode(outerDrivenForce, fn) }
+
+// withoutOuterDriven measures what the join does with the path declined, which is how a
+// test establishes that the hash arm it is comparing against really is the hash arm.
+func withoutOuterDriven(fn func()) { withOuterDrivenMode(outerDrivenNever, fn) }
+
+func withOuterDrivenMode(m outerDrivenMode, fn func()) {
+	old := joinOuterDrivenMode
+	joinOuterDrivenMode = m
+	defer func() { joinOuterDrivenMode = old }()
 	fn()
 }
 
@@ -188,7 +195,8 @@ func TestOuterDrivenRunsAJoinTheHashRefuses(t *testing.T) {
 	cat := outerFixture(t, big, small, 0, true)
 	lim := JoinLimits{MaxHashRows: big / 2}
 
-	_, wst := drainOrdered(t, cat, outerSpec(JoinInner), lim)
+	var wst *JoinStats
+	withoutOuterDriven(func() { _, wst = drainOrdered(t, cat, outerSpec(JoinInner), lim) })
 	if wst.Err == nil {
 		t.Fatalf("the hash path completed under MaxHashRows=%d; the limit is not binding "+
 			"and this test proves nothing", lim.MaxHashRows)
@@ -471,4 +479,299 @@ func TestOuterDrivenExplainIsNotTheProbePathsExplain(t *testing.T) {
 				on.Steps[0].ProbeWhy)
 		}
 	})
+}
+
+// TestOuterDrivenDefaultPolicy pins what the default actually decides. Nothing is forced
+// here: every arm is what a caller gets.
+//
+// The policy is the MEMORY bounds and nothing else. Within them the join is left alone
+// whatever the ratio of the sides, including the selective shape where
+// TestOuterDrivenCrossoverAgainstTheHash shows this path running several times faster --
+// because that benchmark's baseline is the build-side plan and not the index probe, and
+// the probe is what would really run there. Taking the path on selectivity needs that
+// comparison first.
+func TestOuterDrivenDefaultPolicy(t *testing.T) {
+	ratios := []struct {
+		name       string
+		big, small int
+	}{
+		{"selective FROM", 4096, 128},   // 3.1%, where the path is likely faster
+		{"comparable FROM", 4096, 2048}, // 50%, where it is measurably slower
+	}
+	for _, r := range ratios {
+		t.Run(r.name+" within the bounds is left alone", func(t *testing.T) {
+			cat := outerFixture(t, r.big, r.small, 0, true)
+			rows, st := drainOrdered(t, cat, outerSpec(JoinInner), JoinLimits{})
+			if st.Err != nil {
+				t.Fatal(st.Err)
+			}
+			if st.OuterDrivenBatches != 0 {
+				t.Errorf("the default ran %d batches for a FROM side %.1f%% of the inner "+
+					"one, inside both memory bounds", st.OuterDrivenBatches,
+					100*float64(r.small)/float64(r.big))
+			}
+			if len(rows) != r.small {
+				t.Errorf("joined %d rows, want %d", len(rows), r.small)
+			}
+		})
+	}
+
+	t.Run("over the row bound is taken", func(t *testing.T) {
+		const big, small = 4096, 2048
+		cat := outerFixture(t, big, small, 0, true)
+		lim := JoinLimits{MaxHashRows: big / 2}
+
+		var hash *JoinStats
+		withoutOuterDriven(func() { _, hash = drainOrdered(t, cat, outerSpec(JoinInner), lim) })
+		if hash.Err == nil {
+			t.Fatalf("the hash completed under MaxHashRows=%d; the limit is not binding",
+				lim.MaxHashRows)
+		}
+
+		rows, st := drainOrdered(t, cat, outerSpec(JoinInner), lim)
+		if st.OuterDrivenBatches == 0 {
+			t.Fatalf("the default left a join to the hash that the hash refuses: %v", st.Err)
+		}
+		if st.Err != nil {
+			t.Fatalf("the batched arm stopped early: %v", st.Err)
+		}
+		if len(rows) != small {
+			t.Errorf("joined %d rows, want %d", len(rows), small)
+		}
+	})
+}
+
+// fanoutFixture gives the inner side several rows per key, which is what makes a batch's
+// hold larger than the batch. With one row per key a batch can never hold more than
+// joinBatchKeys, and the per-batch bound below could not fire however low the limit went.
+func fanoutFixture(t testing.TB, clusters, fan int) *Catalog {
+	t.Helper()
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cat.Close() })
+	hist, err := cat.CreateArchiveTable("hist", ArchiveConfig{
+		SegmentSize: 4096,
+		ValueAttrs:  []string{"ClusterId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := cat.CreateArchiveTable("jobs", ArchiveConfig{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for c := 1; c <= clusters; c++ {
+		for f := 0; f < fan; f++ {
+			ad := classad.New()
+			ad.InsertAttr("ClusterId", int64(c))
+			ad.InsertAttr("ExitCode", int64(f))
+			ad.InsertAttrString("Pad", strings.Repeat("x", 64))
+			if aerr := hist.Append(ad); aerr != nil {
+				t.Fatal(aerr)
+			}
+		}
+		ad := classad.New()
+		ad.InsertAttr("ClusterId", int64(c))
+		ad.InsertAttrString("Owner", "alice")
+		if aerr := jobs.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	return cat
+}
+
+// TestOuterDrivenRespectsMaxHashRowsPerBatch covers the bound on what a BATCH holds.
+// MaxHashRows bounds rows held, and a batch's matches are the same resource a hash holds,
+// so a path that ignored it would hold more than the caller allowed and report success.
+func TestOuterDrivenRespectsMaxHashRowsPerBatch(t *testing.T) {
+	const clusters, fan = 400, 10
+	cat := fanoutFixture(t, clusters, fan)
+	spec := outerSpec(JoinInner)
+	// A limit at or above the batch size, so planOuterDriven does not decline outright,
+	// but far below what a batch of joinBatchKeys keys pulls back at this fan-out.
+	lim := JoinLimits{MaxHashRows: joinBatchKeys + 1}
+	if joinBatchKeys*fan <= lim.MaxHashRows {
+		t.Fatalf("a batch holds at most %d rows, within the %d limit; the bound cannot fire",
+			joinBatchKeys*fan, lim.MaxHashRows)
+	}
+
+	var st *JoinStats
+	withOuterDriven(func() { _, st = drainOrdered(t, cat, spec, lim) })
+	if st.Err == nil {
+		t.Fatalf("a batch held up to %d rows under a %d-row limit and the join reported no error",
+			joinBatchKeys*fan, lim.MaxHashRows)
+	}
+	if !strings.Contains(st.Err.Error(), "batch") {
+		t.Errorf("the error does not say a batch overran the limit: %v", st.Err)
+	}
+}
+
+// TestOuterDrivenDeclinesBelowTheBatchSize covers the planner's half of the same rule. Under
+// a limit smaller than one batch, no batch that matches anything can meet it, so taking the
+// path would turn a plan the index probe might still have narrowed into a refusal.
+func TestOuterDrivenDeclinesBelowTheBatchSize(t *testing.T) {
+	cat := fanoutFixture(t, 400, 10)
+	spec := outerSpec(JoinInner)
+	var rows []string
+	var st *JoinStats
+	withOuterDriven(func() {
+		rows, st = drainOrdered(t, cat, spec, JoinLimits{MaxHashRows: joinBatchKeys - 1})
+	})
+	if st.OuterDrivenBatches != 0 {
+		t.Errorf("the path ran %d batches under a limit smaller than one batch",
+			st.OuterDrivenBatches)
+	}
+	// A 63-row limit against this inner side has no plan at all, so the join does fail --
+	// the rule is about WHOSE failure it is. Declining hands the join back with the hash's
+	// own verdict, which names the side to narrow; taking it and then overrunning the
+	// per-batch bound reports a batch instead, and leaves the batch count at 0 either way.
+	// So the error text is what separates the two, not the count.
+	_ = rows
+	if st.Err == nil {
+		t.Fatalf("a %d-row limit against a %d-row side produced no error at all",
+			joinBatchKeys-1, 400*10)
+	}
+	if strings.Contains(st.Err.Error(), "batch") {
+		t.Errorf("the join failed as a batch overrun (%v); declining should have left the "+
+			"hash to refuse on its own terms", st.Err)
+	}
+}
+
+// wideFixture builds an inner side of WIDE ads: few rows, many attributes. It is the shape
+// that separates the two bounds -- a row count far inside MaxHashRows whose hold is far
+// outside any sane byte budget.
+func wideFixture(t testing.TB, rows, attrs int) *Catalog {
+	t.Helper()
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cat.Close() })
+	hist, err := cat.CreateArchiveTable("hist", ArchiveConfig{
+		SegmentSize: 1 << 20,
+		ValueAttrs:  []string{"ClusterId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := cat.CreateArchiveTable("jobs", ArchiveConfig{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= rows; i++ {
+		ad := classad.New()
+		ad.InsertAttr("ClusterId", int64(i))
+		ad.InsertAttr("ExitCode", int64(i%7))
+		for a := 0; a < attrs; a++ {
+			ad.InsertAttr(fmt.Sprintf("Attr%d", a), int64(a*7919+i))
+		}
+		if aerr := hist.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+		j := classad.New()
+		j.InsertAttr("ClusterId", int64(i))
+		if aerr := jobs.Append(j); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	return cat
+}
+
+// TestOuterDrivenTriggersOnBytesNotRows is the rule this path was rebuilt around. A row
+// count cannot express a memory budget: the hold costs ~180 + 130*attrs bytes per row, so
+// the same count is a few hundred megabytes for a narrow ad and gigabytes for a wide one.
+//
+// Here the inner side is far inside MaxHashRows and far outside the byte budget, so a rule
+// that triggered on rows would leave the join to a hash that holds the lot.
+func TestOuterDrivenTriggersOnBytesNotRows(t *testing.T) {
+	const rows, attrs = 5000, 120
+	cat := wideFixture(t, rows, attrs)
+	spec := outerSpec(JoinInner)
+
+	est := estHashBytes(rows, attrs+2)
+	lim := JoinLimits{MaxHashBytes: est / 4}
+	if rows >= DefaultJoinLimits().MaxHashRows {
+		t.Fatalf("the fixture's %d rows reach MaxHashRows; the two bounds are not separated", rows)
+	}
+
+	var st *JoinStats
+	_, st = drainOrdered(t, cat, spec, lim)
+	if st.Err != nil {
+		t.Fatalf("join stopped early: %v", st.Err)
+	}
+	if st.OuterDrivenBatches == 0 {
+		t.Errorf("the default left a %d-row side to the hash though holding it is ~%d bytes, "+
+			"over the %d budget -- the rule is still counting rows",
+			rows, est, lim.MaxHashBytes)
+	}
+
+	// And with a budget the hold fits, the hash keeps the join: the trigger is the budget,
+	// not merely the presence of wide ads.
+	var fits *JoinStats
+	_, fits = drainOrdered(t, cat, spec, JoinLimits{MaxHashBytes: est * 4})
+	if fits.Err != nil {
+		t.Fatalf("join stopped early: %v", fits.Err)
+	}
+	if fits.OuterDrivenBatches != 0 {
+		t.Errorf("the path ran %d batches under a budget the hold fits", fits.OuterDrivenBatches)
+	}
+}
+
+// TestHashRowByteEstimateTracksReality guards the model in db/joinmem.go against drift. The
+// constants were measured; if the decoded representation changes shape, an estimate that
+// silently stops matching would mis-plan every join rather than fail.
+func TestHashRowByteEstimateTracksReality(t *testing.T) {
+	for _, attrs := range []int{20, 120} {
+		const rows = 20_000
+		cat := wideFixture(t, rows, attrs)
+		hist, ok := cat.ArchiveTable("hist")
+		if !ok {
+			t.Fatal("no hist table")
+		}
+		width, known := archiveAdWidth(hist)
+		if !known {
+			t.Fatal("the side's width could not be sampled")
+		}
+		if want := attrs + 2; width != want {
+			t.Errorf("sampled width %d, the ads carry %d attributes", width, want)
+		}
+
+		base := heapNowForTest()
+		buckets := make(map[string][]*joinRow, rows)
+		ads, err := hist.Query("true")
+		if err != nil {
+			t.Fatal(err)
+		}
+		held := 0
+		for ad := range ads {
+			r := decodedRow(ad)
+			var b strings.Builder
+			if !appendKeyValue(&b, r.eval("ClusterId")) {
+				continue
+			}
+			buckets[b.String()] = append(buckets[b.String()], r)
+			held++
+		}
+		actual := float64(heapNowForTest() - base)
+		runtime.KeepAlive(buckets)
+		est := float64(estHashBytes(held, width))
+		ratio := est / actual
+		t.Logf("attrs=%d held=%d actual=%.0f est=%.0f ratio=%.2f", attrs, held, actual, est, ratio)
+		// Generous, because this is a model and the heap is noisy -- but tight enough that
+		// the order of magnitude cannot drift unnoticed, which is what mis-plans a join.
+		if ratio < 0.5 || ratio > 2.0 {
+			t.Errorf("attrs=%d: the estimate is %.2fx the measured hold; the model in "+
+				"joinmem.go no longer describes what a row costs", attrs, ratio)
+		}
+	}
+}
+
+func heapNowForTest() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
 }

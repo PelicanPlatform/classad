@@ -206,8 +206,20 @@ type JoinSpec struct {
 // are applied here and a caller can only ask for less (see clamp).
 type JoinLimits struct {
 	// MaxHashRows caps the rows held for the hashed side. Only one side is held, but it is
-	// held entirely, so this is the memory bound.
+	// held entirely.
+	//
+	// It is NOT a memory bound, which is what MaxHashBytes is for. A held row is a decoded
+	// ad, and what that costs is set by how many ATTRIBUTES it carries: measured at roughly
+	// 180 + 130*attrs bytes, so the same row count means 400 MB for a narrow row and 7.7 GB
+	// for a 120-attribute one. A count cannot express a budget across that spread.
 	MaxHashRows int
+	// MaxHashBytes caps the ESTIMATED heap of the rows held, which is the bound that
+	// actually protects the process. The estimate is rows * (hashRowBytesBase +
+	// hashRowBytesPerAttr*width), with width sampled from the side rather than assumed.
+	//
+	// It is an estimate, so it is applied where estimates belong -- choosing a plan -- and
+	// buildStage additionally counts what it really holds.
+	MaxHashBytes int
 	// MaxPairs caps candidate pairs EXAMINED. Neither the per-side cap nor hashing bounds
 	// this: a key with one distinct value puts every row in one bucket, and that bucket is
 	// the cross product. So the budget is spent where pairs are actually examined, which is
@@ -219,7 +231,8 @@ type JoinLimits struct {
 
 // DefaultJoinLimits are the limits a join runs under when a caller names none.
 func DefaultJoinLimits() JoinLimits {
-	return JoinLimits{MaxHashRows: 500_000, MaxPairs: 20_000_000, MaxRows: 1_000_000}
+	return JoinLimits{MaxHashRows: 500_000, MaxHashBytes: 256 << 20,
+		MaxPairs: 20_000_000, MaxRows: 1_000_000}
 }
 
 // clamp lowers each limit to the caller's, never raises it past the store's own.
@@ -231,9 +244,10 @@ func (l JoinLimits) clamp(want JoinLimits) JoinLimits {
 		return mine
 	}
 	return JoinLimits{
-		MaxHashRows: lower(l.MaxHashRows, want.MaxHashRows),
-		MaxPairs:    lower(l.MaxPairs, want.MaxPairs),
-		MaxRows:     lower(l.MaxRows, want.MaxRows),
+		MaxHashRows:  lower(l.MaxHashRows, want.MaxHashRows),
+		MaxHashBytes: lower(l.MaxHashBytes, want.MaxHashBytes),
+		MaxPairs:     lower(l.MaxPairs, want.MaxPairs),
+		MaxRows:      lower(l.MaxRows, want.MaxRows),
 	}
 }
 
@@ -244,6 +258,11 @@ func (l JoinLimits) clamp(want JoinLimits) JoinLimits {
 // or it will read a truncated answer as a complete one.
 type JoinStats struct {
 	HashRows int // rows held for the hashed side
+	// HashBytes is the estimated heap of the rows held, from each side's sampled ad width.
+	// It is what MaxHashBytes bounds, and it is an ESTIMATE -- the row count beside it is
+	// exact, and the two disagree about how much trouble a join is in whenever the ads are
+	// wider or narrower than the sample suggested.
+	HashBytes int
 	// OuterDrivenBatches counts the key batches an outer-driven join resolved against the
 	// inner side's index (db/joinouter.go). It is 0 for every other plan, which is what
 	// distinguishes a join that ran batched from one where that path declined -- a
@@ -483,6 +502,13 @@ type joinStepPlan struct {
 	// them, so a step whose halves are mixed still has probeable equalities even though
 	// rowReadsOnlySide0 is false for the step as a whole.
 	rowOnSide0 []bool
+	// estRowBytes is what one held row of this step's side is expected to cost, from the
+	// side's sampled ad width (see db/joinmem.go). 0 means the width could not be sampled,
+	// and the byte budget is then not applied to this step.
+	//
+	// Sampled once per plan rather than measured per row: counting a row's attributes means
+	// decoding it, and a narrowed read hands buildStage rows it never needs to decode.
+	estRowBytes int
 }
 
 // JoinsChains reports that this catalog's join accepts a chain of more than two tables.
@@ -550,6 +576,14 @@ func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, unordered
 	if err != nil {
 		return nil, err
 	}
+	// What one row of each step's side is expected to cost, so buildStage can hold to a byte
+	// budget without decoding rows to weigh them.
+	for i := range p.steps {
+		if w, ok := cat.sideAdWidth(sides[p.steps[i].side]); ok {
+			p.steps[i].estRowBytes = hashRowBytesBase + hashRowBytesPerAttr*w
+		}
+	}
+
 	// Before anything holds a side, see whether the join can be driven from the FROM side in
 	// key batches instead (see db/joinouter.go). It is tried FIRST because the probe planning
 	// below holds the FROM side to count its distinct keys, and this path exists not to hold
@@ -1048,6 +1082,17 @@ func buildStage(p *joinPlan, step *joinStepPlan, seq iter.Seq[*joinRow], stats *
 				p.aliases[step.side])
 		}
 		stats.HashRows++
+		// The budget that is actually about memory. MaxHashRows counts rows, and a row's
+		// cost moves by twenty times with the width of the ad, so the count alone lets a
+		// wide side hold gigabytes while reporting that it is well inside its limit.
+		if step.estRowBytes > 0 && p.limits.MaxHashBytes > 0 {
+			stats.HashBytes = stats.HashRows * step.estRowBytes
+			if stats.HashBytes > p.limits.MaxHashBytes {
+				return nil, fmt.Errorf("the join would hold about %d bytes from %s (%d rows "+
+					"of ~%d); narrow it with a constraint on that side",
+					stats.HashBytes, p.aliases[step.side], stats.HashRows, step.estRowBytes)
+			}
+		}
 		if !st.hashed {
 			st.all = append(st.all, ad)
 			continue

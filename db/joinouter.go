@@ -23,6 +23,7 @@ package db
 // back in. 64 is a knee, not an optimum.
 
 import (
+	"fmt"
 	"iter"
 	"strings"
 
@@ -36,16 +37,33 @@ import (
 // and so a site whose segments are sized differently has somewhere to change it.
 var joinBatchKeys = 64
 
-// joinOuterDrivenEnabled gates this path, and is OFF.
+// outerDrivenMode overrides the cost rule below. Production runs outerDrivenAuto; the other
+// two exist so a test can put the same join down both paths, which is the only way to check
+// that they answer alike.
+type outerDrivenMode int
+
+const (
+	outerDrivenAuto  outerDrivenMode = iota // the cost rule decides
+	outerDrivenForce                        // take the path wherever it structurally fits
+	outerDrivenNever                        // decline always, to measure the join without it
+)
+
+var joinOuterDrivenMode = outerDrivenAuto
+
+// Where the two paths cross on SPEED is measured but not yet acted on, because the
+// measurement is not yet against the right opponent.
 //
-// What it does is measured and what it answers is tested, but two things have to land before
-// it may decide a plan on its own. It reports none of what ExplainJoin reads -- no steps, no
-// probe attribute, no key count -- so an explained plan and the plan that ran would describe
-// different joins, which is a defect whether or not the rows agree. And it pre-empts the
-// index probe (db/joinprobe.go) wherever both apply, with nothing weighing one against the
-// other: the probe reads less of a SELECTIVE inner side, this reads less of a large one, and
-// which is true of a given join is a cost question neither path currently asks.
-var joinOuterDrivenEnabled = false
+// TestOuterDrivenCrossoverAgainstTheHash sweeps the FROM side against the inner one and finds
+// a ratio rather than a row count -- 0.28x and 0.27x at ~0.3% of the inner side, 1.09x and
+// 1.75x at 20%, unchanged when the inner side grew fourfold. That would argue for taking this
+// path on selectivity alone, somewhere near 5%.
+//
+// It does not, yet. That benchmark reports ProbeKeys of 0 on every row: its baseline is the
+// build-side plan -- hash the small FROM side, stream the inner one -- and not the index
+// probe (db/joinprobe.go), which is the plan that would actually run against a selective FROM
+// side and which narrows the hashed side with the same index this path looks keys up in.
+// Beating the weaker of two incumbents is not evidence for replacing the stronger one, so the
+// default stays on the memory bounds until the comparison is made against the probe.
 
 // outerDriven is a join the batched path can run, and what it needs to run it.
 type outerDriven struct {
@@ -63,7 +81,7 @@ type outerDriven struct {
 // retract rows it has already emitted or answer differently from the hash path, and neither
 // is something a join may do.
 func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven, bool) {
-	if !joinOuterDrivenEnabled {
+	if joinOuterDrivenMode == outerDrivenNever {
 		return nil, false
 	}
 	if len(p.steps) != 1 {
@@ -108,6 +126,46 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 	// disagree with what the batch does, because it is the same query.
 	if ex := t.a.ExplainQuery(collections.BatchKeyQuery(keyAttr, []int64{0})); ex.Plan != "indexed" {
 		return nil, false
+	}
+	// A batch has to be able to hold what it looks up. MaxHashRows bounds rows held, and
+	// this path holds a batch's matches rather than a side -- so a limit below the batch
+	// size cannot be met by any batch that matches anything, and taking the path would turn
+	// a plan the index probe might still have narrowed into a refusal.
+	if p.limits.MaxHashRows < joinBatchKeys {
+		return nil, false
+	}
+	// The cost rule: take this path when holding the inner side would cost more memory than
+	// one join is allowed to spend.
+	//
+	// The bound is BYTES, not rows, because rows do not express it (see db/joinmem.go). An
+	// earlier form of this rule triggered on MaxHashRows, which is wrong twice over. That
+	// count means anything from 400 MB to 7.7 GB depending on how many attributes the ad
+	// carries, so it is not a memory budget. And for a wide ad the process runs out of
+	// memory well before buildStage reaches the count and returns the error this path was
+	// meant to spare it -- so the rescue fired at a threshold the cases needing it never
+	// reach.
+	//
+	// Rows come from index statistics and width from a bounded sample, so choosing reads
+	// almost nothing. A side that cannot be priced is left alone: an unknown size is not
+	// evidence of a large one, and guessing would take this path on every unsized table.
+	if joinOuterDrivenMode != outerDrivenForce {
+		rows, sized := cat.sideReadSize(side)
+		if !sized {
+			return nil, false
+		}
+		width, known := archiveAdWidth(t)
+		if !known {
+			return nil, false
+		}
+		// Either memory bound. Over MaxHashRows the hash refuses outright, so this path is
+		// the difference between rows and an error; over MaxHashBytes it would hold more
+		// than a join may spend, which is the failure a row count does not catch.
+		overRows := rows > p.limits.MaxHashRows
+		overBytes := estHashBytes(rows, width) > p.limits.MaxHashBytes
+
+		if !overRows && !overBytes {
+			return nil, false
+		}
 	}
 	return &outerDriven{arch: t.a, keyAttr: keyAttr, rowAttr: rowAttr, step: step}, true
 }
@@ -203,12 +261,12 @@ func mixedKeyQuery(attr string, ints []int64, reals []float64) *vm.Query {
 
 // stage builds the hash for ONE batch: the inner rows the batch's keys reach, bucketed the
 // way buildStage buckets a whole side, so the walk above cannot tell the difference.
-func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*joinStage, int) {
+func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*joinStage, int, error) {
 	st := &joinStage{step: od.step, hashed: true, buckets: map[string][]*joinRow{}}
 	ints, reals, allInt := od.batchKeys(batch)
 	keys := len(ints) + len(reals)
 	if keys == 0 {
-		return st, 0 // every key in the batch was undefined: nothing to look up
+		return st, 0, nil // every key in the batch was undefined: nothing to look up
 	}
 	var ads iter.Seq[*classad.ClassAd]
 	if allInt {
@@ -225,6 +283,15 @@ func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*
 		}
 		st.buckets[k] = append(st.buckets[k], row)
 		held++
+		// The same bound the hash is held to, applied to what a batch holds. A batch is
+		// small by construction, so this fires only on a limit far below the default --
+		// but a limit is a limit, and a path that quietly ignored it would hold more than
+		// the caller allowed while reporting that it ran.
+		if held > p.limits.MaxHashRows {
+			return nil, 0, fmt.Errorf("a key batch of the join matched more than %d rows "+
+				"from %s; narrow it with a constraint on that side",
+				p.limits.MaxHashRows, p.aliases[od.step.side])
+		}
 	}
 	// HashRows is a HIGH-WATER MARK here, not a running total. What this path holds is one
 	// batch's worth at a time and the previous batch's rows are dropped before the next is
@@ -232,7 +299,7 @@ func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*
 	if held > stats.HashRows {
 		stats.HashRows = held
 	}
-	return st, keys
+	return st, keys, nil
 }
 
 // runJoinOuterDriven streams the FROM side in batches, resolving each batch's keys against the
@@ -266,7 +333,11 @@ func runJoinOuterDriven[T any](p *joinPlan, od *outerDriven, scanSeq iter.Seq[*j
 		if len(batch) == 0 {
 			return false
 		}
-		st, keys := od.stage(p, batch, stats)
+		st, keys, err := od.stage(p, batch, stats)
+		if err != nil {
+			stats.Err = err
+			return true
+		}
 		stats.OuterDrivenBatches++
 		probeStep.Keys += keys
 		stats.ProbeKeys += keys
