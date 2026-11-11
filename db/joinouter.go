@@ -24,7 +24,6 @@ package db
 
 import (
 	"iter"
-	"slices"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -96,11 +95,18 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 	if !ok {
 		return nil, false
 	}
-	// The key must carry a VALUE index. That is what makes a batched lookup a lookup rather
-	// than a scan of the surviving segments, and it is also what bounds which FROM keys can
-	// be served: a value index holds numbers.
-	_, value := t.a.IndexedAttrs()
-	if !slices.Contains(value, keyAttr) {
+	// The key must be served by an index AS THIS PATH WILL ASK FOR IT, which is why the
+	// question is put to the planner as the very query a batch runs rather than to the
+	// archive's declared index set.
+	//
+	// The declared set cannot answer it. A string attribute named in ValueAttrs is accepted
+	// at create and then reported as indexed by both IndexedAttrs and ZoneAttrs, while every
+	// query on it visits each record: a value index serves numbers, and a string belongs in
+	// CategoricalAttrs. Gating on the declared set would admit such a key, and this path
+	// would then fold a batch of string keys down to no numeric keys at all and answer an
+	// empty lookup -- not a slow join, a WRONG one. Explaining the batch query cannot
+	// disagree with what the batch does, because it is the same query.
+	if ex := t.a.ExplainQuery(collections.BatchKeyQuery(keyAttr, []int64{0})); ex.Plan != "indexed" {
 		return nil, false
 	}
 	return &outerDriven{arch: t.a, keyAttr: keyAttr, rowAttr: rowAttr, step: step}, true

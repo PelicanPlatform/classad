@@ -271,3 +271,94 @@ func TestOuterDrivenDeclinesAConstrainedInnerSide(t *testing.T) {
 		t.Errorf("constrained join returned %d rows with the gate on, %d with it off", len(got), len(want))
 	}
 }
+
+// stringKeyFixture joins on a STRING attribute that is named in ValueAttrs. The archive
+// accepts that, and reports the attribute as indexed through both IndexedAttrs and
+// ZoneAttrs, while every query on it visits each record -- a value index serves numbers.
+//
+// So the declared index set says "indexed" and the truth is "scanned", and a path that
+// gated on the declaration would admit this join.
+func stringKeyFixture(t testing.TB, big, small int) *Catalog {
+	t.Helper()
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cat.Close() })
+	hist, err := cat.CreateArchiveTable("hist", ArchiveConfig{
+		SegmentSize: 4096,
+		ValueAttrs:  []string{"ClusterId", "Owner"}, // Owner holds strings
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := cat.CreateArchiveTable("jobs", ArchiveConfig{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= big; i++ {
+		ad := classad.New()
+		ad.InsertAttr("ClusterId", int64(i))
+		ad.InsertAttr("ExitCode", int64(i%7))
+		ad.InsertAttrString("Owner", fmt.Sprintf("u%d", i%small))
+		ad.InsertAttrString("Pad", strings.Repeat("x", 64))
+		if aerr := hist.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	for i := 0; i < small; i++ {
+		ad := classad.New()
+		ad.InsertAttrString("Owner", fmt.Sprintf("u%d", i))
+		if aerr := jobs.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	return cat
+}
+
+// TestOuterDrivenDeclinesAStringKeyDeclaredAsAValueAttr is a WRONG-ANSWER regression, not a
+// performance one. This path folds a batch's keys into the numeric space the hash's bucket
+// key uses; a batch of string keys folds to no keys at all, so the lookup it would run is
+// empty and the join would return nothing while reporting that it ran.
+func TestOuterDrivenDeclinesAStringKeyDeclaredAsAValueAttr(t *testing.T) {
+	const big, small = 2048, 64
+	cat := stringKeyFixture(t, big, small)
+	spec := JoinSpec{
+		Kind:  JoinInner,
+		Left:  JoinSide{Table: "jobs", Alias: "j"},
+		Right: JoinSide{Table: "hist", Alias: "h"},
+		Cond:  []string{"j.Owner == h.Owner"},
+		Equi:  []JoinEqui{{Left: "Owner", Right: "Owner"}},
+	}
+	drain := func() (int, *JoinStats) {
+		var st JoinStats
+		seq, err := cat.Join(spec, JoinLimits{}, &st)
+		if err != nil {
+			t.Fatalf("Join: %v", err)
+		}
+		n := 0
+		for range seq {
+			n++
+		}
+		return n, &st
+	}
+
+	want, wst := drain()
+	if wst.Err != nil {
+		t.Fatal(wst.Err)
+	}
+	if want != big {
+		t.Fatalf("the hash join matched %d rows, want %d; the fixture is not joining", want, big)
+	}
+
+	var got int
+	var gst *JoinStats
+	withOuterDriven(func() { got, gst = drain() })
+	if gst.OuterDrivenBatches != 0 {
+		t.Errorf("the path ran %d batches on a string key; it cannot serve one",
+			gst.OuterDrivenBatches)
+	}
+	if got != want {
+		t.Errorf("with the gate on the join matched %d rows, want %d", got, want)
+	}
+}
