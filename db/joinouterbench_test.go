@@ -83,6 +83,14 @@ func TestOuterDrivenAgainstTheIndexProbe(t *testing.T) {
 	if testing.Short() {
 		t.Skip("times three join paths over several fan-outs and FROM-side sizes")
 	}
+	// This arm compares the three paths BY ELAPSED TIME. The race detector makes every one
+	// of them several times slower and does not make them slower by the same factor, so the
+	// comparison it produces is not the one being asserted -- and it costs 317s of a 25m
+	// budget to produce it. Which path is quicker is not a property the race detector has
+	// anything to say about.
+	if raceEnabled {
+		t.Skip("a timing comparison the race detector cannot answer; see race_on_test.go")
+	}
 	const innerRows = 20_000
 	arms := []joinArm{
 		{"hash", withoutProbe, outerDrivenNever},
