@@ -64,20 +64,44 @@ import (
 // Each ad is yielded once however many keys it matches, so the caller re-associates ads with
 // its own rows by the key -- this reports what the archive holds, not a join.
 func (a *Archive) LookupKeys(attr string, keys []int64) iter.Seq[*classad.ClassAd] {
-	return a.c.lookupKeys(attr, keys, false, nil)
+	return a.c.lookupKeys(attr, keys, nil, false, nil)
 }
 
 // LookupKeysRedacted is LookupKeys for a reader not entitled to sealed values (see
 // Collection.QueryRedacted).
 func (a *Archive) LookupKeysRedacted(attr string, keys []int64) iter.Seq[*classad.ClassAd] {
-	return a.c.lookupKeys(attr, keys, true, nil)
+	return a.c.lookupKeys(attr, keys, nil, true, nil)
 }
 
 // LookupKeysStats is LookupKeys that also fills stats (may be nil) with the per-scan work
 // breakdown, as the explained reads do. It is how a caller sees what the batch's span actually
 // ruled out, rather than what LookupKeysSegments predicts it would.
 func (a *Archive) LookupKeysStats(attr string, keys []int64, stats *ScanStats) iter.Seq[*classad.ClassAd] {
-	return a.c.lookupKeys(attr, keys, false, stats)
+	return a.c.lookupKeys(attr, keys, nil, false, stats)
+}
+
+// LookupKeysWhere is LookupKeys narrowed by a constraint of the caller's own: the ads whose
+// attr is one of keys AND which satisfy where. A nil where is LookupKeys exactly.
+//
+// It exists because the alternative does not work. A caller holding a constraint could
+// conjoin it itself and call Query, but that read is planned through planRead, whose gate is
+// the one this whole file exists to get past -- so a join narrowing its inner side would lose
+// the batched access path precisely by asking for less data. Carrying the constraint INTO the
+// batch keeps planIndex, and the constraint's own probes join the key's in the candidate
+// intersection rather than competing with it.
+//
+// The span hoist is unaffected. It prunes on the KEY's zone map against [lo,hi] of keys, and
+// a conjunction only ever removes records, so a segment the span rules out holds nothing the
+// narrower query wants either.
+func (a *Archive) LookupKeysWhere(attr string, keys []int64, where ast.Expr) iter.Seq[*classad.ClassAd] {
+	return a.c.lookupKeys(attr, keys, where, false, nil)
+}
+
+// LookupKeysWhereStats is LookupKeysWhere that also fills stats (may be nil), as
+// LookupKeysStats does for LookupKeys.
+func (a *Archive) LookupKeysWhereStats(attr string, keys []int64, where ast.Expr,
+	stats *ScanStats) iter.Seq[*classad.ClassAd] {
+	return a.c.lookupKeys(attr, keys, where, false, stats)
 }
 
 // BatchKeyQuery builds the constraint a key batch stands for, `member(attr, {keys...})`, as a
@@ -86,17 +110,31 @@ func (a *Archive) LookupKeysStats(attr string, keys []int64, stats *ScanStats) i
 // formatted text is what makes rebinding a batch cheap: the keys become literals directly, with
 // no lexing.
 func BatchKeyQuery(attr string, keys []int64) *vm.Query {
+	return BatchKeyQueryWhere(attr, keys, nil)
+}
+
+// BatchKeyQueryWhere is BatchKeyQuery conjoined with a constraint of the caller's own, which
+// is the query LookupKeysWhere plans from. A nil where gives BatchKeyQuery exactly.
+//
+// The key term is the RIGHT operand so that the caller's constraint is evaluated first, which
+// is what a reader of an explained plan expects to see, and both are parenthesized by
+// construction because they are AST nodes rather than text.
+func BatchKeyQueryWhere(attr string, keys []int64, where ast.Expr) *vm.Query {
 	elems := make([]ast.Expr, 0, len(keys))
 	for _, k := range keys {
 		elems = append(elems, &ast.IntegerLiteral{Value: k})
 	}
-	return vm.Compile(&ast.FunctionCall{
+	member := &ast.FunctionCall{
 		Name: "member",
 		Args: []ast.Expr{
 			ast.NewAttributeReference(attr, ast.NoScope),
 			&ast.ListLiteral{Elements: elems},
 		},
-	})
+	}
+	if where == nil {
+		return vm.Compile(member)
+	}
+	return vm.Compile(&ast.BinaryOp{Op: "&&", Left: where, Right: member})
 }
 
 // keyBounds is the span of a batch: the one summary the hoisted zone check needs.
@@ -113,13 +151,14 @@ func keyBounds(keys []int64) (lo, hi int64) {
 	return lo, hi
 }
 
-func (c *Collection) lookupKeys(attr string, keys []int64, redact bool, stats *ScanStats) iter.Seq[*classad.ClassAd] {
+func (c *Collection) lookupKeys(attr string, keys []int64, where ast.Expr, redact bool,
+	stats *ScanStats) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		if len(keys) == 0 {
 			return
 		}
 		lo, hi := keyBounds(keys)
-		qp := c.newQueryPlan(BatchKeyQuery(attr, keys), nil, stats, redact)
+		qp := c.newQueryPlan(BatchKeyQueryWhere(attr, keys, where), nil, stats, redact)
 		c.demand.record(qp.probes)
 		// planIndex, not planRead: the gate planRead applies is the collection-wide one this
 		// lookup exists to get past (see the file comment). A batch with no usable index still
