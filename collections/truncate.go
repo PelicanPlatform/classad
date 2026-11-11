@@ -49,6 +49,9 @@ func (c *Collection) Truncate() {
 			sh.appendFloor = sh.commitSeq
 		} else if sh.delLog != nil {
 			sh.delLog.truncate(sh.commitSeq)
+			// The segments holding the delete markers go too, so storage cannot stand in
+			// for the journal for any cursor from before this point.
+			sh.delFloor = sh.commitSeq
 		}
 		if sh.hub != nil {
 			sh.hub.kick()

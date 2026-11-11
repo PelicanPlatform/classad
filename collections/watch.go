@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"iter"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -135,6 +136,45 @@ func (d *deleteLog) record(key []byte, seq uint64) {
 	d.mu.Unlock()
 }
 
+// deleteMarkersSince returns the deletes with seq in (cursor, upTo] read from the delete
+// markers in storage, for a cursor the in-memory journal has already trimmed past. It
+// reports false when storage cannot be trusted to hold them all, which is the honest answer
+// and costs only a full replay.
+//
+// Two things have to hold. The retention window (Options.WatchRetainSeqs) must still cover
+// the cursor, which is what keeps reclamation from unlinking a segment whose markers are
+// above the floor. And no Truncate can have happened since, because that drops the segments
+// outright whatever the window says.
+//
+// The walk runs under the read lock rather than over pinned windows: the window builder
+// skips segments with nothing visible, which is precisely where a delete marker lives once
+// the records around it have been superseded. The keys are copied out, so nothing escapes
+// the lock.
+func (sh *shard) deleteMarkersSince(cursor, upTo uint64) ([]delEntry, bool) {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	if sh.watchRetain.Load() == 0 || cursor < sh.watchFloorLocked() || cursor < sh.delFloor {
+		return nil, false
+	}
+	var out []delEntry
+	for _, seg := range sh.segs {
+		if seg == nil || seg.used == 0 || seg.maxSeq <= cursor {
+			continue
+		}
+		forEachCarriedMarker(seg, func(seq uint64, body []byte) {
+			if seq <= cursor || seq > upTo || len(body) <= 8 {
+				return
+			}
+			out = append(out, delEntry{key: append([]byte(nil), body[8:]...), seq: seq})
+		})
+	}
+	// The journal yields deletes in commit order and catch-up emits them before the upserts
+	// of the same shard, so a key deleted and re-added since the cursor still ends present.
+	// Segments are walked in id order, which is not sequence order after a rewrite.
+	sort.Slice(out, func(i, j int) bool { return out[i].seq < out[j].seq })
+	return out, true
+}
+
 // truncate forgets every journaled delete and raises the horizon to seq: the collection
 // was emptied at seq, and a cursor below it must fall back to a full replay rather than
 // replay the journal. Caller holds the shard write lock, in the critical section that sets
@@ -142,6 +182,16 @@ func (d *deleteLog) record(key []byte, seq uint64) {
 func (d *deleteLog) truncate(seq uint64) {
 	d.mu.Lock()
 	d.entries = nil
+	d.horizon = max(d.horizon, seq)
+	d.mu.Unlock()
+}
+
+// setHorizon raises the journal's horizon to seq. A reopened collection calls it: the
+// journal is in memory, so it starts empty, and an empty journal with a zero horizon claims
+// that nothing was ever deleted rather than that it cannot say. A cursor from before the
+// restart has to be told to look elsewhere.
+func (d *deleteLog) setHorizon(seq uint64) {
+	d.mu.Lock()
 	d.horizon = max(d.horizon, seq)
 	d.mu.Unlock()
 }
@@ -937,8 +987,15 @@ func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
 		var horizon uint64
 		p.dels[i], horizon = sh.delLog.window(seqs[i], sReg[i])
 		if seqs[i] < horizon {
-			p.full = true
-			break
+			// The journal has been trimmed past this cursor, but the deletes are also on
+			// disk as markers; serve them from there when the retention window still
+			// promises they are all present.
+			dels, ok := sh.deleteMarkersSince(seqs[i], sReg[i])
+			if !ok {
+				p.full = true
+				break
+			}
+			p.dels[i] = dels
 		}
 	}
 	if p.full {

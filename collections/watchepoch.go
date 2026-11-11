@@ -37,17 +37,18 @@ import (
 //     issued before the restart is never reissued even when its record is no longer on disk
 //     (Truncate, or Rotate emptying a shard).
 //
-// Mutable collections rotate the epoch at every Open, for a reason that is about retention
-// rather than durability. Their deletes ARE durable: del appends a marker naming the key at
-// its commit seq (writeDeleteMarker), so every commit leaves a record at its seq. But
-// recovery replays those markers only above the supersession horizon, which compaction,
-// reclaim and columnarize each raise as they run, and a marker below it counts as dead bytes
-// like every other marker, so it is reclaimed. The window of replayable deletes is therefore
-// a function of compaction cadence, not of the watch window. Carrying the epoch here would
-// let a cursor older than the last compaction be told it had seen every delete when some had
-// already been reclaimed -- a silent miss, where a Reset is merely expensive. It requires
-// pinning the reclaim floor to the oldest cursor the watch still honors, the way SetGCFloor
-// pins it to a changefeed's acknowledged floor.
+// A MUTABLE collection carries its epoch across a clean restart only when WatchRetainSeqs
+// promises a retention window, and rotates it otherwise. Its deletes are durable --
+// del appends a marker naming the key at its commit seq (writeDeleteMarker) -- but nothing
+// reads those markers for their own sake, so reclamation unlinks the segment holding one as
+// soon as the records around it are superseded. The window is what holds that back, and
+// what bounds how far a cursor may resume from: outside it, catch-up cannot prove it has
+// every delete and Resets (see shard.deleteMarkersSince).
+//
+// The delete journal is in memory and so starts empty on reopen. Its horizon is raised to
+// the recovered commit sequence there, which is what sends a cursor from before the restart
+// to the markers in storage; left at zero it would instead answer that nothing had been
+// deleted.
 //
 // Copying a cleanly closed store directory and later reopening an older copy is outside this
 // guarantee (the epoch matches but the log is shorter); Watch's "cursor ahead of head" check

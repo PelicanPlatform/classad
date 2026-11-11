@@ -824,6 +824,19 @@ func recDeleteMarkerKey(b []byte, off uint32) ([]byte, bool) {
 	return body[8:], true
 }
 
+// holdsDeleteMarkerAbove reports whether seg holds a delete marker committed after floor --
+// a delete a watcher resuming from floor still has to be told about, and which exists nowhere
+// else once the segment is gone.
+func (s *segment) holdsDeleteMarkerAbove(floor uint64) bool {
+	found := false
+	forEachCarriedMarker(s, func(seq uint64, body []byte) {
+		if !found && seq > floor && len(body) > 8 {
+			found = true
+		}
+	})
+	return found
+}
+
 // forEachCarriedMarker calls fn for every marker in seg that a segment rewrite must carry
 // across: a time checkpoint, which includes a delete marker (whose body continues past the
 // millis with the key it deletes). A dictionary or columnar record also sets markerFlag but

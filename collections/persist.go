@@ -317,7 +317,7 @@ func Open(opts Options) (*Collection, error) {
 	// consumed BEFORE any segment is mapped or any seq issued, so a crash from here on
 	// rotates the epoch instead of letting recovery reissue seqs a cursor already covers.
 	var watchHW []uint64
-	if c.hub != nil && opts.AppendOnly {
+	if c.hub != nil && (opts.AppendOnly || opts.WatchRetainSeqs > 0) {
 		if watchHW, err = c.claimWatchEpoch(opts.Dir); err != nil {
 			return nil, err
 		}
@@ -373,6 +373,17 @@ func Open(opts Options) (*Collection, error) {
 	// unaffected.
 	for _, sh := range c.shards {
 		sh.gcFloor = max(sh.gcFloor, sh.commitSeq)
+		// For the same reason, the delete journal did not survive this open: it is in
+		// memory. Left at zero it would answer "no deletes since your cursor" for a cursor
+		// from before the restart, which is a silent miss rather than a Reset. Raising it
+		// to the recovered sequence sends every such cursor to the markers in storage,
+		// which answer precisely or refuse.
+		//
+		// An append log has no per-key delete, so its journal is empty whatever happens and
+		// raising its horizon would refuse the resume it is entitled to.
+		if sh.delLog != nil && !sh.appendOnly {
+			sh.delLog.setHorizon(sh.commitSeq)
+		}
 	}
 	// The append floor is not persisted; derive it from what recovery found. With the
 	// high-water mark applied, a shard Truncated (or rotated empty) before a clean Close
