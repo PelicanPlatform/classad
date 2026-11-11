@@ -263,8 +263,10 @@ func (sh *shard) dropDeferredLocked() {
 	o := &sh.pub
 	o.mu.Lock()
 	for _, ev := range evs {
-		for i, s := range o.pending {
-			if s == ev.seq {
+		stamp, found := uint64(0), false
+		for i, e := range o.pending {
+			if e.seq == ev.seq {
+				stamp, found = e.stamp, true
 				o.pending = append(o.pending[:i], o.pending[i+1:]...)
 				o.n.Add(-1)
 				break
@@ -272,6 +274,12 @@ func (sh *shard) dropDeferredLocked() {
 		}
 		if ev.seq > o.done {
 			o.done = ev.seq
+			// Only when this commit had a stamp of its own. An untracked one carries no
+			// reading, and inventing one would move the shard's watermark past events it
+			// cannot vouch for; leaving it behind only makes the watermark lag.
+			if found {
+				o.doneStamp = stamp
+			}
 		}
 	}
 	o.mu.Unlock()

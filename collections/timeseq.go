@@ -68,6 +68,12 @@ var nowMillisFn = func() uint64 { return uint64(time.Now().UnixMilli()) }
 // nowMillis is the current wall-clock time in unix milliseconds.
 func nowMillis() uint64 { return nowMillisFn() }
 
+// nowMicros is the current wall-clock time in unix microseconds. The watch clock stamps
+// commits in microseconds so a busy shard rarely has to force a stamp past the last one
+// (see pubOrder.stampLocked); it is the same clock nowMillis reads, and a test that
+// installs nowMillisFn moves both.
+func nowMicros() uint64 { return nowMillisFn() * 1000 }
+
 // SetTimeTravel enables, retunes, or (with a nil/zero option) disables point-in-time
 // queries at runtime. Enabling starts recording checkpoints and retaining superseded
 // versions from now on (it is not retroactive); disabling lets the next compaction

@@ -38,6 +38,16 @@ type WatchEvent struct {
 	Key    string
 	Ad     *classad.ClassAd // nil for a delete
 	Cursor []byte
+	// Stamp names this change in a clock shared by every shard, so two readers of the same
+	// DB give the same change the same number. A server that owes its clients one
+	// comparable version -- a Kubernetes resourceVersion, say -- takes it from here instead
+	// of keeping a counter of its own, which would restart with the process and differ
+	// between replicas.
+	//
+	// It is not a position: resuming is Cursor's job. Live events carry it; catch-up events
+	// do not, and WatchSynced carries the watermark instead. See collections.WatchEvent for
+	// what it does and does not order.
+	Stamp uint64
 }
 
 // Watch streams changes committed after the given cursor (nil = from now). Cancel via
@@ -47,6 +57,12 @@ type WatchEvent struct {
 // Watch(ctx, cursor) then streams only subsequent changes (no replay of current
 // contents). Cheap; requires the store was opened with watch history.
 func (db *DB) WatchCursor() ([]byte, error) { return db.c.WatchCursor() }
+
+// WatchWatermark is the DB's closed watch clock: every change at or below it has been
+// handed to every attached watcher, and nothing committed later will be stamped at or
+// below it. It is what a catch-up has caught up TO, and the one value that is both
+// comparable across shards and non-decreasing. 0 when the store has no watch.
+func (db *DB) WatchWatermark() uint64 { return db.c.WatchWatermark() }
 
 func (db *DB) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
 	return db.watchAs(ctx, cursor, false)
@@ -70,7 +86,7 @@ func (db *DB) watchAs(ctx context.Context, cursor []byte, redact bool) (iter.Seq
 	}
 	return func(yield func(WatchEvent) bool) {
 		for ev := range seq {
-			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor}
+			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor, Stamp: ev.Stamp}
 			switch ev.Kind {
 			case collections.WatchDelete:
 				we.Kind = WatchDelete
