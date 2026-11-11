@@ -249,6 +249,12 @@ func isReservedWord(name string) bool {
 		return strings.EqualFold(name, "true") || strings.EqualFold(name, "isnt")
 	case 5:
 		return strings.EqualFold(name, "false") || strings.EqualFold(name, "error")
+	case 6:
+		// The lexical-parent scope keyword. It is in the reference
+		// unparser's list (src/classad/sink.cpp) and was missing here, so
+		// an attribute called `parent` was written bare where HTCondor
+		// quotes it.
+		return strings.EqualFold(name, "parent")
 	case 9:
 		return strings.EqualFold(name, "undefined")
 	}
