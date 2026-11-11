@@ -144,7 +144,15 @@ type shard struct {
 	idx    int
 	hub    *watchHub
 	delLog *deleteLog
-	pub    pubOrder // orders live cursors against out-of-order publishes (watch.go)
+	// watchRetain is Options.WatchRetainSeqs: how far behind the head delete markers are
+	// kept for a resuming watcher. 0 disables the floor entirely. Atomic because
+	// SetWatchRetainSeqs reconfigures it and the floor is read under either lock.
+	watchRetain atomic.Uint64
+	// delFloor is the highest sequence at or below which the delete markers in storage can
+	// no longer be trusted to be complete, whatever the retention window says. Truncate
+	// raises it: it drops every segment, so the markers go with them. Guarded by mu.
+	delFloor uint64
+	pub      pubOrder // orders live cursors against out-of-order publishes (watch.go)
 	// deferred holds the events of deferred appends (commitDeferred) committed while a
 	// watcher was attached, in commit order, until a durability sync covers them and
 	// publishDeferred hands them to the hub. dmu guards it and nests inside mu; ndeferred

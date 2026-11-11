@@ -186,6 +186,33 @@ func (sh *shard) retainFloorLocked() uint64 {
 	return floor
 }
 
+// watchFloorLocked is the oldest commit sequence a resuming watcher is still promised its
+// deletes from: anything at or below it may be reclaimed. It is deliberately NOT the oldest
+// live cursor -- a floor that followed a consumer would let one stuck watcher hold the whole
+// history open. Caller holds at least the read lock.
+func (sh *shard) watchFloorLocked() uint64 {
+	retain := sh.watchRetain.Load()
+	if retain == 0 || sh.delLog == nil {
+		return sh.commitSeq // no promise: everything is reclaimable, as before
+	}
+	if sh.commitSeq <= retain {
+		return 0
+	}
+	return sh.commitSeq - retain
+}
+
+// SetWatchRetainSeqs reconfigures Options.WatchRetainSeqs, so a server can change the
+// window on a config reload rather than a reopen.
+//
+// Widening it does not reach back: markers already reclaimed stay reclaimed, and delFloor
+// records how far that went, so a cursor the old window had given up on is still refused
+// rather than answered from a window that only looks wide enough.
+func (c *Collection) SetWatchRetainSeqs(n uint64) {
+	for _, sh := range c.shards {
+		sh.watchRetain.Store(n)
+	}
+}
+
 // timeSeqEntry is one checkpoint: seq was the shard's commit sequence at wall-clock
 // millis. Both fields are non-decreasing along the slice.
 type timeSeqEntry struct {

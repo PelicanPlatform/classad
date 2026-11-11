@@ -224,6 +224,7 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 		return 0
 	}
 	retain := sh.retainFloorLocked()
+	watchFloor := sh.watchFloorLocked()
 	var dead []*segment
 	for _, seg := range sh.segs {
 		if seg == nil || seg == sh.act || seg.used == 0 {
@@ -236,12 +237,24 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 		// data has aged out. With time travel off, retain == commitSeq, so any
 		// all-superseded segment qualifies -- exactly the previous behavior.
 		if seg.dead >= int64(seg.used) && seg.maxSup <= retain && seg.maxSeq <= horizonNeed {
+			// A delete marker is not a record any reader looks for, so none of the tests
+			// above keep one alive -- unlinking the segment is where a watcher's evidence
+			// of a delete is lost. The walk is bounded to segments inside the window.
+			if seg.maxSeq > watchFloor && seg.holdsDeleteMarkerAbove(watchFloor) {
+				continue
+			}
 			dead = append(dead, seg)
 		}
 	}
 	if len(dead) == 0 {
 		sh.mu.Unlock()
 		return 0
+	}
+	// Every marker in a dropped segment was at or below the floor -- that is what the check
+	// above enforces -- so this is exactly how far the deletes in storage have been lost.
+	// Recording it is what keeps a later, wider window from claiming them back.
+	if watchFloor > sh.delFloor {
+		sh.delFloor = watchFloor
 	}
 	deadSet := make(map[uint32]struct{}, len(dead))
 	for _, seg := range dead {
@@ -505,11 +518,15 @@ func (c *Collection) anyShardNeedsRewrite() bool {
 // the loop that acts on them.
 func (sh *shard) hasReclaimableSegment() bool {
 	retain := sh.retainFloorLocked()
+	watchFloor := sh.watchFloorLocked()
 	for _, seg := range sh.segs {
 		if seg == nil || seg == sh.act || seg.used == 0 {
 			continue
 		}
 		if seg.dead >= int64(seg.used) && seg.maxSup <= retain {
+			if seg.maxSeq > watchFloor && seg.holdsDeleteMarkerAbove(watchFloor) {
+				continue // reclaimDeadShard will not take it either
+			}
 			return true
 		}
 	}
@@ -597,6 +614,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 	}
 	retain := sh.retainFloorLocked()
+	watchFloor := sh.watchFloorLocked()
 	horizonNeed := sh.commitSeq // every source record is at or below it
 	origLen := len(sh.segs)
 	sources := make([]*segment, 0, origLen)
@@ -993,19 +1011,28 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			if recIsMarker(seg.data, o) {
 				// Carry an in-window checkpoint forward (to history). A dictionary or columnar
 				// record is rebuilt by whatever writes the destination, never copied.
-				if seq > retain && recIsTimeMarker(seg.data, o) {
+				//
+				// The body comes across verbatim. A delete marker is a time checkpoint whose
+				// body continues past the millis with the key it deletes, and that key is the
+				// only durable evidence the delete happened -- rebuilding the marker from its
+				// millis alone would keep the sequence and silently drop the key.
+				body := recAd(seg.data, o)
+				_, isDelete := recDeleteMarkerKey(seg.data, o)
+				keep := seq > retain || (isDelete && seq > watchFloor)
+				if keep && recIsTimeMarker(seg.data, o) {
 					markerReserve := 0
 					if intern {
 						markerReserve = reserve
 					}
-					if hcur == nil || hcur.used+recordLen(0, 8)+markerReserve > len(hcur.data) {
+					need := recordLen(0, len(body)) + markerReserve
+					if hcur == nil || hcur.used+need > len(hcur.data) {
 						finalizeInterned(hcur, &hcurStream) // no-op unless interning
-						hcur = newDst(&histSegs, recordLen(0, 8)+markerReserve, target)
+						hcur = newDst(&histSegs, need, target)
 						if intern {
 							hcurStream = newStream()
 						}
 					}
-					hcur.appendMarker(seq, recMarkerMillis(seg.data, o))
+					hcur.appendMarkerBody(seq, body)
 				}
 				off += int(total)
 				continue

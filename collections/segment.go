@@ -598,6 +598,15 @@ func (s *segment) appendFlagged(seq uint64, next loc, key, ad []byte, hdrFlags u
 func (s *segment) appendMarker(seq, millis uint64) bool {
 	var ad [8]byte
 	binary.LittleEndian.PutUint64(ad[:], millis)
+	return s.appendMarkerBody(seq, ad[:])
+}
+
+// appendMarkerBody writes a marker whose body is given rather than built from a millis
+// value, so a rewrite can carry a marker across without having to know what kind it is. A
+// delete marker's body is the millis followed by the key (see shard.writeDeleteMarker), and
+// re-emitting it as a bare 8-byte checkpoint would keep its sequence and lose the key it
+// names. The caller holds the shard lock.
+func (s *segment) appendMarkerBody(seq uint64, ad []byte) bool {
 	rl := recordLen(0, len(ad))
 	off := s.used
 	if off+rl > len(s.data) {
@@ -613,7 +622,7 @@ func (s *segment) appendMarker(seq, millis uint64) bool {
 	binary.LittleEndian.PutUint32(b[recKeyLenOff:], markerFlag) // flag set, key length 0
 	adLenOff := recKeyOff
 	binary.LittleEndian.PutUint32(b[adLenOff:], uint32(len(ad)))
-	copy(b[adLenOff+4:], ad[:])
+	copy(b[adLenOff+4:], ad)
 	if s.persistent {
 		crcOff := adLenOff + 4 + len(ad)
 		binary.LittleEndian.PutUint32(b[crcOff:], recCRC(b, crcOff))
@@ -813,6 +822,44 @@ func recDeleteMarkerKey(b []byte, off uint32) ([]byte, bool) {
 		return nil, false
 	}
 	return body[8:], true
+}
+
+// holdsDeleteMarkerAbove reports whether seg holds a delete marker committed after floor --
+// a delete a watcher resuming from floor still has to be told about, and which exists nowhere
+// else once the segment is gone.
+func (s *segment) holdsDeleteMarkerAbove(floor uint64) bool {
+	found := false
+	forEachCarriedMarker(s, func(seq uint64, body []byte) {
+		if !found && seq > floor && len(body) > 8 {
+			found = true
+		}
+	})
+	return found
+}
+
+// forEachCarriedMarker calls fn for every marker in seg that a segment rewrite must carry
+// across: a time checkpoint, which includes a delete marker (whose body continues past the
+// millis with the key it deletes). A dictionary or columnar record also sets markerFlag but
+// is rebuilt by whatever writes the destination, so it is never copied.
+//
+// body aliases seg's arena and is only valid for the duration of the call.
+func forEachCarriedMarker(seg *segment, fn func(seq uint64, body []byte)) {
+	dm := seg.damaged()
+	for off := 0; off < seg.used; {
+		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
+		total := recTotalLen(seg.data, o)
+		if total == 0 {
+			break
+		}
+		if recIsTimeMarker(seg.data, o) {
+			fn(recSeq(seg.data, o), recAd(seg.data, o))
+		}
+		off += int(total)
+	}
 }
 
 // recMarkerMillis reads a marker's wall-clock payload (unixMillis). Only valid when

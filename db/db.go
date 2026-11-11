@@ -244,6 +244,16 @@ type Config struct {
 	// AggMinBytes is collections.Options.AggMinBytes: the live segment bytes an aggregate pass
 	// must cover before it fans out across segments. 0 takes the measured default.
 	AggMinBytes int
+	// WatchRetainSeqs is collections.Options.WatchRetainSeqs: how many commit sequences
+	// behind the head a persistent store keeps its delete markers for, so a watcher that
+	// reconnects after a restart can still be told which keys went away rather than being
+	// sent back for a full replay.
+	//
+	// 0 (the default) retains nothing extra, which is what a store with no reconnecting
+	// watchers wants: the window is paid for in segments that cannot be reclaimed yet. Set
+	// it where resuming matters more than the space, sized to the writes a watcher may be
+	// disconnected across rather than to a duration.
+	WatchRetainSeqs uint64
 }
 
 // Open opens a ClassAd log with default configuration. A non-empty dir makes it
@@ -264,6 +274,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 	opts := collections.Options{
 		Dir:                       cfg.Dir,
 		WatchHistory:              4096, // enables Watch
+		WatchRetainSeqs:           cfg.WatchRetainSeqs,
 		Ordered:                   cfg.Ordered,
 		HotAttrs:                  cfg.HotAttrs,
 		CategoricalAttrs:          cfg.CategoricalAttrs,
