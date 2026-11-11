@@ -33,6 +33,30 @@ import (
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
+// joinBatchedPairFloor is the pair count below which the index probe beats this path, and
+// joinBatchedPairFrac the share of the inner side's rows, in pairs, above which holding that
+// side in one hash beats it. Between them is where this path belongs.
+//
+// The floor is an ABSOLUTE count rather than a fraction, because what it prices is this
+// path's fixed per-batch overhead -- planning, the snapshot, the zone walk -- against the
+// probe's single query, and that overhead does not scale with the inner side. Measured on a
+// 400,000-row inner side at fan-outs of 1, 8 and 64, the probe wins below about 1,200 pairs,
+// the two draw by about 1,200, and this path leads by 2.2x to 10.9x at about 4,000. The
+// three fan-outs agree to within a factor the fan-out itself spans 64 times, which is what
+// says the axis is pairs. Either side of the knee the whole join runs in tens of
+// milliseconds, so the floor buys safety cheaply.
+//
+// The cap is a fraction, because what it prices is reading the inner side whole. It is set
+// where this path clearly WINS rather than where it stops losing, and those are far apart:
+// the crossover against the hash is ~80% of the inner side's rows at the archive's default
+// segment size, but by 50% the two are already within 0.80x to 1.07x of each other across
+// every geometry measured -- parity, bought with a less predictable plan. The clear margin
+// is below about a quarter, where this path runs at 0.27x to 0.35x, so that is the cap.
+const (
+	joinBatchedPairFloor = 2048
+	joinBatchedPairFrac  = 0.25
+)
+
 // joinBatchKeys is how many FROM-side rows one batch covers. A var so a test can move it,
 // and so a site whose segments are sized differently has somewhere to change it.
 var joinBatchKeys = 64
@@ -65,7 +89,8 @@ var joinOuterDrivenMode = outerDrivenAuto
 //
 // Three columns per cell, one per fan-out of 1, 8 and 64. They barely move, and that is the
 // result: the crossover against the hash is the PAIRS a join produces over the inner side's
-// rows -- about 50% -- and not the ratio of the two sides' row counts. An earlier sweep read
+// rows -- about 50% on this fixture, and the sweeps below say what that figure depends on --
+// and not the ratio of the two sides' row counts. An earlier sweep read
 // it as the latter because it held fan-out at 1, where a key count and a pair count are the
 // same number.
 //
@@ -77,35 +102,47 @@ var joinOuterDrivenMode = outerDrivenAuto
 // key count where the probe is not. Below 5% the probe narrows to the same rows in one query
 // and wins on the per-batch overhead this pays.
 //
-// So there is a band -- from about 5% of the inner side's rows in pairs to about 50% -- where
-// this path beats both. What is missing is not the measurement but the ESTIMATE: engaging on
-// it needs the pair count before any row is read, and a pair count is the FROM side's distinct
-// keys times the inner side's rows per key, neither of which the plan holds. The FROM side's
-// keys are counted by planIndexProbes, which already holds that side to collect them, so the
-// number exists -- one step later than the decision is made now. Until that is wired, the
-// default stays on the memory bounds, which are structural and need no estimate.
+// So there is a band -- from a couple of thousand pairs up to about a quarter of the inner
+// side's rows -- where this path beats both, and the default engages on it. What that costs
+// is a pair count before any row is read, which the plan does not hold: it is ESTIMATED
+// instead, from the FROM side's priced row count and the inner side's records per distinct
+// key (outerDrivenPairEstimate). A FROM side whose constraint the store cannot price is
+// refused rather than counted at its whole table, because that number does not move when the
+// caller narrows and the decision is entirely about how far it moves.
 //
-// WHAT THAT TABLE DOES NOT TRANSFER, and it is the number most likely to be quoted. The
-// crossover against the hash is ~50% of the inner side's rows ON THAT FIXTURE, whose segments
-// are 64 KiB and so carry about 670 rows each. The archive default is 8 MiB, about 50,000
-// rows, and the crossover moves with rows per segment until it saturates:
+// WHAT THAT TABLE DOES NOT TRANSFER, and it is the number most likely to be quoted: ~50% is
+// the crossover ON THAT FIXTURE, whose segments are 64 KiB and carry about 670 rows. The
+// archive default is 8 MiB. Two sweeps vary one axis each, at fan-out 64, so that what moves
+// the ratio can be told from what moves with it.
 //
-//	rows/segment   5%      20%     50%     80%    crossover
-//	         666   0.20x   0.51x   1.07x   1.40x    ~47%
-//	      10,526   0.18x   0.45x   0.81x   1.02x    ~79%
-//	      30,769   0.15x   0.40x   0.80x   1.02x    ~80%
+// Table size, at a fixed 2 MiB segment (12,500 to 21,000 rows each, 2 to 19 segments):
 //
-// The last two rows differ 2x in table size and agree, so it is rows per segment rather than
-// table size, and it has saturated well before the production figure. Key ORDER moves it back:
-// at 10,526 rows per segment, appending the inner side's keys fully shuffled rather than in
-// order takes the crossover from ~70% to ~45%, because the batch's [lo,hi] span then rules out
-// no segment. That is a 1.5x effect and not the ~75x that zone tiling alone suffers, because
-// the index inside a surviving segment visits the matching rows whatever the order.
+//	inner rows    5%      20%     80%
+//	    25,000   0.06x   0.27x   0.92x
+//	   100,000   0.07x   0.27x   0.95x
+//	   400,000   0.07x   0.28x   0.95x
 //
-// So the band that holds across EVERY condition measured -- three rows-per-segment values,
-// three fan-outs, three key orderings -- is pairs below about 20-25% of the inner side's rows,
-// where this path ran between 0.40x and 0.58x. A default should be built on that, not on the
-// fixture-specific 50%.
+// Sixteen times the table and the ratio does not move. Pairs over inner rows is the axis; the
+// two sides' absolute sizes are not, and neither is a segment count between 2 and 19.
+//
+// Segment size, at a fixed 400,000-row inner side:
+//
+//	rows/segment   segments    5%      20%     80%
+//	         681        587   0.10x   0.35x   1.24x
+//	      21,053         19   0.08x   0.27x   0.95x
+//
+// This one moves, and only at the top of the range: 0.02x apart at 5% of pairs, 0.26x at 80%.
+// The cost is per BATCH and per SEGMENT -- every batch walks the zone map of every segment to
+// find the ones its key span can reach -- so it is paid against however few rows a batch keeps,
+// and 587 segments pay it 30 times over against 19. It is a segment COUNT effect rather than a
+// rows-per-segment one, which is why the first sweep sees none of it at 2 to 19 segments.
+//
+// So the crossover against the hash is ~80% of the inner side's rows in pairs at production
+// segment sizes, not the ~50% this fixture shows, and the margin below it is wide: 0.07x at
+// 5% of pairs and 0.27x at 20%, consistently, across every table size measured.
+//
+// Every ratio above is a measured point. A crossover quoted as a percentage is interpolated
+// between two of them, so it is stated as a rough figure and never carried into a comparison.
 //
 // The last column is worth its own look: it is what a caller really gets, and at fan-out 64
 // the planner picks the probe at every ratio, including 80%, where the probe takes 177 ms
@@ -119,6 +156,11 @@ type outerDriven struct {
 	keyAttr string // the inner side's half of the equality, a bare attribute
 	rowAttr string // the FROM side's half, likewise
 	step    *joinStepPlan
+	// where is the inner side's own constraint, parsed, or nil when the side asked for
+	// everything. It rides INTO each batch's lookup rather than filtering the lookup's
+	// results, so a batch reads only the rows it will keep and the store can drop a
+	// record on an index before decoding it.
+	where ast.Expr
 }
 
 // planOuterDriven decides whether a join can be driven from its FROM side.
@@ -151,11 +193,22 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 		return nil, false
 	}
 	side := sides[step.side]
-	if constraintOf(side) != "true" {
-		// The side's own constraint says which of its rows the caller asked for, and a
-		// lookup resolves the key and nothing else. Applying one without the other widens
-		// the join to rows the query excluded.
-		return nil, false
+	// The side's own constraint says which of its rows the caller asked for, and a bare key
+	// lookup resolves the key and nothing else -- so a batch that dropped it would widen the
+	// join to rows the query excluded. The batch carries it instead.
+	//
+	// A constraint that does not parse declines the path rather than being ignored. The scan
+	// paths reject it downstream, where the parse error is reported as a parse error; a path
+	// that quietly ran without it would answer a different query from the one asked.
+	var where ast.Expr
+	if c := constraintOf(side); c != "true" {
+		q, perr := vm.Parse(c)
+		if perr != nil {
+			return nil, false
+		}
+		if where = q.Expr(); where == nil {
+			return nil, false
+		}
 	}
 	t, ok := cat.ArchiveTable(side.Table)
 	if !ok {
@@ -174,6 +227,26 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 	// disagree with what the batch does, because it is the same query.
 	if ex := t.a.ExplainQuery(collections.BatchKeyQuery(keyAttr, []int64{0})); ex.Plan != "indexed" {
 		return nil, false
+	}
+	// With a constraint there is a second question, because what a batch runs is the key AND
+	// the constraint, and a constraint can defeat an index the key alone was served by. It is
+	// asked separately rather than instead, since each gate catches what the other misses: a
+	// key no index serves can still plan well once a constraint narrows it, and a key an index
+	// serves can still end in a scan once one is conjoined.
+	//
+	// The admitted plans are named rather than the refused ones. "indexed" is the batch doing
+	// what this path exists to do. "empty" is an artefact of the sentinel key and not an answer
+	// about the constraint at all: a constraint on the key attribute itself -- ClusterId > 100
+	// -- contradicts the sentinel and folds to nothing, where the same constraint against a
+	// batch's real keys plans "indexed". Everything else is declined, "indexed-union" among
+	// them: a union over an OR is index-driven and probably fine here, but nothing has measured
+	// what a batch costs on one, and an unmeasured plan is not a plan this path should take.
+	if where != nil {
+		switch ex := t.a.ExplainQuery(collections.BatchKeyQueryWhere(keyAttr, []int64{0}, where)); ex.Plan {
+		case "indexed", "empty":
+		default:
+			return nil, false
+		}
 	}
 	// A batch has to be able to hold what it looks up. MaxHashRows bounds rows held, and
 	// this path holds a batch's matches rather than a side -- so a limit below the batch
@@ -211,11 +284,82 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 		overRows := rows > p.limits.MaxHashRows
 		overBytes := estHashBytes(rows, width) > p.limits.MaxHashBytes
 
+		// Over either bound this path is the difference between rows and an error, and it
+		// is taken whatever it costs: the alternative is not a slower plan but no plan.
+		//
+		// Under both, it has to earn the choice. That needs the pairs the join will
+		// produce, which is the axis every measurement of these three paths lands on, and
+		// which nothing in the plan holds -- so it is BOUNDED rather than estimated.
 		if !overRows && !overBytes {
-			return nil, false
+			pairs, ok := cat.outerDrivenPairEstimate(sides, step, t, keyAttr)
+			if !ok {
+				return nil, false
+			}
+			if pairs < joinBatchedPairFloor {
+				return nil, false // the probe reaches these rows in one query for less
+			}
+			if float64(pairs) > joinBatchedPairFrac*float64(rows) {
+				return nil, false // enough of the inner side that holding it once is as cheap
+			}
 		}
 	}
-	return &outerDriven{arch: t.a, keyAttr: keyAttr, rowAttr: rowAttr, step: step}, true
+	return &outerDriven{arch: t.a, keyAttr: keyAttr, rowAttr: rowAttr, step: step, where: where}, true
+}
+
+// outerDrivenPairEstimate estimates the pairs this join will produce, from metadata alone.
+//
+// An ESTIMATE, although one of its two factors is a bound, and the distinction is the whole
+// reason this is not called a bound. A key cannot appear in more FROM rows than that side
+// has, so the FROM side's priced row count really does bound its distinct keys. The second
+// factor does not: AttrNDV gives records per distinct key as Records over Distinct, which is
+// an AVERAGE, and one key holding far more rows than the average is exactly what a skewed
+// join key looks like. Their product is therefore an estimate that skew can beat, and
+// rounding the average up buys a little margin rather than correctness.
+//
+// What that costs is bounded by the measurement either way. Under-counting takes this path
+// where pairs run past the fraction, and that is where the hash is merely AS cheap -- 0.95x
+// to 1.24x, parity rather than a cliff. Over-counting declines to the hash, or takes the path
+// below the floor where both finish in tens of milliseconds. Neither direction has a
+// catastrophic end, which is what makes an estimate usable here at all.
+//
+// A side that cannot be priced declines the path rather than being guessed at: an unknown
+// size is not evidence of a convenient one.
+func (cat *Catalog) outerDrivenPairEstimate(sides []JoinSide, step *joinStepPlan,
+	t *ArchiveTable, keyAttr string) (int, bool) {
+	// sides[0] is the streamed side -- the FROM side -- as JoinExplain reports it, and the
+	// step names the side folded into it. Deriving the FROM side as "the other one" instead
+	// read the INNER side's row count here, which carries no constraint of the caller's, so
+	// the bound came out the same whatever the query asked for.
+	if len(sides) != 2 || step.side == 0 {
+		return 0, false
+	}
+	from := sides[0]
+	fromRows, sized := cat.sideReadSize(from)
+	if !sized || fromRows <= 0 {
+		return 0, false
+	}
+	// A constrained side whose count came back at the table's own size was not priced: the
+	// store could not answer the constraint from an index and fell back to the total. That
+	// number describes the TABLE, not the query, so the pairs built on it do not move when
+	// the caller narrows -- and the whole decision below turns on how far they move. It is
+	// refused rather than used, because a bound that cannot see selectivity would engage or
+	// decline a whole table at a time on a figure the query has no influence over.
+	if strings.TrimSpace(from.Constraint) != "" {
+		total, _, _, _, ok := cat.joinSideStats(from.Table, "")
+		if !ok || fromRows >= total {
+			return 0, false
+		}
+	}
+	ndv, ok := t.a.AttrNDV(keyAttr)
+	if !ok || ndv.Distinct == 0 || ndv.Records == 0 {
+		return 0, false
+	}
+	// Rounded up: a ratio of 1.4 means some keys reach two rows, and rounding it down prices
+	// those away. It does not make the result a bound -- see above -- only less optimistic,
+	// and no test pins the direction, because the skew this estimate cannot see moves it by
+	// more than a unit of rounding ever will (TestOuterDrivenPairEstimateUnderSkew).
+	fan := (ndv.Records + ndv.Distinct - 1) / ndv.Distinct
+	return fromRows * int(fan), true
 }
 
 // constraintOf is a side's constraint with the empty spelling folded into the true one, so a
@@ -315,7 +459,7 @@ func numericKey(v classad.Value) (float64, bool) {
 // `member(attr, {...})` over the values themselves. It is the same shape LookupKeys compiles
 // internally, built from an AST rather than text so the values become literals with no
 // formatting round trip to disagree about.
-func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string) *vm.Query {
+func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string, where ast.Expr) *vm.Query {
 	elems := make([]ast.Expr, 0, len(ints)+len(reals)+len(strs))
 	for _, n := range ints {
 		elems = append(elems, &ast.IntegerLiteral{Value: n})
@@ -326,10 +470,14 @@ func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string) *v
 	for _, str := range strs {
 		elems = append(elems, &ast.StringLiteral{Value: str})
 	}
-	return vm.Compile(&ast.FunctionCall{
+	member := &ast.FunctionCall{
 		Name: "member",
 		Args: []ast.Expr{ast.NewAttributeReference(attr, ast.NoScope), &ast.ListLiteral{Elements: elems}},
-	})
+	}
+	if where == nil {
+		return vm.Compile(member)
+	}
+	return vm.Compile(&ast.BinaryOp{Op: "&&", Left: where, Right: member})
 }
 
 // stage builds the hash for ONE batch: the inner rows the batch's keys reach, bucketed the
@@ -343,9 +491,9 @@ func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*
 	}
 	var ads iter.Seq[*classad.ClassAd]
 	if fast {
-		ads = od.arch.LookupKeys(od.keyAttr, ints)
+		ads = od.arch.LookupKeysWhere(od.keyAttr, ints, od.where)
 	} else {
-		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals, strs))
+		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals, strs, od.where))
 	}
 	held := 0
 	for ad := range ads {
