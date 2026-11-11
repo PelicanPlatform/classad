@@ -535,7 +535,7 @@ func (p *joinPlan) rowHalfValueAt(sp *joinStepPlan, rows []*joinRow, k int) (cla
 		return rows[0].eval(name), true
 	}
 	if al := sp.rowAliased[k]; al != nil {
-		if v, ok := al.eval(rows); ok {
+		if v, ok := al.eval(sideResolver(rows)); ok {
 			return v, true
 		}
 	}

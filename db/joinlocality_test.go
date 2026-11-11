@@ -14,11 +14,12 @@ import (
 // held side is walked once per left row. That is the classic shape for blocking an inner
 // loop, and the question is whether it costs anything in practice.
 //
-// It does not. With the per-pair WORK and the SELECTIVITY held constant, the per-pair cost is
-// flat across a 262x change in how much is held:
+// It does not. With the per-pair WORK and the SELECTIVITY held constant, the per-pair cost
+// does not rise across a 262x change in how much is held -- it falls slightly, because the
+// shapes that hold more stream fewer rows and so spend less of each pair on the read:
 //
 //	held:    125    256    512   1024   2048   4096   8192  32768
-//	ns/pair: 227.7  225.3  224.9  223.8  222.8  221.2  222.3  225.4
+//	ns/pair: 35.2   32.5   32.0   31.8   28.1   28.9   31.9   27.9
 //
 // WHY THIS BENCHMARK LOOKS THE WAY IT DOES, which is the part worth keeping. An earlier
 // version used `r.V >= l.Lo && r.V < l.Hi` and showed a 1.81x rise, which read as exactly the
