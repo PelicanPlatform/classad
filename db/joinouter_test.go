@@ -362,3 +362,113 @@ func TestOuterDrivenDeclinesAStringKeyDeclaredAsAValueAttr(t *testing.T) {
 		t.Errorf("with the gate on the join matched %d rows, want %d", got, want)
 	}
 }
+
+// TestOuterDrivenExplainDescribesTheJoinThatRuns is the bar an execution path has to clear
+// before it may decide a plan: the explained plan and the plan that runs must be the same
+// plan. A path that reports nothing leaves ExplainJoin describing the join it REPLACED.
+func TestOuterDrivenExplainDescribesTheJoinThatRuns(t *testing.T) {
+	cat := outerFixture(t, 2048, 128, 0, true)
+	spec := outerSpec(JoinInner)
+
+	// With the path off, the explain must not claim it.
+	off, err := cat.ExplainJoin(spec, JoinLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.OuterDriven {
+		t.Error("the explain claims an outer-driven plan while the path is gated off")
+	}
+
+	var ex JoinExplain
+	var st *JoinStats
+	withOuterDriven(func() {
+		var eerr error
+		if ex, eerr = cat.ExplainJoin(spec, JoinLimits{}); eerr != nil {
+			t.Fatal(eerr)
+		}
+		_, st = drainOrdered(t, cat, spec, JoinLimits{})
+	})
+	if st.OuterDrivenBatches == 0 {
+		t.Fatal("the join did not run outer-driven, so there is nothing to agree with")
+	}
+	if !ex.OuterDriven {
+		t.Fatal("the join ran outer-driven and the explain did not say so")
+	}
+	if ex.OuterDrivenBatchKeys != joinBatchKeys {
+		t.Errorf("the explain reports batches of %d, the path uses %d",
+			ex.OuterDrivenBatchKeys, joinBatchKeys)
+	}
+	// The same agreement TestExplainJoinAgreesWithTheJoinItDescribes requires of every
+	// other path: a step per step, in order, on the same side, and a step the run narrowed
+	// must not be one the explain said it could not.
+	if len(ex.Steps) != len(st.ProbeSteps) {
+		t.Fatalf("the explain has %d steps, the join ran %d", len(ex.Steps), len(st.ProbeSteps))
+	}
+	for i, s := range ex.Steps {
+		ran := st.ProbeSteps[i]
+		if s.Alias != ran.Alias {
+			t.Errorf("step %d: explain folds %s, the join folded %s", i, s.Alias, ran.Alias)
+		}
+		if ran.Keys > 0 && s.ProbeAttr == "" {
+			t.Errorf("step %s was narrowed on %s, but the explain said it could not be: %q",
+				s.Alias, ran.Attr, s.ProbeWhy)
+		}
+	}
+	if st.ProbeSteps[0].Keys == 0 {
+		t.Error("the run reported narrowing on no keys at all")
+	}
+	// The hold is a batch, not a side, and the explain has to say which -- a side-sized
+	// EstHashRows here would describe the plan this one replaces.
+	if ex.EstHashRows != 0 {
+		t.Errorf("EstHashRows = %d; an outer-driven plan holds one batch's matches", ex.EstHashRows)
+	}
+	if !strings.Contains(ex.HashWhy, "batches") {
+		t.Errorf("HashWhy does not say what is held: %q", ex.HashWhy)
+	}
+}
+
+// TestOuterDrivenExplainIsNotTheProbePathsExplain checks that ExplainJoin describes THIS
+// path rather than the one it replaces. The two agree on the attribute whenever both apply,
+// so a fixture where both apply cannot tell them apart -- and an explain that had never
+// heard of this path would pass such a test.
+//
+// So the probe is disabled, which makes its gate report the step as un-narrowable. The
+// outer-driven path does not depend on that gate, so with it on the step must still be
+// reported as narrowed, and on the key the batch resolves.
+func TestOuterDrivenExplainIsNotTheProbePathsExplain(t *testing.T) {
+	cat := outerFixture(t, 2048, 128, 0, true)
+	spec := outerSpec(JoinInner)
+
+	withoutProbe(func() {
+		off, err := cat.ExplainJoin(spec, JoinLimits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if off.Steps[0].ProbeAttr != "" {
+			t.Fatalf("the probe gate is disabled yet still reports %q; the off switch did "+
+				"not take and this test cannot discriminate", off.Steps[0].ProbeAttr)
+		}
+
+		var on JoinExplain
+		var st *JoinStats
+		withOuterDriven(func() {
+			var eerr error
+			if on, eerr = cat.ExplainJoin(spec, JoinLimits{}); eerr != nil {
+				t.Fatal(eerr)
+			}
+			_, st = drainOrdered(t, cat, spec, JoinLimits{})
+		})
+		if st.OuterDrivenBatches == 0 {
+			t.Fatal("the outer-driven path declined; nothing to describe")
+		}
+		if on.Steps[0].ProbeAttr == "" {
+			t.Errorf("the join narrowed the step on %d keys and the explain says it could "+
+				"not: %q -- the explain is still describing the probe path",
+				st.ProbeSteps[0].Keys, on.Steps[0].ProbeWhy)
+		}
+		if on.Steps[0].ProbeWhy != "" {
+			t.Errorf("the explain names a decline reason (%q) for a step it reports narrowed",
+				on.Steps[0].ProbeWhy)
+		}
+	})
+}

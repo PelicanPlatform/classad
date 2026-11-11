@@ -203,11 +203,12 @@ func mixedKeyQuery(attr string, ints []int64, reals []float64) *vm.Query {
 
 // stage builds the hash for ONE batch: the inner rows the batch's keys reach, bucketed the
 // way buildStage buckets a whole side, so the walk above cannot tell the difference.
-func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) *joinStage {
+func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*joinStage, int) {
 	st := &joinStage{step: od.step, hashed: true, buckets: map[string][]*joinRow{}}
 	ints, reals, allInt := od.batchKeys(batch)
-	if len(ints) == 0 && len(reals) == 0 {
-		return st // every key in the batch was undefined or non-numeric: nothing to look up
+	keys := len(ints) + len(reals)
+	if keys == 0 {
+		return st, 0 // every key in the batch was undefined: nothing to look up
 	}
 	var ads iter.Seq[*classad.ClassAd]
 	if allInt {
@@ -231,7 +232,7 @@ func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) *j
 	if held > stats.HashRows {
 		stats.HashRows = held
 	}
-	return st
+	return st, keys
 }
 
 // runJoinOuterDriven streams the FROM side in batches, resolving each batch's keys against the
@@ -246,6 +247,17 @@ func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) *j
 func runJoinOuterDriven[T any](p *joinPlan, od *outerDriven, scanSeq iter.Seq[*joinRow],
 	stats *JoinStats, mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool),
 	yield func(T) bool) {
+	// What the run narrowed, reported in the same shape every other path reports it, so
+	// ExplainJoin's description of this step can be checked against what the step did.
+	// Attr is known before any batch runs; Keys accumulates as batches resolve, because
+	// what this path narrows on is the whole stream's keys, one batch at a time.
+	stats.ProbeAttr = od.keyAttr
+	stats.ProbeSteps = append(stats.ProbeSteps, JoinProbeStat{
+		Alias: p.aliases[od.step.side],
+		Attr:  od.keyAttr,
+	})
+	probeStep := &stats.ProbeSteps[len(stats.ProbeSteps)-1]
+
 	wk := newJoinWalk(p)
 	rows := wk.rows
 	batch := make([]*joinRow, 0, joinBatchKeys)
@@ -254,8 +266,10 @@ func runJoinOuterDriven[T any](p *joinPlan, od *outerDriven, scanSeq iter.Seq[*j
 		if len(batch) == 0 {
 			return false
 		}
-		st := od.stage(p, batch, stats)
+		st, keys := od.stage(p, batch, stats)
 		stats.OuterDrivenBatches++
+		probeStep.Keys += keys
+		stats.ProbeKeys += keys
 		walk := makeWalk(p, []*joinStage{st}, wk, stats, mk, yield)
 		for _, l := range batch {
 			stats.ScanRows++

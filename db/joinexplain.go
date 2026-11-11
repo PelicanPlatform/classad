@@ -26,6 +26,7 @@ package db
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -51,6 +52,14 @@ type JoinExplain struct {
 	// pricing anything -- an order it may not change costs nothing to not compare.
 	OrderCost          int `json:"orderCost,omitempty"`
 	OrderAsWrittenCost int `json:"orderAsWrittenCost,omitempty"`
+	// OuterDriven reports that the plan streams the FROM side in key batches and resolves
+	// each batch against the inner side's index, holding neither side whole (db/joinouter.go).
+	// OuterDrivenBatchKeys is how many FROM rows one batch covers.
+	//
+	// It changes what EstHashRows means: on this plan the hold is one batch's matches, so
+	// there is no side-sized number to report and HashWhy says so instead.
+	OuterDriven          bool `json:"outerDriven,omitempty"`
+	OuterDrivenBatchKeys int  `json:"outerDrivenBatchKeys,omitempty"`
 	// Steps are the folds after the streamed side, in plan order.
 	Steps []JoinStepExplain `json:"steps"`
 	// Limits are what the join would actually run under: the store's own, lowered to the
@@ -220,6 +229,9 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 	// streamed one is hashed and every step is one of those sides, so the steps are exactly
 	// the sides this has to add up.
 	held, probeable, unsized := 0, []string(nil), []string(nil)
+	// The same call Join makes, and made at the same point in the plan, so that what is
+	// explained is the path that would run rather than a second opinion about it.
+	od, outerDriven := cat.planOuterDriven(p, sides)
 	for i := range steps {
 		sp := p.steps[i]
 		attrs, all, rows, _, why := cat.probeGateAll(sp, sides[sp.side])
@@ -252,6 +264,15 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 		if attr != "" {
 			probeable = append(probeable, alias)
 		}
+		if outerDriven {
+			// The index probe below never runs on this plan, so reporting its verdict
+			// would describe a decision the join does not make. What narrows this step is
+			// the batch itself.
+			attr, why = od.keyAttr, ""
+			if !slices.Contains(probeable, alias) {
+				probeable = append(probeable, alias)
+			}
+		}
 		out.Steps = append(out.Steps, JoinStepExplain{
 			Alias:      alias,
 			Kind:       joinKindName(steps[i].Kind),
@@ -262,7 +283,14 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 			Equi:       steps[i].Equi,
 		})
 	}
-	out.EstHashRows, out.HashWhy = explainHashBound(held, limits.MaxHashRows, probeable, unsized)
+	if outerDriven {
+		out.OuterDriven, out.OuterDrivenBatchKeys = true, joinBatchKeys
+		out.EstHashRows = 0
+		out.HashWhy = fmt.Sprintf("the join is driven from %s in batches of %d keys, so what "+
+			"it holds is one batch's matches rather than a side", out.Sides[0].Alias, joinBatchKeys)
+	} else {
+		out.EstHashRows, out.HashWhy = explainHashBound(held, limits.MaxHashRows, probeable, unsized)
+	}
 	return out, nil
 }
 
