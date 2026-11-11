@@ -485,11 +485,10 @@ func TestOuterDrivenExplainIsNotTheProbePathsExplain(t *testing.T) {
 // here: every arm is what a caller gets.
 //
 // The policy is the MEMORY bounds and nothing else. Within them the join is left alone
-// whatever the ratio of the sides, including the selective shape where
-// TestOuterDrivenCrossoverAgainstTheHash shows this path running several times faster --
-// because that benchmark's baseline is the build-side plan and not the index probe, and
-// the probe is what would really run there. Taking the path on selectivity needs that
-// comparison first.
+// whatever the ratio of the sides, including the band where TestOuterDrivenAgainstTheIndexProbe
+// measures this path beating both the hash and the index probe. Engaging on that band needs an
+// estimate of the PAIRS a join will produce, which is the FROM side's distinct keys times the
+// inner side's rows per key -- and the plan holds neither number at the point it decides.
 func TestOuterDrivenDefaultPolicy(t *testing.T) {
 	ratios := []struct {
 		name       string
