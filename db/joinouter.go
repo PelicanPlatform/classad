@@ -50,20 +50,68 @@ const (
 
 var joinOuterDrivenMode = outerDrivenAuto
 
-// Where the two paths cross on SPEED is measured but not yet acted on, because the
-// measurement is not yet against the right opponent.
+// Where the three paths cross on SPEED is measured, and the default still does not act on
+// it, for a reason the measurement itself supplies.
 //
-// TestOuterDrivenCrossoverAgainstTheHash sweeps the FROM side against the inner one and finds
-// a ratio rather than a row count -- 0.28x and 0.27x at ~0.3% of the inner side, 1.09x and
-// 1.75x at 20%, unchanged when the inner side grew fourfold. That would argue for taking this
-// path on selectivity alone, somewhere near 5%.
+// TestOuterDrivenAgainstTheIndexProbe runs this path against BOTH incumbents -- the hash and
+// the index probe (db/joinprobe.go) -- sweeping fan-out, how many inner rows share a key, at
+// a fixed inner side of 20,000 rows over 30 segments:
 //
-// It does not, yet. That benchmark reports ProbeKeys of 0 on every row: its baseline is the
-// build-side plan -- hash the small FROM side, stream the inner one -- and not the index
-// probe (db/joinprobe.go), which is the plan that would actually run against a selective FROM
-// side and which narrows the hashed side with the same index this path looks keys up in.
-// Beating the weaker of two incumbents is not evidence for replacing the stronger one, so the
-// default stays on the memory bounds until the comparison is made against the probe.
+//	pairs/inner   b/hash                b/probe              what the planner picks
+//	       0.3%   0.01x 0.05x 0.09x     1.41x 3.73x 4.36x    probe
+//	         5%   0.10x 0.15x 0.21x     0.12x 0.34x 0.74x    probe, probe, hash
+//	        20%   0.42x 0.47x 0.53x     0.02x 0.07x 0.41x    probe, probe, hash
+//	        80%   1.43x 1.47x 1.57x     0.01x 0.04x 0.16x    hash
+//
+// Three columns per cell, one per fan-out of 1, 8 and 64. They barely move, and that is the
+// result: the crossover against the hash is the PAIRS a join produces over the inner side's
+// rows -- about 50% -- and not the ratio of the two sides' row counts. An earlier sweep read
+// it as the latter because it held fan-out at 1, where a key count and a pair count are the
+// same number.
+//
+// Against the probe this path wins from 5% up and loses below it. That is the shape of the
+// two mechanisms: the probe folds every key into ONE membership constraint, so past the
+// store's pushdown estimate (collections, maxPushdownFrac) the index union is abandoned and
+// the constraint becomes a predicate over a full scan -- 613 ms against the hash's 24 ms at
+// 4,000 keys. Batching at 64 keys never reaches that estimate, so this path is linear in the
+// key count where the probe is not. Below 5% the probe narrows to the same rows in one query
+// and wins on the per-batch overhead this pays.
+//
+// So there is a band -- from about 5% of the inner side's rows in pairs to about 50% -- where
+// this path beats both. What is missing is not the measurement but the ESTIMATE: engaging on
+// it needs the pair count before any row is read, and a pair count is the FROM side's distinct
+// keys times the inner side's rows per key, neither of which the plan holds. The FROM side's
+// keys are counted by planIndexProbes, which already holds that side to collect them, so the
+// number exists -- one step later than the decision is made now. Until that is wired, the
+// default stays on the memory bounds, which are structural and need no estimate.
+//
+// WHAT THAT TABLE DOES NOT TRANSFER, and it is the number most likely to be quoted. The
+// crossover against the hash is ~50% of the inner side's rows ON THAT FIXTURE, whose segments
+// are 64 KiB and so carry about 670 rows each. The archive default is 8 MiB, about 50,000
+// rows, and the crossover moves with rows per segment until it saturates:
+//
+//	rows/segment   5%      20%     50%     80%    crossover
+//	         666   0.20x   0.51x   1.07x   1.40x    ~47%
+//	      10,526   0.18x   0.45x   0.81x   1.02x    ~79%
+//	      30,769   0.15x   0.40x   0.80x   1.02x    ~80%
+//
+// The last two rows differ 2x in table size and agree, so it is rows per segment rather than
+// table size, and it has saturated well before the production figure. Key ORDER moves it back:
+// at 10,526 rows per segment, appending the inner side's keys fully shuffled rather than in
+// order takes the crossover from ~70% to ~45%, because the batch's [lo,hi] span then rules out
+// no segment. That is a 1.5x effect and not the ~75x that zone tiling alone suffers, because
+// the index inside a surviving segment visits the matching rows whatever the order.
+//
+// So the band that holds across EVERY condition measured -- three rows-per-segment values,
+// three fan-outs, three key orderings -- is pairs below about 20-25% of the inner side's rows,
+// where this path ran between 0.40x and 0.58x. A default should be built on that, not on the
+// fixture-specific 50%.
+//
+// The last column is worth its own look: it is what a caller really gets, and at fan-out 64
+// the planner picks the probe at every ratio, including 80%, where the probe takes 177 ms
+// against the hash's 19 ms and this path's 28 ms. The probe's gate prices distinct keys
+// against segments and never sees how many rows a key reaches, so fan-out is invisible to it.
+// That is the probe's bug, not this path's, and it is filed separately.
 
 // outerDriven is a join the batched path can run, and what it needs to run it.
 type outerDriven struct {
@@ -179,18 +227,41 @@ func constraintOf(s JoinSide) string {
 	return "true"
 }
 
-// batchKeys is the batch's distinct keys, and whether every one of them is an integer.
+// batchKeys is the batch's distinct keys, and whether the fast lookup can serve them.
 //
-// Keys are collected as ClassAd values and folded the way the hash's bucket key folds them,
-// so that two FROM rows whose keys compare equal produce one lookup key. A row whose key is
-// undefined contributes nothing: ClassAd equality propagates undefined, so it matches no
-// inner row on either path.
-func (od *outerDriven) batchKeys(batch []*joinRow) (ints []int64, reals []float64, allInt bool) {
+// Keys are collected as ClassAd values and folded the way the hash's bucket key folds them
+// (appendKeyValue), so that two FROM rows whose keys compare equal produce one lookup key.
+// That contract admits FOUR kinds -- bool, integer, real and string -- and this must admit
+// exactly the same four. A kind dropped here is not a slower join: the inner rows carrying it
+// are never looked up, so an INNER join loses those pairs and a LEFT join null-extends rows
+// that had a match. A row whose key is any other kind contributes nothing, which is right
+// because appendKeyValue gives it no bucket either, so it matches nothing on either path.
+//
+// Strings fold to lower case, as appendKeyValue folds them, because ClassAd compares strings
+// case-insensitively -- and so does the member() the lookup compiles to, which is what lets
+// the folded literal stand for every casing of it.
+//
+// fast reports that every key is an integer, which is the only case the zone-hoisted
+// LookupKeys can serve: its keys are int64, so a real would be truncated into a key that
+// matches the wrong rows, and a string has no numeric span to hoist at all.
+func (od *outerDriven) batchKeys(batch []*joinRow) (ints []int64, reals []float64, strs []string, fast bool) {
 	seenI := map[int64]bool{}
 	seenR := map[float64]bool{}
-	allInt = true
+	seenS := map[string]bool{}
 	for _, r := range batch {
 		v := r.eval(od.rowAttr)
+		if v.IsString() {
+			str, err := v.StringValue()
+			if err != nil {
+				continue // claims a kind and will not produce it: no bucket either
+			}
+			str = strings.ToLower(str)
+			if !seenS[str] {
+				seenS[str] = true
+				strs = append(strs, str)
+			}
+			continue
+		}
 		f, ok := numericKey(v)
 		if !ok {
 			continue
@@ -202,13 +273,12 @@ func (od *outerDriven) batchKeys(batch []*joinRow) (ints []int64, reals []float6
 			}
 			continue
 		}
-		allInt = false
 		if !seenR[f] {
 			seenR[f] = true
 			reals = append(reals, f)
 		}
 	}
-	return ints, reals, allInt
+	return ints, reals, strs, len(reals) == 0 && len(strs) == 0
 }
 
 // numericKey folds a key value into the one numeric space the hash's bucket key uses, so this
@@ -241,17 +311,20 @@ func numericKey(v classad.Value) (float64, bool) {
 	return 0, false
 }
 
-// mixedKeyQuery is the constraint a batch stands for when its keys are not all integers:
+// mixedKeyQuery is the constraint a batch stands for when the fast lookup cannot serve it:
 // `member(attr, {...})` over the values themselves. It is the same shape LookupKeys compiles
 // internally, built from an AST rather than text so the values become literals with no
 // formatting round trip to disagree about.
-func mixedKeyQuery(attr string, ints []int64, reals []float64) *vm.Query {
-	elems := make([]ast.Expr, 0, len(ints)+len(reals))
+func mixedKeyQuery(attr string, ints []int64, reals []float64, strs []string) *vm.Query {
+	elems := make([]ast.Expr, 0, len(ints)+len(reals)+len(strs))
 	for _, n := range ints {
 		elems = append(elems, &ast.IntegerLiteral{Value: n})
 	}
 	for _, f := range reals {
 		elems = append(elems, &ast.RealLiteral{Value: f})
+	}
+	for _, str := range strs {
+		elems = append(elems, &ast.StringLiteral{Value: str})
 	}
 	return vm.Compile(&ast.FunctionCall{
 		Name: "member",
@@ -263,16 +336,16 @@ func mixedKeyQuery(attr string, ints []int64, reals []float64) *vm.Query {
 // way buildStage buckets a whole side, so the walk above cannot tell the difference.
 func (od *outerDriven) stage(p *joinPlan, batch []*joinRow, stats *JoinStats) (*joinStage, int, error) {
 	st := &joinStage{step: od.step, hashed: true, buckets: map[string][]*joinRow{}}
-	ints, reals, allInt := od.batchKeys(batch)
-	keys := len(ints) + len(reals)
+	ints, reals, strs, fast := od.batchKeys(batch)
+	keys := len(ints) + len(reals) + len(strs)
 	if keys == 0 {
 		return st, 0, nil // every key in the batch was undefined: nothing to look up
 	}
 	var ads iter.Seq[*classad.ClassAd]
-	if allInt {
+	if fast {
 		ads = od.arch.LookupKeys(od.keyAttr, ints)
 	} else {
-		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals))
+		ads = od.arch.Query(mixedKeyQuery(od.keyAttr, ints, reals, strs))
 	}
 	held := 0
 	for ad := range ads {
