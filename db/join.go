@@ -244,11 +244,19 @@ func (l JoinLimits) clamp(want JoinLimits) JoinLimits {
 // or it will read a truncated answer as a complete one.
 type JoinStats struct {
 	HashRows int // rows held for the hashed side
-	ScanRows int // rows streamed from the other side
-	Pairs    int // candidate pairs examined
-	Rows     int // joined rows produced
-	Groups   int // groups a reduced join returned (0 when the rows were not reduced)
-	Err      error
+	// OuterDrivenBatches counts the key batches an outer-driven join resolved against the
+	// inner side's index (db/joinouter.go). It is 0 for every other plan, which is what
+	// distinguishes a join that ran batched from one where that path declined -- a
+	// distinction no other counter here makes, since a declined path and a cheap one
+	// produce the same rows.
+	//
+	// On this path HashRows is a HIGH-WATER MARK over the batches rather than a total.
+	OuterDrivenBatches int
+	ScanRows           int // rows streamed from the other side
+	Pairs              int // candidate pairs examined
+	Rows               int // joined rows produced
+	Groups             int // groups a reduced join returned (0 when the rows were not reduced)
+	Err                error
 
 	// ProbeAttr and ProbeKeys describe an index-based equi join: the attribute the hashed
 	// side's scan was narrowed on, and how many distinct key values it was narrowed to.
@@ -542,6 +550,16 @@ func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, unordered
 	if err != nil {
 		return nil, err
 	}
+	// Before anything holds a side, see whether the join can be driven from the FROM side in
+	// key batches instead (see db/joinouter.go). It is tried FIRST because the probe planning
+	// below holds the FROM side to count its distinct keys, and this path exists not to hold
+	// a side at all.
+	if od, ok := cat.planOuterDriven(p, sides); ok {
+		return func(yield func(T) bool) {
+			runJoinOuterDriven(p, od, scanSeq, stats, mk, yield)
+		}, nil
+	}
+
 	// Before reading any step's table whole, see whether an index can be made to read only
 	// the rows whose key the FROM side actually holds (see db/joinprobe.go).
 	probes := cat.planIndexProbes(p, sides, scanSeq, stats)
