@@ -219,15 +219,15 @@ func unparseString(s string) string {
 
 // Unparse renders v as the reference unparser does (ClassAdUnParser::Unparse
 // of a Value): strings quoted and escaped, reals as "%1.15E" ("0.0" for zero),
-// lists as "{ e1,e2 }", undefined and error as their keywords. ok is false for
-// values it cannot render that way (currently nested classads).
+// lists as "{ e1,e2 }", nested classads as "[ a = 1; b = 2 ]", undefined and
+// error as their keywords. ok is false for values it cannot render that way.
 func (v Value) Unparse() (string, bool) {
 	return unparseValueNested(v)
 }
 
 // unparseValueNested renders a value as it appears inside a list literal: like
 // classadScalarString but strings are quoted and undefined/error print as their
-// keywords. Returns ok=false for nested classads (not yet supported).
+// keywords.
 func unparseValueNested(v Value) (string, bool) {
 	switch {
 	case v.IsUndefined():
@@ -239,9 +239,40 @@ func unparseValueNested(v Value) (string, bool) {
 		return unparseString(s), true
 	case v.IsList():
 		return unparseList(v)
+	case v.IsClassAd():
+		return unparseNestedAd(v)
 	default:
 		return classadScalarString(v)
 	}
+}
+
+// unparseNestedAd renders a classad value in reference sink form,
+// "[ a = 1; b = 2 ]" -- and "[  ]" when empty, because the reference
+// unparser writes the brackets with a trailing and a leading space
+// whether or not anything goes between them (src/classad/sink.cpp,
+// ClassAdUnParser::UnparseAux for a ClassAd).
+//
+// The attributes are unparsed as EXPRESSIONS, not as evaluated values:
+// an ad holds what was written, so `[a = 1 + 1]` renders back as
+// `[ a = 1 + 1 ]`, the same way a list literal keeps its elements'
+// source expressions.
+func unparseNestedAd(v Value) (string, bool) {
+	ad := v.classAd()
+	if ad == nil {
+		return "[  ]", true
+	}
+	var b strings.Builder
+	b.WriteString("[ ")
+	for i, attr := range ad.attrs() {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(unparseAttrName(attr.Name))
+		b.WriteString(" = ")
+		b.WriteString(unparseExprString(attr.Value))
+	}
+	b.WriteString(" ]")
+	return b.String(), true
 }
 
 // unparseList renders a list value in reference sink form, "{ e1,e2 }" (and
