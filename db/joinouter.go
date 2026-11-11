@@ -85,6 +85,28 @@ var joinOuterDrivenMode = outerDrivenAuto
 // number exists -- one step later than the decision is made now. Until that is wired, the
 // default stays on the memory bounds, which are structural and need no estimate.
 //
+// WHAT THAT TABLE DOES NOT TRANSFER, and it is the number most likely to be quoted. The
+// crossover against the hash is ~50% of the inner side's rows ON THAT FIXTURE, whose segments
+// are 64 KiB and so carry about 670 rows each. The archive default is 8 MiB, about 50,000
+// rows, and the crossover moves with rows per segment until it saturates:
+//
+//	rows/segment   5%      20%     50%     80%    crossover
+//	         666   0.20x   0.51x   1.07x   1.40x    ~47%
+//	      10,526   0.18x   0.45x   0.81x   1.02x    ~79%
+//	      30,769   0.15x   0.40x   0.80x   1.02x    ~80%
+//
+// The last two rows differ 2x in table size and agree, so it is rows per segment rather than
+// table size, and it has saturated well before the production figure. Key ORDER moves it back:
+// at 10,526 rows per segment, appending the inner side's keys fully shuffled rather than in
+// order takes the crossover from ~70% to ~45%, because the batch's [lo,hi] span then rules out
+// no segment. That is a 1.5x effect and not the ~75x that zone tiling alone suffers, because
+// the index inside a surviving segment visits the matching rows whatever the order.
+//
+// So the band that holds across EVERY condition measured -- three rows-per-segment values,
+// three fan-outs, three key orderings -- is pairs below about 20-25% of the inner side's rows,
+// where this path ran between 0.40x and 0.58x. A default should be built on that, not on the
+// fixture-specific 50%.
+//
 // The last column is worth its own look: it is what a caller really gets, and at fan-out 64
 // the planner picks the probe at every ratio, including 80%, where the probe takes 177 ms
 // against the hash's 19 ms and this path's 28 ms. The probe's gate prices distinct keys
