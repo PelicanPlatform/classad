@@ -93,12 +93,18 @@ func (a *aliasedCond) newMatchers() *matcherSet {
 	return &matcherSet{ms: ms}
 }
 
+// sideLookup answers (side index, attribute name) out of an accumulated row. It is the
+// shape vm.EvalAliased wants, and it is named so a walker can hold ONE of them: the closure
+// captures the row slice, whose identity never changes for the life of a walker, so building
+// it per pair allocated once per pair and the pair count is the product of the sides.
+type sideLookup = func(int, string) classad.Value
+
 // sideResolver answers (side index, attribute name) out of the row's sides.
 //
 // A side index past what the row holds, and a side that is absent -- the null-extended half
 // of an unmatched LEFT row -- both resolve undefined, which is what an absent member of the
 // composite evaluates to.
-func sideResolver(rows []*joinRow) func(int, string) classad.Value {
+func sideResolver(rows []*joinRow) sideLookup {
 	return func(side int, name string) classad.Value {
 		if side < 0 || side >= len(rows) || rows[side] == nil {
 			return classad.NewUndefinedValue()
@@ -126,8 +132,7 @@ func unqualifiedUndefined(string, ast.AttributeScope) classad.Value {
 // at evaluation, and then nothing it returned may be used: the caller must fall back to the
 // composite, because a declined term reads undefined rather than failing and the join would
 // silently return too few rows.
-func (a *aliasedCond) holds(rows []*joinRow) (held, ok bool) {
-	resolve := sideResolver(rows)
+func (a *aliasedCond) holds(resolve sideLookup) (held, ok bool) {
 	set, pooled := a.pool.Get().(*matcherSet)
 	if !pooled {
 		// Unreachable: the pool's New returns this type. Checked rather than asserted
@@ -180,11 +185,11 @@ func compileAliasedValue(src string, aliases []string) *aliasedValue {
 // eval returns the half's value for this row. ok is false when the term declined, and the
 // caller must then evaluate against a composite -- a declined term reads undefined, which
 // would silently put every row in the no-key bucket and match nothing.
-func (a *aliasedValue) eval(rows []*joinRow) (classad.Value, bool) {
+func (a *aliasedValue) eval(resolve sideLookup) (classad.Value, bool) {
 	m, ok := a.pool.Get().(*vm.Matcher)
 	if !ok {
 		m = a.q.Matcher() // unreachable; see aliasedCond.holds
 	}
 	defer a.pool.Put(m)
-	return m.EvalAliased(sideResolver(rows), unqualifiedUndefined)
+	return m.EvalAliased(resolve, unqualifiedUndefined)
 }

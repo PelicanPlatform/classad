@@ -453,10 +453,16 @@ type joinWalk struct {
 	member0       memberBody
 	member0OK     bool
 	member0Cached bool
+	// resolve reads rows, and is built once here because rows is allocated once and
+	// mutated in place: a per-pair closure over it allocated once per PAIR, which is the
+	// product of the sides and was 90% of a cartesian join's allocations.
+	resolve sideLookup
 }
 
 func newJoinWalk(p *joinPlan) *joinWalk {
-	return &joinWalk{rows: make([]*joinRow, p.nSides())}
+	w := &joinWalk{rows: make([]*joinRow, p.nSides())}
+	w.resolve = sideResolver(w.rows)
+	return w
 }
 
 // scanRow marks the start of a new FROM-side row, dropping what spliceComposite cached for
@@ -1146,7 +1152,7 @@ func (st *joinStage) indexPreserved(noKey []*joinRow) {
 // because the one caller that used to branch on it drew the wrong conclusion from it.
 func emitJoin[T any](wk *joinWalk, p *joinPlan, rows []*joinRow, stats *JoinStats,
 	mk func(wk *joinWalk, p *joinPlan, rows []*joinRow) (T, bool), yield func(T) bool) (stop bool) {
-	if !p.postHolds(rows) {
+	if !p.postHolds(rows, wk.resolve) {
 		return false
 	}
 	row, ok := mk(wk, p, rows)
@@ -1176,12 +1182,12 @@ func emitJoin[T any](wk *joinWalk, p *joinPlan, rows []*joinRow, stats *JoinStat
 // reference through its alias is undefined, exactly as it is for the ON condition. Dropping
 // the row here does NOT bring it back null-extended: run decides that from whether the pair
 // MATCHED, which is a separate question answered before this.
-func (p *joinPlan) postHolds(rows []*joinRow) bool {
+func (p *joinPlan) postHolds(rows []*joinRow, resolve sideLookup) bool {
 	if len(p.post) == 0 {
 		return true
 	}
 	if p.postAlias != nil {
-		if held, ok := p.postAlias.holds(rows); ok {
+		if held, ok := p.postAlias.holds(resolve); ok {
 			return held
 		}
 	}
@@ -1248,12 +1254,12 @@ func project(ad *classad.ClassAd, attrs []string) *classad.ClassAd {
 // not commutative: the only way `A && B` is true is for both to be true, which does not
 // depend on their order. The VALUE of the conjunction is order-dependent; the match set is
 // not.
-func (p *joinPlan) condHolds(step *joinStepPlan, rows []*joinRow) bool {
+func (p *joinPlan) condHolds(step *joinStepPlan, rows []*joinRow, resolve sideLookup) bool {
 	if len(step.cond) == 0 {
 		return true
 	}
 	if step.condAlias != nil {
-		if held, ok := step.condAlias.holds(rows); ok {
+		if held, ok := step.condAlias.holds(resolve); ok {
 			return held
 		}
 	}
@@ -1272,7 +1278,7 @@ func (p *joinPlan) condHolds(step *joinStepPlan, rows []*joinRow) bool {
 // row answers without being decoded and which is the only shape the two-table spelling ever
 // had; a qualified reference the alias compiler took, read out of the sides directly; and
 // anything else, evaluated against a composite of the row so far.
-func (p *joinPlan) rowKey(step *joinStepPlan, rows []*joinRow) (string, bool) {
+func (p *joinPlan) rowKey(step *joinStepPlan, rows []*joinRow, resolve sideLookup) (string, bool) {
 	var b strings.Builder
 	for i := range step.equiRow {
 		var v classad.Value
@@ -1283,7 +1289,7 @@ func (p *joinPlan) rowKey(step *joinStepPlan, rows []*joinRow) (string, bool) {
 			}
 			v = rows[0].eval(step.equiRowAttr[i])
 		case step.rowAliased[i] != nil:
-			got, ok := step.rowAliased[i].eval(rows)
+			got, ok := step.rowAliased[i].eval(resolve)
 			if !ok {
 				v = step.equiRow[i].Eval(p.rowHalfScope(step, rows))
 			} else {
@@ -1428,7 +1434,7 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 		// by a right-outer step, so an ordinary join never pays the second map lookup.
 		base := 0
 		if st.hashed {
-			k, ok := p.rowKey(st.step, rows)
+			k, ok := p.rowKey(st.step, rows, wk.resolve)
 			if !ok {
 				candidates = nil // an undefined key matches nothing
 			} else {
@@ -1449,7 +1455,7 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 			rows[st.step.side] = r
 			// The hash only narrowed the candidates; the condition decides, in full,
 			// with ClassAd's own semantics.
-			if !p.condHolds(st.step, rows) {
+			if !p.condHolds(st.step, rows, wk.resolve) {
 				continue
 			}
 			// The pair matched. Whether the finished row then survives the post-filter
