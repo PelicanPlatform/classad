@@ -66,9 +66,24 @@ func planJoinRead(spec JoinSpec) joinReadProjection {
 	if forceWholeRead {
 		return whole
 	}
+	// A semi or anti step's side is not in the row, so its output projection is empty
+	// whatever the caller wrote -- compileJoin refuses a Project on one. Standing that
+	// empty projection in here is what narrows its read to the attributes its own
+	// condition tests, which for an anti join against a wide table is the difference
+	// between reading one attribute and reading every ad whole.
+	project := make([][]string, len(sides))
+	for i, sd := range sides {
+		project[i] = sd.Project
+	}
 	anyProjected := false
-	for _, sd := range sides {
-		if sd.Project != nil {
+	for i := range steps {
+		if !steps[i].Kind.carriesSide() && i+1 < len(project) {
+			project[i+1] = []string{}
+			anyProjected = true
+		}
+	}
+	for _, pr := range project {
+		if pr != nil {
 			anyProjected = true
 		}
 	}
@@ -173,7 +188,7 @@ func planJoinRead(spec JoinSpec) joinReadProjection {
 	out := make(joinReadProjection, len(sides))
 	for i := range sides {
 		if ok[i] {
-			out[i] = sets[i].union(sides[i].Project)
+			out[i] = sets[i].union(project[i])
 		}
 	}
 	return out

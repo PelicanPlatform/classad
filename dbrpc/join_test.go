@@ -135,6 +135,8 @@ func TestJoinOverTheWireAgreesWithTheInProcessJoin(t *testing.T) {
 	cases := map[string]JoinRequest{
 		"inner":      equiReq(db.JoinInner),
 		"left":       equiReq(db.JoinLeft),
+		"semi":       equiReq(db.JoinSemi),
+		"anti":       equiReq(db.JoinAnti),
 		"cross":      {Spec: db.JoinSpec{Kind: db.JoinCross, Left: db.JoinSide{Table: "jobs", Alias: "j"}, Right: db.JoinSide{Table: "hist", Alias: "h"}}},
 		"theta":      {Spec: db.JoinSpec{Kind: db.JoinInner, Left: db.JoinSide{Table: "jobs", Alias: "j"}, Right: db.JoinSide{Table: "hist", Alias: "h"}, Cond: []string{"j.ClusterId < h.ClusterId"}}},
 		"post":       {Spec: db.JoinSpec{Kind: db.JoinInner, Left: db.JoinSide{Table: "jobs", Alias: "j"}, Right: db.JoinSide{Table: "hist", Alias: "h"}, Cond: []string{"j.ClusterId == h.ClusterId"}, Equi: []db.JoinEqui{{Left: "ClusterId", Right: "ClusterId"}}, Post: []string{"h.ExitCode == 0"}}},

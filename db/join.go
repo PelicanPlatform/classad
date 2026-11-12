@@ -68,7 +68,28 @@ const (
 	JoinLeft
 	// JoinCross pairs every row with every row; its condition, if any, decides.
 	JoinCross
+	// JoinSemi keeps a row once when this side has at least one match, and carries nothing
+	// from this side into it. It is SQL's `EXISTS`: the question is whether a match exists,
+	// not what matched, so the walk stops at the first one and the row's fan-out over this
+	// side is one however many rows matched.
+	JoinSemi
+	// JoinAnti keeps a row when this side has no match at all, and carries nothing from this
+	// side into it. It is SQL's `NOT EXISTS`.
+	//
+	// It is the kind a `LEFT JOIN ... WHERE <right key> =?= undefined` was emulating, and it
+	// differs from that emulation in what it costs rather than in what it answers: the
+	// emulation forms every matching pair and then drops it, so a row that matched a hundred
+	// times paid a hundred pairs to establish that it matched once.
+	JoinAnti
 )
+
+// carriesSide reports whether a step of this kind puts its side INTO the joined row.
+//
+// Semi and anti joins do not: they test for a match and contribute nothing, so the side is
+// absent from every row they emit, exactly as the unmatched half of a LEFT join is. That one
+// fact is what the rest of their handling follows from -- nothing downstream may read the
+// side, and nothing of it needs to be read but what its own condition tests.
+func (k JoinKind) carriesSide() bool { return k != JoinSemi && k != JoinAnti }
 
 // joinRightOuter is a LEFT join with its sides exchanged: the preserved side is HASHED and
 // the other is streamed, so the unmatched preserved rows are the ones left over in the hash
@@ -89,17 +110,23 @@ const (
 // It is always the ONLY step of a two-table join, because planBuildSide declines a chain and
 // planChainOrder reorders only inner steps. That is what makes the tail pass a row with one
 // side in it: there is no earlier side for a null-extended row to also carry.
-const joinRightOuter JoinKind = 3
+const joinRightOuter JoinKind = 5
 
-// validateJoinKinds refuses a kind that is not one of the three a caller may write.
+// validateJoinKinds refuses a kind that is not one a caller may write.
 //
 // It guards joinRightOuter, which the planner introduces AFTER this runs and which means
-// something quite different from the kinds around it: a spec arriving with kind 3 would
-// otherwise be executed as a right-outer join over sides the caller wrote the other way
-// round. Everything above JoinCross used to behave as JoinInner -- no comparison in the
-// walk matched it -- so refusing it costs nothing a caller was relying on.
+// something quite different from the kinds around it: a spec arriving with that number
+// would otherwise be executed as a right-outer join over sides the caller wrote the other
+// way round. It is numbered above the kinds a caller may write so that those stay
+// contiguous and a new one can be added without moving it.
 func validateJoinKinds(spec JoinSpec) error {
-	ok := func(k JoinKind) bool { return k == JoinInner || k == JoinLeft || k == JoinCross }
+	ok := func(k JoinKind) bool {
+		switch k {
+		case JoinInner, JoinLeft, JoinCross, JoinSemi, JoinAnti:
+			return true
+		}
+		return false
+	}
 	if !ok(spec.Kind) {
 		return fmt.Errorf("join: unknown join kind %d", int(spec.Kind))
 	}
@@ -718,6 +745,10 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 		seen[strings.ToLower(sd.Alias)] = true
 		p.aliases = append(p.aliases, sd.Alias)
 		p.projects = append(p.projects, sd.Project)
+	}
+
+	if semiErr := refuseSemiSideRefs(sides, steps, spec.Post, p.aliases); semiErr != nil {
+		return nil, semiErr
 	}
 
 	if p.post, err = compileAll("WHERE", spec.Post); err != nil {
@@ -1444,6 +1475,10 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 				}
 			}
 		}
+		// A semi or anti step asks only whether a match EXISTS. It contributes no side to
+		// the row, so there is nothing to descend once per match with: the walk stops at the
+		// first matching candidate and descends once, or not at all.
+		existence := !st.step.kind.carriesSide()
 		matched := false
 		for i, r := range candidates {
 			stats.Pairs++
@@ -1471,16 +1506,32 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 			if st.tracksMatches() && !st.matched[base+i].Load() {
 				st.matched[base+i].Store(true)
 			}
+			if existence {
+				// One match answers the question and a second cannot change the
+				// answer. Stopping here is where a semi or anti join's whole saving
+				// comes from: the pairs it examines are bounded by one per row rather
+				// than by this side's fan-out.
+				break
+			}
 			if walk(depth + 1) {
 				return true
 			}
 		}
 		rows[st.step.side] = nil
+		switch {
+		case existence:
+			// The side is left nil above, so the descent carries the row WITHOUT it --
+			// which is what makes a semi or anti join contribute no member, by the same
+			// route the unmatched half of a LEFT join contributes none.
+			if matched == (st.step.kind == JoinSemi) {
+				return walk(depth + 1)
+			}
+			return false
 		// A side is null-extendable exactly when ITS OWN step is a LEFT join. Every
 		// earlier side is preserved by every later step, so being preserved once is
 		// being preserved throughout -- which is why this is one comparison and not a
 		// walk back along the chain.
-		if !matched && st.step.kind == JoinLeft {
+		case !matched && st.step.kind == JoinLeft:
 			return walk(depth + 1)
 		}
 		return false
