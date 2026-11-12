@@ -1243,12 +1243,13 @@ func TestOuterDrivenPairBoundTracksTheJoin(t *testing.T) {
 					t.Errorf("limit=%d: bound %d is BELOW the %d pairs the join produced; "+
 						"it is not a bound", limit, bound, len(rows))
 				}
-				// Loose enough for a sketched NDV to round a fan of 1.02 up to 2, tight
-				// enough that a bound which stopped tracking the query would fail -- which
-				// is what an unpriced FROM side did, returning the same number for every
-				// limit.
-				if bound > 4*len(rows) {
-					t.Errorf("limit=%d: bound %d is more than 4x the %d pairs produced",
+				// Loose enough for a sketched NDV's error on a small result, tight enough
+				// to fail two things that have happened: an unpriced FROM side, which
+				// returned the same number for every limit, and rounding the rows-per-key
+				// ratio up to a whole number, which doubles every estimate on a table whose
+				// keys are nearly unique.
+				if bound > 2*len(rows) {
+					t.Errorf("limit=%d: bound %d is more than 2x the %d pairs produced",
 						limit, bound, len(rows))
 				}
 			}
@@ -1506,5 +1507,43 @@ func TestOuterDrivenEngagesOnAPricedFromSide(t *testing.T) {
 	if st.OuterDrivenBatches == 0 {
 		t.Fatalf("the batched path declined a join of %d pairs over %d inner rows with the "+
 			"FROM side priced at %d of %d", st.Pairs, innerRows, priced, fromTotal)
+	}
+}
+
+// The rows-per-key ratio is multiplied in as a ratio, not rounded up to a whole number of
+// rows first. On a table whose keys are nearly unique the true ratio is a little over 1, and
+// rounding it up to 2 doubles every estimate built on it -- a systematic multiplier sitting
+// exactly where the floor and the cap are, not the unit of slack it looks like.
+//
+// Asserted on the ESTIMATE rather than on which path ran, because the path is what the
+// thresholds decide and this is about the number they are given.
+func TestOuterDrivenPairEstimateKeepsTheRatio(t *testing.T) {
+	cat := fanFixture(t, 20_000, 1, 65536)
+	spec := outerSpec(JoinInner)
+	spec.Left.Constraint = "ClusterId <= 4000"
+	p, sides, err := planFor(cat, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, ok := cat.ArchiveTable(sides[p.steps[0].side].Table)
+	if !ok {
+		t.Fatal("no archive table for the inner side")
+	}
+	est, ok := cat.outerDrivenPairEstimate(sides, p.steps[0], tb, p.steps[0].equiSideAttr[0])
+	if !ok {
+		t.Fatal("the estimate could not be computed")
+	}
+	rows, st := drainOrdered(t, cat, spec, JoinLimits{})
+	if st.Err != nil {
+		t.Fatal(st.Err)
+	}
+	// One row per key, so the estimate should be within a sketch's error of the pairs. A
+	// ratio rounded up to 2 lands at twice this and fails.
+	if est > 3*len(rows)/2 {
+		t.Errorf("estimate %d for %d pairs at a fan-out of 1: the rows-per-key ratio was "+
+			"rounded up rather than multiplied in", est, len(rows))
+	}
+	if est < len(rows) {
+		t.Errorf("estimate %d is below the %d pairs produced", est, len(rows))
 	}
 }
