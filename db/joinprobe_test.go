@@ -255,12 +255,18 @@ func TestJoinIndexProbeDeclinesWhenItsWorkOutweighsTheScan(t *testing.T) {
 }
 
 // The key cap is the backstop below the cost model, and declines for its own reason.
+//
+// The batched path is declined for the length of it. Lowering the cap is what this test
+// does, and the batched path's pair floor READS the cap (floorStands): a cap the FROM side
+// exceeds means no probe below that floor, so the floor lifts and the batched path takes the
+// join -- reporting ProbeKeys of its own, from a path this test is not about.
 func TestJoinIndexProbeDeclinesPastTheKeyCap(t *testing.T) {
 	old := maxProbeKeys
 	maxProbeKeys = 8
 	defer func() { maxProbeKeys = old }()
 	cat := probeFixture(t, 4096, 64, true)
-	_, st := drainProbe(t, cat, probeSpec(JoinInner))
+	var st *JoinStats
+	withoutOuterDriven(func() { _, st = drainProbe(t, cat, probeSpec(JoinInner)) })
 	if st.ProbeKeys != 0 {
 		t.Fatalf("the probe fired past the key cap")
 	}

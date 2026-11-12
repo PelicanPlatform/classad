@@ -122,7 +122,13 @@ func TestOuterDrivenAgreesWithTheHashJoin(t *testing.T) {
 	for _, kind := range []JoinKind{JoinInner, JoinLeft} {
 		t.Run(fmt.Sprintf("kind%d", kind), func(t *testing.T) {
 			cat := outerFixture(t, 2048, 128, 17, true)
-			want, wst := drainOrdered(t, cat, outerSpec(kind), JoinLimits{})
+			// The baseline is the hash path, and it is asked for explicitly: the
+			// default takes this fixture now, because the probe declines on it (145
+			// keys reaching 145 records of 2,048) and the floor lifts where there is
+			// no probe below it.
+			var want []string
+			var wst *JoinStats
+			withoutOuterDriven(func() { want, wst = drainOrdered(t, cat, outerSpec(kind), JoinLimits{}) })
 			if wst.Err != nil {
 				t.Fatalf("hash join stopped early: %v", wst.Err)
 			}
@@ -163,7 +169,10 @@ func TestOuterDrivenAgreesWithTheHashJoin(t *testing.T) {
 func TestOuterDrivenHoldsOneBatchNotTheTable(t *testing.T) {
 	const big, small = 4096, 256
 	cat := outerFixture(t, big, small, 0, true)
-	_, wst := drainOrdered(t, cat, outerSpec(JoinInner), JoinLimits{})
+	// Explicitly the hash path: the default takes this fixture now (the probe declines on
+	// it), and what the hash HOLDS is the comparison this test exists for.
+	var wst *JoinStats
+	withoutOuterDriven(func() { _, wst = drainOrdered(t, cat, outerSpec(JoinInner), JoinLimits{}) })
 	if wst.HashRows < big {
 		t.Fatalf("the hash path held %d rows of a %d-row inner table; the fixture is not "+
 			"exercising a whole-side hold", wst.HashRows, big)
@@ -358,11 +367,15 @@ func TestOuterDrivenExplainDescribesTheJoinThatRuns(t *testing.T) {
 	cat := outerFixture(t, 2048, 128, 0, true)
 	spec := outerSpec(JoinInner)
 
-	// With the path off, the explain must not claim it.
-	off, err := cat.ExplainJoin(spec, JoinLimits{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// With the path off, the explain must not claim it. Off is asked for rather than
+	// assumed: the default takes this fixture now, since the probe declines on it.
+	var off JoinExplain
+	withoutOuterDriven(func() {
+		var err error
+		if off, err = cat.ExplainJoin(spec, JoinLimits{}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if off.OuterDriven {
 		t.Error("the explain claims an outer-driven plan while the path is gated off")
 	}
@@ -465,17 +478,23 @@ func TestOuterDrivenExplainIsNotTheProbePathsExplain(t *testing.T) {
 // here: every arm is what a caller gets.
 //
 // Over either memory bound the path is taken whatever it costs, because the alternative is
-// not a slower plan but no plan. Under them it has to be cheaper, and both ratios here are
-// outside the band where it is: the selective arm produces too FEW pairs, where the index
-// probe reaches the same rows in one query, and the comparable arm too many, where holding
-// the inner side once is as cheap. TestOuterDrivenEngagesOnTheMeasuredBand covers between
-// them.
+// not a slower plan but no plan. Under them it has to be cheaper, and the two ratios left
+// alone here are outside the band where it is: the selective arm produces too FEW pairs,
+// where the index probe reaches the same rows in one query, and the comparable arm too many,
+// where holding the inner side once is as cheap. TestOuterDrivenEngagesOnTheMeasuredBand
+// covers between them.
+//
+// "Too few pairs" means too few FOR THE PROBE, which is what the floor defers to, so the
+// selective arm is sized where the probe really does take the join -- 64 keys reaching 64
+// records of 4,096, inside its 0.135 share. At 128 keys the same fixture is past that share,
+// the probe declines, and the floor lifts: that is the third arm, and on it this path runs
+// at 0.11x of the hash (4.75ms against 534us, medians of 5).
 func TestOuterDrivenDefaultPolicy(t *testing.T) {
 	ratios := []struct {
 		name       string
 		big, small int
 	}{
-		{"selective FROM", 4096, 128},   // 3.1%, where the path is likely faster
+		{"selective FROM", 4096, 64},    // 1.6%, few enough pairs that the probe takes it
 		{"comparable FROM", 4096, 2048}, // 50%, where it is measurably slower
 	}
 	for _, r := range ratios {
@@ -495,6 +514,32 @@ func TestOuterDrivenDefaultPolicy(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("under the floor with no probe below it is taken", func(t *testing.T) {
+		const big, small = 4096, 128
+		cat := outerFixture(t, big, small, 0, true)
+		spec := outerSpec(JoinInner)
+		// The premise, asserted rather than assumed: with this path declined the probe
+		// does not take the join either, so the floor has nothing to defer to and the
+		// alternative is the hash reading all 4,096 rows.
+		var pst *JoinStats
+		withoutOuterDriven(func() { _, pst = drainOrdered(t, cat, spec, JoinLimits{}) })
+		if pst.ProbeKeys != 0 {
+			t.Fatalf("the probe took the join (%d keys); the arm is not the shape it claims",
+				pst.ProbeKeys)
+		}
+		rows, st := drainOrdered(t, cat, spec, JoinLimits{})
+		if st.Err != nil {
+			t.Fatal(st.Err)
+		}
+		if st.OuterDrivenBatches == 0 {
+			t.Errorf("the default left %d pairs of a %d-row inner side to the hash, with no "+
+				"probe below the floor", len(rows), big)
+		}
+		if len(rows) != small {
+			t.Errorf("joined %d rows, want %d", len(rows), small)
+		}
+	})
 
 	t.Run("over the row bound is taken", func(t *testing.T) {
 		const big, small = 4096, 2048
@@ -1211,6 +1256,70 @@ func TestOuterDrivenEngagesOnTheMeasuredBand(t *testing.T) {
 	}
 }
 
+// TestOuterDrivenLiftsTheFloorWhereTheProbeDeclines pins the floor's condition at both
+// outcomes on ONE fixture, so what separates the arms is the pairs and nothing else.
+//
+// The floor says the probe reaches these rows in one query for less. Where the probe runs,
+// that is the measured answer and the floor stands. Where the probe declines on its own cost
+// rule, the sentence is empty and the join falls to the hash instead -- which is what this
+// lifts. Both halves are asserted, including that the probe really does decline, because a
+// test of the first half alone would pass with the condition deleted.
+func TestOuterDrivenLiftsTheFloorWhereTheProbeDeclines(t *testing.T) {
+	// Fan-out 1, where a key count and a pair count are the same number: the probe's rule
+	// is 4*keys + pairs <= 0.135 * 20,000, so it declines above about 540 pairs, well
+	// under the 2,048-pair floor.
+	cat := bandFixture(t, 20_000, 1)
+	for _, c := range []struct {
+		name    string
+		limit   int
+		keyCap  int  // maxProbeKeys for the arm, 0 for its production value
+		probe   bool // whether the index probe takes the join with this path declined
+		batched bool
+	}{
+		{"the probe runs, so the floor stands", 256, 0, true, false},
+		{"the probe declines on cost, so the floor lifts", 1024, 0, false, true},
+		// The key cap is the other way the probe declines. Reaching it at production
+		// settings needs an inner side over about 38,000 rows -- below that the work rule
+		// declines first -- so the cap is moved to the fixture rather than the fixture to
+		// the cap. What is asserted is the same: the floor reads the cap.
+		{"the probe declines on the key cap, so the floor lifts", 256, 100, false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.keyCap > 0 {
+				old := maxProbeKeys
+				maxProbeKeys = c.keyCap
+				defer func() { maxProbeKeys = old }()
+			}
+			spec := outerSpec(JoinInner)
+			spec.Left.Constraint = fmt.Sprintf("ClusterId <= %d", c.limit)
+
+			// What the probe does with this path out of the way, which is the thing the
+			// floor defers to.
+			var pst *JoinStats
+			withoutOuterDriven(func() { _, pst = drainOrdered(t, cat, spec, JoinLimits{}) })
+			if pst.Err != nil {
+				t.Fatal(pst.Err)
+			}
+			if got := pst.ProbeKeys > 0; got != c.probe {
+				t.Fatalf("the probe fired=%v, want %v (%q); the arm is not the shape it claims",
+					got, c.probe, pst.ProbeWhy)
+			}
+
+			rows, st := drainOrdered(t, cat, spec, JoinLimits{})
+			if st.Err != nil {
+				t.Fatal(st.Err)
+			}
+			if len(rows) != c.limit {
+				t.Fatalf("joined %d rows, want %d", len(rows), c.limit)
+			}
+			if got := st.OuterDrivenBatches > 0; got != c.batched {
+				t.Errorf("batched=%v, want %v for %d pairs under the %d-pair floor",
+					got, c.batched, len(rows), joinBatchedPairFloor)
+			}
+		})
+	}
+}
+
 // TestOuterDrivenPairBoundTracksTheJoin keeps the bound honest about the thing it bounds. It
 // is the only input the cost rule has, so a bound that drifted from the pairs a join really
 // produces would move the policy silently -- engaging where the probe is quicker, or
@@ -1230,7 +1339,7 @@ func TestOuterDrivenPairBoundTracksTheJoin(t *testing.T) {
 				if !ok {
 					t.Fatal("no archive table for the inner side")
 				}
-				bound, ok := cat.outerDrivenPairEstimate(sides, p.steps[0], tb,
+				bound, _, ok := cat.outerDrivenPairEstimate(sides, p.steps[0], tb,
 					p.steps[0].equiSideAttr[0])
 				if !ok {
 					t.Fatalf("limit=%d: the bound could not be computed", limit)
@@ -1438,7 +1547,7 @@ func TestOuterDrivenPairEstimateUnderSkew(t *testing.T) {
 	if !ok {
 		t.Fatal("no archive table for the inner side")
 	}
-	est, ok := cat.outerDrivenPairEstimate(sides, p.steps[0], tb, p.steps[0].equiSideAttr[0])
+	est, _, ok := cat.outerDrivenPairEstimate(sides, p.steps[0], tb, p.steps[0].equiSideAttr[0])
 	if !ok {
 		t.Fatal("the estimate could not be computed")
 	}
@@ -1529,7 +1638,7 @@ func TestOuterDrivenPairEstimateKeepsTheRatio(t *testing.T) {
 	if !ok {
 		t.Fatal("no archive table for the inner side")
 	}
-	est, ok := cat.outerDrivenPairEstimate(sides, p.steps[0], tb, p.steps[0].equiSideAttr[0])
+	est, _, ok := cat.outerDrivenPairEstimate(sides, p.steps[0], tb, p.steps[0].equiSideAttr[0])
 	if !ok {
 		t.Fatal("the estimate could not be computed")
 	}
