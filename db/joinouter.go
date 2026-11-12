@@ -47,6 +47,20 @@ import (
 // says the axis is pairs. Either side of the knee the whole join runs in tens of
 // milliseconds, so the floor buys safety cheaply.
 //
+// The floor is CONDITIONAL on the probe, because the probe is the whole of its reason: it
+// does not say this path is slow below 2,048 pairs, it says something else is quicker, and
+// that sentence is empty where the probe declines (floorStands). Since the probe's gate began
+// pricing the records a key reaches as well as the lookups, it declines at low fan-out too --
+// at fan-out 1 a key and a pair are the same number, so it declines above roughly 0.027 of
+// the inner side -- and the band between there and the floor fell through to the hash.
+// Measured at 1,024 pairs and 20,000 inner rows, that band costs 2.6x at 42 rows per segment
+// (hash 10.1ms, this path 3.9ms) and 4.4x at 681 (14.9ms against 3.4ms); at 400,000 inner
+// rows and 1,536 pairs it costs 20.5x (457.8ms against 22.3ms).
+//
+// Where the probe does run, the floor stands and this path still declines: on a 400,000-row
+// inner side at 256 pairs the probe takes 5.3ms against this path's 19.0ms at fan-out 1, and
+// leads at fan-outs 8 and 64 as well.
+//
 // The cap is a fraction, because what it prices is reading the inner side whole. It is set
 // where this path clearly WINS rather than where it stops losing, and those are far apart:
 // the crossover against the hash is ~80% of the inner side's rows at the archive's default
@@ -292,12 +306,12 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 		// produce, which is the axis every measurement of these three paths lands on, and
 		// which nothing in the plan holds -- so it is BOUNDED rather than estimated.
 		if !overRows && !overBytes {
-			pairs, ok := cat.outerDrivenPairEstimate(sides, step, t, keyAttr)
+			pairs, fromRows, ok := cat.outerDrivenPairEstimate(sides, step, t, keyAttr)
 			if !ok {
 				return nil, false
 			}
-			if pairs < joinBatchedPairFloor {
-				return nil, false // the probe reaches these rows in one query for less
+			if pairs < joinBatchedPairFloor && floorStands(fromRows, pairs, rows) {
+				return nil, false // something below this path reaches these rows for less
 			}
 			if float64(pairs) > joinBatchedPairFrac*float64(rows) {
 				return nil, false // enough of the inner side that holding it once is as cheap
@@ -326,18 +340,18 @@ func (cat *Catalog) planOuterDriven(p *joinPlan, sides []JoinSide) (*outerDriven
 // A side that cannot be priced declines the path rather than being guessed at: an unknown
 // size is not evidence of a convenient one.
 func (cat *Catalog) outerDrivenPairEstimate(sides []JoinSide, step *joinStepPlan,
-	t *ArchiveTable, keyAttr string) (int, bool) {
+	t *ArchiveTable, keyAttr string) (pairs, fromRows int, ok bool) {
 	// sides[0] is the streamed side -- the FROM side -- as JoinExplain reports it, and the
 	// step names the side folded into it. Deriving the FROM side as "the other one" instead
 	// read the INNER side's row count here, which carries no constraint of the caller's, so
 	// the bound came out the same whatever the query asked for.
 	if len(sides) != 2 || step.side == 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	from := sides[0]
 	fromRows, sized := cat.sideReadSize(from)
 	if !sized || fromRows <= 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	// A constrained side whose count came back at the table's own size was not priced: the
 	// store could not answer the constraint from an index and fell back to the total. That
@@ -346,14 +360,14 @@ func (cat *Catalog) outerDrivenPairEstimate(sides []JoinSide, step *joinStepPlan
 	// refused rather than used, because a bound that cannot see selectivity would engage or
 	// decline a whole table at a time on a figure the query has no influence over.
 	if strings.TrimSpace(from.Constraint) != "" {
-		total, _, _, _, ok := cat.joinSideStats(from.Table, "")
-		if !ok || fromRows >= total {
-			return 0, false
+		total, _, _, _, sok := cat.joinSideStats(from.Table, "")
+		if !sok || fromRows >= total {
+			return 0, 0, false
 		}
 	}
-	ndv, ok := t.a.AttrNDV(keyAttr)
-	if !ok || ndv.Distinct == 0 || ndv.Records == 0 {
-		return 0, false
+	ndv, nok := t.a.AttrNDV(keyAttr)
+	if !nok || ndv.Distinct == 0 || ndv.Records == 0 {
+		return 0, 0, false
 	}
 	// The ratio is kept as a ratio and multiplied in, rather than rounded to a whole number
 	// of rows per key first. Rounding it up looks like a unit of slack and is not one near
@@ -364,8 +378,55 @@ func (cat *Catalog) outerDrivenPairEstimate(sides []JoinSide, step *joinStepPlan
 	//
 	// The product is rounded up instead, which is the slack that was wanted: at most one
 	// row, whatever the ratio.
-	pairs := float64(fromRows) * float64(ndv.Records) / float64(ndv.Distinct)
-	return int(math.Ceil(pairs)), true
+	est := float64(fromRows) * float64(ndv.Records) / float64(ndv.Distinct)
+	return int(math.Ceil(est)), fromRows, true
+}
+
+// floorStands reports whether a join under the pair floor has anything cheaper than this
+// path to fall to. The floor's whole premise is that it does -- "the probe reaches these rows
+// in one query for less" -- and that sentence is empty where the probe declines.
+//
+// The probe's decision is EVALUATED here rather than asked of planIndexProbes, because
+// join.go consults this path first and returns early. That ordering is deliberate: deciding
+// the probe holds the FROM side, which is the cost this path exists not to pay. What the
+// probe's gate is an expression over -- the FROM side's keys, the pairs they reach, the inner
+// side's rows -- the plan already holds, two of them exactly.
+//
+// The two it holds inexactly are both substituted upwards:
+//
+//   - Distinct FROM keys are unknown here, so the FROM side's priced ROW count stands in. A
+//     key cannot appear in more rows than that side has, so it is an upper bound.
+//   - The pair count is this path's estimate, ceil(fromRows * Records/Distinct). The probe's
+//     own is keys * int(Records/Distinct), TRUNCATED -- at a ratio of 1.9999 it prices a
+//     fan-out of 1 -- so this figure is the larger of the two.
+//
+// A larger key count and a larger pair count both read as more probe work, which reads as
+// "the probe declines", which KEEPS this path. Both errors widen this path rather than hand
+// a join to a probe that would not take it.
+//
+// Checked against the probe's real decision at 86 points: 56 on a 20,000-row inner side
+// (fan-out 1, 2, 8 and 64, at 42 and 681 rows per segment, pair counts 256 to 4,096) and 30
+// on a 400,000-row one (fan-out 1, 8 and 64, at 681 and 21,053 rows per segment). They agree
+// at 81. All five disagreements are that conservative direction -- the probe would have run
+// and this path takes the join instead -- and at all five this path is the quicker of the two
+// anyway, by 1.4x to 9.6x. Two of the five sit above the floor, where the rule never asks
+// this question at all.
+//
+// minProbeRows is NOT read as the probe declining, and that is the one asymmetry here. Below
+// it the probe is not considered at all, but its reason -- reading a small side whole is
+// cheap enough that the decision is not worth its own cost -- holds for this path too, and
+// the measurement agrees: on an inner side narrowed by its own indexed constraint to 89 to
+// 505 records inside tables of 20,000 and 100,000 rows, this path runs at 0.31x to 1.24x of
+// the hash, parity rather than a win, every arm inside 6 ms. So the floor stands there, and
+// is lifted only where the probe declines on COST -- its work rule or its key cap.
+func floorStands(fromRows, pairs, innerRows int) bool {
+	if innerRows < minProbeRows {
+		return true // too small for the probe to be considered, and too small to matter
+	}
+	if fromRows > maxProbeKeys {
+		return false // more distinct keys than one membership constraint may carry
+	}
+	return float64(probeSegVisits*fromRows+pairs) <= probeWorkFrac*float64(innerRows)
 }
 
 // constraintOf is a side's constraint with the empty spelling folded into the true one, so a
