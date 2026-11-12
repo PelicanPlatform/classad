@@ -55,7 +55,9 @@ import (
 // the inner side -- and the band between there and the floor fell through to the hash.
 // Measured at 1,024 pairs and 20,000 inner rows, that band costs 2.6x at 42 rows per segment
 // (hash 10.1ms, this path 3.9ms) and 4.4x at 681 (14.9ms against 3.4ms); at 400,000 inner
-// rows and 1,536 pairs it costs 20.5x (457.8ms against 22.3ms).
+// rows and 1,536 pairs it costs at least 16x (338ms against 21ms). The last figure is the
+// lower of two runs that disagreed by a quarter on the hash arm alone, which is the
+// precision these absolute times have -- the ratio within a run is the comparison.
 //
 // Where the probe does run, the floor stands and this path still declines: on a 400,000-row
 // inner side at 256 pairs the probe takes 5.3ms against this path's 19.0ms at fan-out 1, and
