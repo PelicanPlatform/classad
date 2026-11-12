@@ -25,6 +25,7 @@ package db
 import (
 	"fmt"
 	"iter"
+	"math"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -354,12 +355,17 @@ func (cat *Catalog) outerDrivenPairEstimate(sides []JoinSide, step *joinStepPlan
 	if !ok || ndv.Distinct == 0 || ndv.Records == 0 {
 		return 0, false
 	}
-	// Rounded up: a ratio of 1.4 means some keys reach two rows, and rounding it down prices
-	// those away. It does not make the result a bound -- see above -- only less optimistic,
-	// and no test pins the direction, because the skew this estimate cannot see moves it by
-	// more than a unit of rounding ever will (TestOuterDrivenPairEstimateUnderSkew).
-	fan := (ndv.Records + ndv.Distinct - 1) / ndv.Distinct
-	return fromRows * int(fan), true
+	// The ratio is kept as a ratio and multiplied in, rather than rounded to a whole number
+	// of rows per key first. Rounding it up looks like a unit of slack and is not one near
+	// 1: a table whose keys are very nearly unique has a ratio of about 1.01, which rounds
+	// to 2 and DOUBLES every estimate built on it. That is a systematic multiplier, and it
+	// lands where the thresholds are -- it put a fan-out of 1 over the cap at half the pairs
+	// the cap is set for, and the path was declined where it ran 1.5x quicker than the hash.
+	//
+	// The product is rounded up instead, which is the slack that was wanted: at most one
+	// row, whatever the ratio.
+	pairs := float64(fromRows) * float64(ndv.Records) / float64(ndv.Distinct)
+	return int(math.Ceil(pairs)), true
 }
 
 // constraintOf is a side's constraint with the empty spelling folded into the true one, so a
