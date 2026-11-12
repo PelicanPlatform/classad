@@ -64,3 +64,26 @@ func TestBareScopeKeywordShadowedByAttribute(t *testing.T) {
 		}
 	}
 }
+
+// TestBareParentResolvesToEnclosingAd covers the other half of PARENT: inside a
+// nested ad it names the enclosing one, where at the top level it is undefined.
+// The scope chain is established by the select operator, so the reference has
+// to be reached through one.
+func TestBareParentResolvesToEnclosingAd(t *testing.T) {
+	ad, err := Parse("[Outer = 1; Inner = [Got = PARENT]; Reached = Inner.Got]")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	v := ad.EvaluateAttr("Reached")
+	if !v.IsClassAd() {
+		t.Fatalf("Inner.Got = %s, want the enclosing ad", v.String())
+	}
+	// The enclosing ad is the outer one, which is the ad that defines Outer.
+	inner, err := v.ClassAdValue()
+	if err != nil {
+		t.Fatalf("ClassAdValue: %v", err)
+	}
+	if got := inner.EvaluateAttr("Outer"); got.IsUndefined() {
+		t.Errorf("PARENT resolved to an ad without Outer: %s", v.String())
+	}
+}

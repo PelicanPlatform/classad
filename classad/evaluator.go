@@ -809,6 +809,8 @@ const (
 // resolveBareScopeName resolves an unscoped reference that names one of the
 // scope keywords, against the scope level ad where an ordinary lookup for it
 // just failed. The second result reports whether norm is such a keyword at all.
+// ad is the scope level being walked and is never nil; a non-nil ad always has
+// a root, so only PARENT can come up empty, at the top of the chain.
 //
 // A keyword resolves at that level instead of continuing up the enclosing
 // chain, matching the reference engine, which returns from inside its own
@@ -818,17 +820,11 @@ const (
 func (e *Evaluator) resolveBareScopeName(ad *ClassAd, norm string) (Value, bool) {
 	switch norm {
 	case selfAttr, myAttr:
-		if ad == nil {
-			return NewUndefinedValue(), true
-		}
 		return NewClassAdValue(ad), true
 	case rootAttr, topLevelAttr:
-		if r := rootOf(ad); r != nil {
-			return NewClassAdValue(r), true
-		}
-		return NewUndefinedValue(), true
+		return NewClassAdValue(rootOf(ad)), true
 	case parentAttr:
-		if ad == nil || ad.parent == nil {
+		if ad.parent == nil {
 			return NewUndefinedValue(), true
 		}
 		return NewClassAdValue(ad.parent), true
