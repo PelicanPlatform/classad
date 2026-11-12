@@ -153,6 +153,10 @@ func joinKindName(k JoinKind) string {
 		return "inner"
 	case JoinLeft:
 		return "left"
+	case JoinSemi:
+		return "semi"
+	case JoinAnti:
+		return "anti"
 	case JoinCross:
 		return "cross"
 	case joinRightOuter:
