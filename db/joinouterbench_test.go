@@ -42,7 +42,18 @@ func fanFixture(t testing.TB, keys, fan, segSize int) *Catalog {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobs, err := cat.CreateArchiveTable("jobs", ArchiveConfig{SegmentSize: segSize})
+	// The FROM side carries a zone map on the join key, and segments small enough that it
+	// has several. Both are needed for its own constraint to be PRICED: a side's read is
+	// sized from what the store says the scan visits, a zone map is what lets the store say
+	// less than the whole table, and a single-segment side has nothing to prune.
+	//
+	// Without them this fixture reported that the batched path never engages at any
+	// fan-out, which is a statement about the fixture. Production's FROM side is a large
+	// history archive carrying EnteredHistoryTime in ZoneAttrs, and its window prunes.
+	jobs, err := cat.CreateArchiveTable("jobs", ArchiveConfig{
+		SegmentSize: 1024,
+		ZoneAttrs:   []string{"ClusterId"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +70,7 @@ func fanFixture(t testing.TB, keys, fan, segSize int) *Catalog {
 		aj := classad.New()
 		aj.InsertAttr("ClusterId", int64(i))
 		aj.InsertAttrString("Owner", "alice")
+		aj.InsertAttrString("Pad", strings.Repeat("y", 96))
 		if aerr := jobs.Append(aj); aerr != nil {
 			t.Fatal(aerr)
 		}

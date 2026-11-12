@@ -1458,3 +1458,53 @@ func TestOuterDrivenPairEstimateUnderSkew(t *testing.T) {
 		t.Fatalf("row %d: outer-driven %q, hash %q", i, got[i], want[i])
 	}
 }
+
+// The batched path engages on a FROM side whose own constraint the store can price, which is
+// what the production shape has: a large history archive filtered on an attribute in
+// ZoneAttrs. Both halves are asserted, because the path declining is indistinguishable from
+// the path being slow unless the reason is checked.
+//
+// This exists because the fixture used to lack both, and the measurement built on it reported
+// that the batched path never engages at any fan-out -- a statement about the fixture that
+// read as a statement about the planner.
+func TestOuterDrivenEngagesOnAPricedFromSide(t *testing.T) {
+	const innerRows, fan = 20_000, 64
+	keys := innerRows / fan
+	cat := fanFixture(t, keys, fan, 65536)
+
+	fromTotal, _, _, _, ok := cat.joinSideStats("jobs", "")
+	if !ok {
+		t.Fatal("the FROM side's size could not be learned")
+	}
+	spec := outerSpec(JoinInner)
+	spec.Left.Constraint = fmt.Sprintf("ClusterId <= %d", keys/5)
+
+	priced, sized := cat.sideReadSize(spec.Left)
+	if !sized {
+		t.Fatal("the FROM side's constraint could not be priced at all")
+	}
+	if priced >= fromTotal {
+		t.Fatalf("the FROM side's constraint priced at %d of %d rows: nothing was pruned, so "+
+			"the pair estimate cannot see what the caller narrowed to", priced, fromTotal)
+	}
+
+	var st JoinStats
+	seq, err := cat.Join(spec, JoinLimits{}, &st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for range seq {
+		rows++
+	}
+	if st.Err != nil {
+		t.Fatal(st.Err)
+	}
+	if rows == 0 {
+		t.Fatal("the join produced no rows, so nothing about the path was exercised")
+	}
+	if st.OuterDrivenBatches == 0 {
+		t.Fatalf("the batched path declined a join of %d pairs over %d inner rows with the "+
+			"FROM side priced at %d of %d", st.Pairs, innerRows, priced, fromTotal)
+	}
+}
