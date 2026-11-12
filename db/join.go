@@ -747,8 +747,8 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 		p.projects = append(p.projects, sd.Project)
 	}
 
-	if err := refuseSemiSideRefs(sides, steps, spec.Post, p.aliases); err != nil {
-		return nil, err
+	if semiErr := refuseSemiSideRefs(sides, steps, spec.Post, p.aliases); semiErr != nil {
+		return nil, semiErr
 	}
 
 	if p.post, err = compileAll("WHERE", spec.Post); err != nil {
