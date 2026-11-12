@@ -118,6 +118,34 @@ var (
 	// the cost model says.
 	maxProbeKeys = 1024
 
+	// probeSegVisits and probeWorkFrac price what the probe actually does, which is look
+	// each key up and then READ the records that key reaches.
+	//
+	// Only the lookups were priced, as `segments * keys`, and both halves of that were
+	// wrong. The records were counted as zero, so a fan-out of 64 was taken at eight times
+	// the hash's cost -- the gate saw a few hundred lookups and never counted the sixteen
+	// thousand records they pulled back. And `segments` is not how many segments a key is
+	// looked up in: a numeric key correlated with insertion order has its zone map rule out
+	// nearly every segment before a posting is read, so the real figure is a small constant
+	// and does not grow with the table. Pricing it as the segment COUNT is what made the
+	// gate refuse a probe running fifty times quicker than the hash on a table of 196
+	// segments.
+	//
+	// Measured against a forced hash over 32 points: fan-out 1, 4, 8 and 64 at 20,000 rows
+	// over 30 segments, fan-out 64 at 100,000 over 147, and fan-out 1, 8 and 64 at 8,192
+	// over 196 -- that last being 42 rows per segment, where the lookup term dominates.
+	// Sorting every point by (4*keys + records reached) / records separates them: nothing
+	// at or under 0.133 ran worse than 1.09x the hash, and the first point above it is
+	// 1.53x. Two wins sit above the line, at 0.85x and 0.67x, and are given up rather than
+	// chased -- a loss sits between them.
+	//
+	// The constant assumes the pruning works, which is the shape a join key is in here: a
+	// key uncorrelated with insertion order prunes nothing, and the probe then costs more
+	// than this prices. The figure it replaces assumed pruning never works, and was wrong
+	// by more.
+	probeSegVisits = 4
+	probeWorkFrac  = 0.135
+
 	// minProbeRows is the hashed side's size below which narrowing is not considered at
 	// all. Reading a small table whole is cheap enough that the decision is not worth its
 	// own cost, let alone the risk of getting it wrong.
@@ -363,6 +391,7 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 			lookups += c.segments * len(c.lits)
 		}
 		rows := g[0].rows
+		pairs, priced := cat.probePairEstimate(sides, p.steps[i], g, keys)
 		switch {
 		case keys == 0:
 			st.Why = "no row of the FROM side has a usable key value"
@@ -370,7 +399,12 @@ func (cat *Catalog) planIndexProbes(p *joinPlan, sides []JoinSide, scanSeq iter.
 		case tooManyKeys(g):
 			st.Why = fmt.Sprintf("the FROM side has more than %d distinct keys", maxProbeKeys)
 			continue
-		case lookups*probeLookupCost > rows:
+		case priced && float64(probeSegVisits*keys+pairs) > probeWorkFrac*float64(rows):
+			st.Why = fmt.Sprintf("%d keys reaching about %d records is more than a %.3f "+
+				"share of the %d records the scan it replaces would read",
+				keys, pairs, probeWorkFrac, rows)
+			continue
+		case !priced && lookups*probeLookupCost > rows:
 			st.Why = fmt.Sprintf("%d keys across %d segments is %d index lookups against a "+
 				"read of %d records, which costs more than it saves", keys, g[0].segments,
 				lookups, rows)
@@ -581,6 +615,33 @@ func (cat *Catalog) joinSideStats(table, attr string) (rows, segments int, index
 	// A view's two halves have separate indexes and separate sizes; narrowing one of them
 	// is a decision this does not try to make.
 	return 0, 0, false, false, false
+}
+
+// probePairEstimate is how many records the narrowed scan would read: one per key, times the
+// records a key reaches. It is what the cost gate was missing.
+//
+// `AttrNDV` answers from sealed segment summaries with no record read, and Records/Distinct is
+// the records per key. That is an AVERAGE, so a skewed key beats it and the estimate comes in
+// low -- which takes the probe where it should have declined. It is still strictly better
+// than what it replaces, which counted those records as zero.
+//
+// Declined for a multi-attribute group: the records a CONJUNCTION of equalities reaches is not
+// the product of what each reaches, and nothing here knows the correlation between them. Those
+// fall back to the lookup-only rule.
+func (cat *Catalog) probePairEstimate(sides []JoinSide, sp *joinStepPlan, g []*probeCandidate,
+	keys int) (int, bool) {
+	if len(g) != 1 || sp == nil || sp.side < 0 || sp.side >= len(sides) {
+		return 0, false
+	}
+	ndv, ok := cat.AttrNDV(sides[sp.side].Table, g[0].attr)
+	if !ok || ndv.Distinct == 0 || ndv.Records == 0 {
+		return 0, false
+	}
+	fan := int(ndv.Records / ndv.Distinct)
+	if fan < 1 {
+		fan = 1
+	}
+	return keys * fan, true
 }
 
 // bareAttr reports the attribute name of an expression that is nothing but an unscoped

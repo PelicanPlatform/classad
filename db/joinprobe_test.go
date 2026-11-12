@@ -98,13 +98,17 @@ func withoutProbe(fn func()) {
 }
 
 // forcingProbe runs fn with the COST GATE off but the probe itself on, which is what a
-// benchmark needs in order to find where the gate belongs. Pricing a lookup at zero makes
-// the comparison against the scan always favour probing; every soundness gate above it
-// still applies.
+// benchmark needs in order to find where the gate belongs. Pricing the probe's work at zero
+// and allowing it any share of the scan makes the comparison always favour probing; every
+// soundness gate above it still applies.
+//
+// Both gates are turned off, not just one. The cost model has a rule for a step whose key
+// fan-out it can price and a fallback for one it cannot, and a benchmark arm that silently
+// took the fallback would be measuring the gate rather than the probe.
 func forcingProbe(fn func()) {
-	oldCost, oldKeys := probeLookupCost, maxProbeKeys
-	probeLookupCost, maxProbeKeys = 0, 1<<30
-	defer func() { probeLookupCost, maxProbeKeys = oldCost, oldKeys }()
+	oldCost, oldKeys, oldFrac := probeLookupCost, maxProbeKeys, probeWorkFrac
+	probeLookupCost, maxProbeKeys, probeWorkFrac = 0, 1<<30, 1<<30
+	defer func() { probeLookupCost, maxProbeKeys, probeWorkFrac = oldCost, oldKeys, oldFrac }()
 	fn()
 }
 
@@ -233,19 +237,20 @@ func TestJoinIndexProbeDeclinesWithoutAnIndex(t *testing.T) {
 	}
 }
 
-// More index lookups than the scan has records: the probe would cost more than it saves.
+// The probe's own work outweighing the scan it replaces: it would cost more than it saves.
 // The gate has to decline on the COST, not on the key count -- maxProbeKeys is a separate
 // backstop, and a test that tripped that one instead would say nothing about the model.
-func TestJoinIndexProbeDeclinesWhenTheLookupsOutnumberTheRows(t *testing.T) {
-	// 2048 rows across many segments, with a key for every row: segments*keys is far more
-	// lookups than 2048 records, while the key count stays under maxProbeKeys.
+func TestJoinIndexProbeDeclinesWhenItsWorkOutweighsTheScan(t *testing.T) {
+	// 2048 rows with a key for every row: the probe would look up 512 keys and read the
+	// 512 records they reach, a quarter of the table, while the key count stays under
+	// maxProbeKeys so the backstop above is not what declines.
 	cat := probeFixture(t, 2048, 512, true)
 	_, st := drainProbe(t, cat, probeSpec(JoinInner))
 	if st.ProbeKeys != 0 {
-		t.Fatalf("the probe fired when its lookups outnumbered the rows: %q", st.ProbeWhy)
+		t.Fatalf("the probe fired when its own work outweighed the scan: %q", st.ProbeWhy)
 	}
-	if !strings.Contains(st.ProbeWhy, "index lookups") {
-		t.Errorf("ProbeWhy = %q, which does not name the cost it declined on", st.ProbeWhy)
+	if !strings.Contains(st.ProbeWhy, "reaching about") {
+		t.Errorf("ProbeWhy = %q, which does not name the records it would read", st.ProbeWhy)
 	}
 }
 
@@ -406,5 +411,68 @@ func TestJoinIndexProbeDeclinesWhenTheIndexIsConfiguredButNotBuilt(t *testing.T)
 	if !strings.Contains(st.ProbeWhy, "none is built") {
 		t.Errorf("ProbeWhy = %q, which does not distinguish an unbuilt index from a missing one",
 			st.ProbeWhy)
+	}
+}
+
+// A key whose fan-out makes the probe read most of the table. The lookups alone are cheap --
+// 156 keys over 30 segments is well under the 20,000 records of the scan, so the rule this
+// replaces took it -- but each key reaches 64 records, so the probe reads half the table to
+// save the other half and runs several times slower than the hash.
+//
+// This is the case the cost model was blind to: it is decided entirely by a quantity the
+// lookup count does not contain.
+func TestJoinIndexProbeDeclinesAKeyWithHighFanOut(t *testing.T) {
+	cat := fanFixture(t, 312, 64, 65536)
+	spec := outerSpec(JoinInner)
+	spec.Left.Constraint = "ClusterId <= 156"
+	var st JoinStats
+	withoutOuterDriven(func() {
+		seq, err := cat.Join(spec, JoinLimits{}, &st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range seq {
+		}
+	})
+	if st.Err != nil {
+		t.Fatal(st.Err)
+	}
+	if st.ProbeKeys != 0 {
+		t.Fatalf("the probe fired on a key reaching %d records of %d: %q",
+			st.Pairs, 20_000, st.ProbeWhy)
+	}
+	if !strings.Contains(st.ProbeWhy, "reaching about") {
+		t.Errorf("ProbeWhy = %q, which does not name the records it would read", st.ProbeWhy)
+	}
+}
+
+// The same model has to keep taking a probe that a segment COUNT would refuse. 8,192 records
+// over ~196 segments is 42 rows each; 128 keys priced at segments*keys is 25,088 lookups
+// against 8,192 records, which the rule this replaces declined -- while the probe actually
+// runs about eight times quicker than the hash, because a zone map rules nearly every
+// segment out before a posting is read.
+func TestJoinIndexProbeTakesALowFanOutKeyAcrossManySegments(t *testing.T) {
+	cat := fanFixture(t, 8192, 1, 4096)
+	_, segments, _, _, ok := cat.joinSideStats("hist", "")
+	if !ok || segments < 100 {
+		t.Fatalf("fixture has %d segments, want the many-segment shape this is about", segments)
+	}
+	spec := outerSpec(JoinInner)
+	spec.Left.Constraint = "ClusterId <= 128"
+	var st JoinStats
+	withoutOuterDriven(func() {
+		seq, err := cat.Join(spec, JoinLimits{}, &st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range seq {
+		}
+	})
+	if st.Err != nil {
+		t.Fatal(st.Err)
+	}
+	if st.ProbeKeys != 128 {
+		t.Fatalf("ProbeKeys = %d across %d segments, want 128: %q",
+			st.ProbeKeys, segments, st.ProbeWhy)
 	}
 }
