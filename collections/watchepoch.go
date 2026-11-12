@@ -37,7 +37,7 @@ import (
 //     issued before the restart is never reissued even when its record is no longer on disk
 //     (Truncate, or Rotate emptying a shard).
 //
-// A MUTABLE collection carries its epoch across a clean restart only when WatchRetainSeqs
+// A MUTABLE collection carries its epoch across a clean restart only when WatchRetain
 // promises a retention window, and rotates it otherwise. Its deletes are durable --
 // del appends a marker naming the key at its commit seq (writeDeleteMarker) -- but nothing
 // reads those markers for their own sake, so reclamation unlinks the segment holding one as

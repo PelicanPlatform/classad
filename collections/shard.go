@@ -144,10 +144,11 @@ type shard struct {
 	idx    int
 	hub    *watchHub
 	delLog *deleteLog
-	// watchRetain is Options.WatchRetainSeqs: how far behind the head delete markers are
-	// kept for a resuming watcher. 0 disables the floor entirely. Atomic because
-	// SetWatchRetainSeqs reconfigures it and the floor is read under either lock.
-	watchRetain atomic.Uint64
+	// watchRetain is Options.WatchRetain as a time.Duration in nanoseconds: how far back
+	// in WALL-CLOCK time delete markers are kept for a resuming watcher. 0 disables the
+	// floor entirely. Atomic because SetWatchRetain reconfigures it and the floor is read
+	// under either lock; stored as nanos because there is no atomic.Duration.
+	watchRetain atomic.Int64
 	// delFloor is the highest sequence at or below which the delete markers in storage can
 	// no longer be trusted to be complete, whatever the retention window says. Truncate
 	// raises it: it drops every segment, so the markers go with them. Guarded by mu.
@@ -623,25 +624,48 @@ func (sh *shard) syncOutgoingLocked(seg *segment) {
 	seg.unpin()
 }
 
-// maybeCheckpoint records a time->seq checkpoint (see timeseq.go) if time travel is
-// enabled and the checkpoint interval has elapsed. Caller holds the write lock and
-// calls this after the batch's records are written and sh.commitSeq is bumped, so the
-// marker lands in the active segment and rides the batch's msync.
+// maybeCheckpoint records a time->seq checkpoint (see timeseq.go) if this shard writes them
+// at all and the checkpoint interval has elapsed. Caller holds the write lock and calls this
+// after the batch's records are written and sh.commitSeq is bumped, so the marker lands in
+// the active segment and rides the batch's msync.
 func (sh *shard) maybeCheckpoint(seq uint64) {
-	if sh.tt == nil {
+	iv, ok := sh.checkpointInterval()
+	if !ok {
 		return
 	}
-	cfg := sh.tt.Load()
-	if cfg == nil {
-		return // time travel disabled
-	}
 	nowMs := nowMillis()
-	if !sh.tseq.due(nowMs, cfg.interval) {
+	if !sh.tseq.due(nowMs, iv) {
 		return
 	}
 	if sh.writeMarker(seq, nowMs) {
 		sh.tseq.record(seq, nowMs)
 	}
+}
+
+// checkpointInterval reports how often this shard writes a time->seq checkpoint, and whether
+// it writes them at all. Time travel and a watch retention window are separate features that
+// both resolve a wall-clock instant to a commit sequence through the same index, so either one
+// turns checkpointing on and the finer interval wins. With neither, the mechanism stays inert
+// and the write path pays nothing, exactly as before.
+//
+// A retention window shorter than the checkpoint interval would still resolve -- seqAt returns
+// the newest checkpoint at or before the cutoff -- but only to a checkpoint far older than the
+// window, so the shard would retain much more than it was asked to. Clamping the interval to
+// the window keeps the resolved floor within about two windows of the one configured.
+func (sh *shard) checkpointInterval() (time.Duration, bool) {
+	var iv time.Duration
+	if sh.tt != nil {
+		if cfg := sh.tt.Load(); cfg != nil {
+			iv = cfg.interval
+		}
+	}
+	if d := time.Duration(sh.watchRetain.Load()); d > 0 && sh.delLog != nil {
+		wiv := min(defaultCheckpointInterval, d)
+		if iv == 0 || wiv < iv {
+			iv = wiv
+		}
+	}
+	return iv, iv > 0
 }
 
 // writeMarker appends a time-checkpoint marker to the active segment if there is room,

@@ -317,7 +317,7 @@ func Open(opts Options) (*Collection, error) {
 	// consumed BEFORE any segment is mapped or any seq issued, so a crash from here on
 	// rotates the epoch instead of letting recovery reissue seqs a cursor already covers.
 	var watchHW []uint64
-	if c.hub != nil && (opts.AppendOnly || opts.WatchRetainSeqs > 0) {
+	if c.hub != nil && (opts.AppendOnly || opts.WatchRetain > 0) {
 		if watchHW, err = c.claimWatchEpoch(opts.Dir); err != nil {
 			return nil, err
 		}

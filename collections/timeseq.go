@@ -196,26 +196,35 @@ func (sh *shard) retainFloorLocked() uint64 {
 // deletes from: anything at or below it may be reclaimed. It is deliberately NOT the oldest
 // live cursor -- a floor that followed a consumer would let one stuck watcher hold the whole
 // history open. Caller holds at least the read lock.
+//
+// The window is a DURATION, resolved through the same per-shard time index time travel uses:
+// the floor is the sequence that was current WatchRetain ago. A sequence count cannot express
+// this promise, because the sequences it counts are commits, not time -- the same number is
+// hours on an idle shard and seconds on a busy one, and a watcher's outage is measured in
+// neither. maybeCheckpoint therefore keeps the index fed whenever this is on, not only under
+// time travel.
+//
+// retainFloor answers 0 when the window reaches back past the earliest checkpoint, which means
+// "retain everything": the honest answer while a just-opened shard has no checkpoint old enough
+// to resolve against, and the safe direction -- it retains markers a watcher may never ask for,
+// rather than discarding ones it was promised.
 func (sh *shard) watchFloorLocked() uint64 {
-	retain := sh.watchRetain.Load()
-	if retain == 0 || sh.delLog == nil {
+	d := time.Duration(sh.watchRetain.Load())
+	if d <= 0 || sh.delLog == nil {
 		return sh.commitSeq // no promise: everything is reclaimable, as before
 	}
-	if sh.commitSeq <= retain {
-		return 0
-	}
-	return sh.commitSeq - retain
+	return sh.tseq.retainFloor(nowMillis(), d)
 }
 
-// SetWatchRetainSeqs reconfigures Options.WatchRetainSeqs, so a server can change the
-// window on a config reload rather than a reopen.
+// SetWatchRetain reconfigures Options.WatchRetain, so a server can change the window on a
+// config reload rather than a reopen.
 //
 // Widening it does not reach back: markers already reclaimed stay reclaimed, and delFloor
 // records how far that went, so a cursor the old window had given up on is still refused
 // rather than answered from a window that only looks wide enough.
-func (c *Collection) SetWatchRetainSeqs(n uint64) {
+func (c *Collection) SetWatchRetain(d time.Duration) {
 	for _, sh := range c.shards {
-		sh.watchRetain.Store(n)
+		sh.watchRetain.Store(int64(d))
 	}
 }
 
