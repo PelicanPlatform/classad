@@ -273,21 +273,21 @@ func TestKeyReaddedAfterColumnarizeStillReads(t *testing.T) {
 	}
 }
 
-// TestWatchRetainSeqsKeepsDeleteMarkersFromReclaim is a differential test: the same history
+// TestWatchRetainKeepsDeleteMarkersFromReclaim is a differential test: the same history
 // under the same fixture, with the retention window the only difference. A segment whose
 // records are all superseded is unlinked whole, and a delete marker is not a record any
 // reader looks for, so nothing else in the collection keeps one alive. With the window off
 // the delete's evidence is gone; with it set, the marker is still there to replay.
-func TestWatchRetainSeqsKeepsDeleteMarkersFromReclaim(t *testing.T) {
+func TestWatchRetainKeepsDeleteMarkersFromReclaim(t *testing.T) {
 	const deleted = "key-000003"
-	run := func(t *testing.T, retainSeqs uint64) map[uint64]string {
+	run := func(t *testing.T, retain time.Duration) map[uint64]string {
 		t.Helper()
 		c, err := Open(Options{
-			Dir:             t.TempDir(),
-			Shards:          1,
-			SegmentSize:     8 << 10,
-			WatchHistory:    1024,
-			WatchRetainSeqs: retainSeqs,
+			Dir:          t.TempDir(),
+			Shards:       1,
+			SegmentSize:  8 << 10,
+			WatchHistory: 1024,
+			WatchRetain:  retain,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -329,7 +329,7 @@ func TestWatchRetainSeqsKeepsDeleteMarkersFromReclaim(t *testing.T) {
 		}
 	})
 	t.Run("window-set", func(t *testing.T) {
-		got := run(t, 1<<20)
+		got := run(t, time.Hour)
 		if len(got) != 1 {
 			t.Fatalf("delete markers = %v, want the one naming %q to survive reclamation", got, deleted)
 		}
@@ -351,14 +351,14 @@ func TestWatchResumesDeletesFromStorage(t *testing.T) {
 	const journal = 4
 	const deletes = 20
 
-	run := func(t *testing.T, retainSeqs uint64) ([]WatchEvent, bool) {
+	run := func(t *testing.T, retain time.Duration) ([]WatchEvent, bool) {
 		t.Helper()
 		c, err := Open(Options{
-			Dir:             t.TempDir(),
-			Shards:          1,
-			SegmentSize:     8 << 10,
-			WatchHistory:    journal,
-			WatchRetainSeqs: retainSeqs,
+			Dir:          t.TempDir(),
+			Shards:       1,
+			SegmentSize:  8 << 10,
+			WatchHistory: journal,
+			WatchRetain:  retain,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -394,7 +394,7 @@ func TestWatchResumesDeletesFromStorage(t *testing.T) {
 	})
 
 	t.Run("window-set", func(t *testing.T) {
-		events, sawReset := run(t, 1<<20)
+		events, sawReset := run(t, time.Hour)
 		if sawReset {
 			t.Fatal("resume fell back to a full replay; the markers in storage were not used")
 		}
@@ -420,15 +420,15 @@ func TestWatchResumesDeletesFromStorage(t *testing.T) {
 // handed a Reset. Nothing but the retention window differs between the two halves.
 func TestWatchResumesAcrossRestart(t *testing.T) {
 	const deletes = 8
-	run := func(t *testing.T, retainSeqs uint64) ([]WatchEvent, bool) {
+	run := func(t *testing.T, retain time.Duration) ([]WatchEvent, bool) {
 		t.Helper()
 		dir := t.TempDir()
 		opts := Options{
-			Dir:             dir,
-			Shards:          1,
-			SegmentSize:     8 << 10,
-			WatchHistory:    64,
-			WatchRetainSeqs: retainSeqs,
+			Dir:          dir,
+			Shards:       1,
+			SegmentSize:  8 << 10,
+			WatchHistory: 64,
+			WatchRetain:  retain,
 		}
 		c, err := Open(opts)
 		if err != nil {
@@ -472,7 +472,7 @@ func TestWatchResumesAcrossRestart(t *testing.T) {
 	})
 
 	t.Run("window-set", func(t *testing.T) {
-		events, sawReset := run(t, 1<<20)
+		events, sawReset := run(t, time.Hour)
 		if sawReset {
 			t.Fatal("resume across the restart fell back to a full replay")
 		}
@@ -493,7 +493,7 @@ func TestWatchResumesAcrossRestart(t *testing.T) {
 	})
 }
 
-// TestWideningTheWindowDoesNotResurrectReclaimedDeletes: SetWatchRetainSeqs can widen the
+// TestWideningTheWindowDoesNotResurrectReclaimedDeletes: SetWatchRetain can widen the
 // window at runtime, but the markers reclaimed under the narrow one are gone. A resume must
 // then be refused, not answered from a window that merely looks wide enough now.
 //
@@ -502,11 +502,11 @@ func TestWatchResumesAcrossRestart(t *testing.T) {
 func TestWideningTheWindowDoesNotResurrectReclaimedDeletes(t *testing.T) {
 	const deletes = 12
 	c, err := Open(Options{
-		Dir:             t.TempDir(),
-		Shards:          1,
-		SegmentSize:     8 << 10,
-		WatchHistory:    4,
-		WatchRetainSeqs: 4, // narrow: the churn below leaves the deletes far behind it
+		Dir:          t.TempDir(),
+		Shards:       1,
+		SegmentSize:  8 << 10,
+		WatchHistory: 4,
+		WatchRetain:  time.Millisecond, // narrow: the churn below outlasts it many times over
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -540,7 +540,7 @@ func TestWideningTheWindowDoesNotResurrectReclaimedDeletes(t *testing.T) {
 			"reclaiming them, so widening below proves nothing", len(got))
 	}
 
-	c.SetWatchRetainSeqs(1 << 20) // now claim a window far wider than what is actually left
+	c.SetWatchRetain(time.Hour) // now claim a window far wider than what is actually left
 
 	events, _ := collectCatchUp(t, c, cursor)
 	reset := false
@@ -562,4 +562,66 @@ func TestWideningTheWindowDoesNotResurrectReclaimedDeletes(t *testing.T) {
 				"window answered for markers that had already been reclaimed", k)
 		}
 	}
+}
+
+// TestWatchRetainWindowExpires: a window that has gone by stops holding delete markers.
+//
+// Every other test here asserts the window RETAINS. That half passes just as well when the
+// window does not bound anything at all -- an unresolvable time index answers "retain
+// everything", which looks identical from the retaining side and never expires. So this is
+// the half that fails when the floor stops advancing: a store configured with a 50ms window
+// that still holds a delete minutes later is not honouring a window, it is leaking.
+//
+// It is written as liveness against a deadline rather than a fixed sleep: the window passes
+// in wall-clock time, and how many compactions it takes to notice is not something to assert.
+func TestWatchRetainWindowExpires(t *testing.T) {
+	const window = 50 * time.Millisecond
+	const deleted = "key-000003"
+	c, err := Open(Options{
+		Dir:          t.TempDir(),
+		Shards:       1,
+		SegmentSize:  8 << 10,
+		WatchHistory: 1024,
+		WatchRetain:  window,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	put := func(i, gen int) {
+		t.Helper()
+		if err := c.Put([]byte(fmt.Sprintf("key-%06d", i)), padAd(t, gen)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 40 {
+		put(i, i)
+	}
+	if !c.Delete([]byte(deleted)) {
+		t.Fatalf("Delete(%q) found nothing to remove", deleted)
+	}
+	if got := deleteMarkerKeys(t, c); len(got) != 1 {
+		t.Fatalf("delete markers right after the delete = %v, want exactly one; without one "+
+			"retained to begin with, its expiry below proves nothing", got)
+	}
+
+	// Churn so the marker's segment becomes fully superseded (the shape reclaim unlinks),
+	// and keep going until the window it was promised has demonstrably passed.
+	deadline := time.Now().Add(10 * time.Second)
+	for round := 0; time.Now().Before(deadline); round++ {
+		for i := range 40 {
+			if i == 3 {
+				continue
+			}
+			put(i, i+100*round)
+		}
+		c.Compact()
+		if len(deleteMarkerKeys(t, c)) == 0 {
+			return // aged out of the window, which is the whole point
+		}
+	}
+	t.Fatalf("delete marker naming %q is still retained after %v of churn against a %v "+
+		"window: the retention floor is not advancing, so the window bounds nothing",
+		deleted, 10*time.Second, window)
 }

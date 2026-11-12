@@ -350,19 +350,28 @@ type Options struct {
 	// A larger value lets clients resume incrementally from further back before
 	// falling to a full replay.
 	WatchHistory int
-	// WatchRetainSeqs, when > 0, is how many commit sequences behind the head a persistent
-	// collection keeps its delete markers for, so a watcher that reconnects after a restart
-	// can still be told which keys went away. Reclamation drops a fully-superseded segment
-	// as soon as nothing can read its records, and a delete marker is not a record anyone
-	// reads -- so without this the replayable window is whatever compaction has not yet
-	// reclaimed, which is a function of write volume rather than of anything a watcher was
-	// promised.
+	// WatchRetain, when > 0, is how far back in time a persistent collection keeps its
+	// delete markers, so a watcher that reconnects after a restart can still be told which
+	// keys went away. Reclamation drops a fully-superseded segment as soon as nothing can
+	// read its records, and a delete marker is not a record anyone reads -- so without this
+	// the replayable window is whatever compaction has not yet reclaimed, which is a
+	// function of write volume rather than of anything a watcher was promised.
+	//
+	// It is a duration because that is the question a caller can actually answer: how long
+	// a consumer may be away -- a restart, a redeploy, a network partition -- and still
+	// resume incrementally. The equivalent in commit sequences is not a property of the
+	// deployment at all, since the same count is hours of an idle shard and seconds of a
+	// busy one.
 	//
 	// It is a ceiling on retention, not a consumer's position: a watcher that never comes
 	// back cannot hold history open, and a cursor older than the window gets a Reset, which
 	// is the honest answer. 0 (the default) retains nothing extra and leaves reclamation
 	// exactly as it was. Requires WatchHistory > 0 to have any effect.
-	WatchRetainSeqs uint64
+	//
+	// Turning this on also starts the time->seq checkpoints (see timeseq.go) that resolve
+	// the window, at most one per minute per shard, written into the segment arena as
+	// markers that ride the existing msync.
+	WatchRetain time.Duration
 	// WatchBuffer is the per-watcher live event-channel capacity (default 1024). A
 	// watcher that overflows it is told to resync rather than stalling writers.
 	WatchBuffer int
@@ -1045,7 +1054,7 @@ func New(opts Options) *Collection {
 			sh.idx = i
 			sh.hub = c.hub
 			sh.delLog = newDeleteLog(opts.WatchHistory, 0)
-			sh.watchRetain.Store(opts.WatchRetainSeqs)
+			sh.watchRetain.Store(int64(opts.WatchRetain))
 		}
 	}
 	c.parentKeyFor = opts.ParentKeyFor

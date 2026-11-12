@@ -156,7 +156,7 @@ func (d *deleteLog) record(key []byte, seq uint64) {
 // reports false when storage cannot be trusted to hold them all, which is the honest answer
 // and costs only a full replay.
 //
-// Two things have to hold. The retention window (Options.WatchRetainSeqs) must still cover
+// Two things have to hold. The retention window (Options.WatchRetain) must still cover
 // the cursor, which is what keeps reclamation from unlinking a segment whose markers are
 // above the floor. And no Truncate can have happened since, because that drops the segments
 // outright whatever the window says.
@@ -168,7 +168,7 @@ func (d *deleteLog) record(key []byte, seq uint64) {
 func (sh *shard) deleteMarkersSince(cursor, upTo uint64) ([]delEntry, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	if sh.watchRetain.Load() == 0 || cursor < sh.watchFloorLocked() || cursor < sh.delFloor {
+	if sh.watchRetain.Load() <= 0 || cursor < sh.watchFloorLocked() || cursor < sh.delFloor {
 		return nil, false
 	}
 	var out []delEntry

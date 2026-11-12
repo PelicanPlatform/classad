@@ -4,22 +4,23 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 )
 
-// TestWatchRetainSeqsResumesDeletesAcrossReopen is the db-level contract htcondordb needs:
+// TestWatchRetainResumesDeletesAcrossReopen is the db-level contract htcondordb needs:
 // with a retention window configured, a watcher holding a cursor from before the process
 // restarted is caught up incrementally -- including the keys that went away while it was
 // gone -- instead of being told to start over.
 //
-// The two halves run the identical history. WatchRetainSeqs is the only difference.
-func TestWatchRetainSeqsResumesDeletesAcrossReopen(t *testing.T) {
+// The two halves run the identical history. WatchRetain is the only difference.
+func TestWatchRetainResumesDeletesAcrossReopen(t *testing.T) {
 	const deletes = 6
 
-	run := func(t *testing.T, retainSeqs uint64) (gone map[string]bool, reset bool) {
+	run := func(t *testing.T, retain time.Duration) (gone map[string]bool, reset bool) {
 		t.Helper()
-		cfg := Config{Dir: t.TempDir(), WatchRetainSeqs: retainSeqs}
+		cfg := Config{Dir: t.TempDir(), WatchRetain: retain}
 		db, err := OpenConfig(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -81,7 +82,7 @@ func TestWatchRetainSeqsResumesDeletesAcrossReopen(t *testing.T) {
 	})
 
 	t.Run("window-set", func(t *testing.T) {
-		gone, reset := run(t, 1<<20)
+		gone, reset := run(t, time.Hour)
 		if reset {
 			t.Fatal("resume across the reopen fell back to a full replay")
 		}

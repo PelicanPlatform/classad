@@ -37,8 +37,8 @@ are assigned in append order and never change.
 - **`epoch`** — the identity of the sequence space the numbers belong to. If it does
   not match, the client's sequence numbers are from a different store generation, so
   the server ignores them and does a **full replay** (`WatchReset`). It is a random
-  value chosen per process, except for a persistent append-only collection (an
-  Archive), which carries it across a clean restart — see **Epoch across a restart**.
+  value chosen per process, except for a store that carries it across a clean restart —
+  see **Epoch across a restart**.
 - A cursor whose `seq` for some shard is **ahead of** that shard's current head was
   not issued by the log as it now stands (e.g. an older copy of the store reopened),
   so it also gets a full replay — never a resume that would skip the records later
@@ -49,9 +49,29 @@ processed, and hands it back on reconnect.
 
 ### Epoch across a restart
 
-**Mutable collections** (tables) pick a fresh random epoch every time they are opened,
-so **every watcher Resets after a server restart**. That is deliberate: the delete
-journal lives in memory, so a resume could not replay deletes precisely anyway.
+**Mutable collections** (tables) carry their epoch across a clean restart when
+`Options.WatchRetain` promises a retention window, and pick a fresh random epoch
+otherwise — in which case **every watcher Resets after a server restart**.
+
+The window is the whole difference, because the deletes themselves are already durable:
+`del` appends a marker naming the key at its commit seq. Nothing reads those markers for
+their own sake, though, so reclamation unlinks the segment holding one as soon as the
+records around it are superseded — which makes the replayable window a function of write
+volume rather than of anything a watcher was promised. `WatchRetain` holds reclamation
+back, and the same window bounds how far a cursor may resume from: outside it, catch-up
+cannot prove it has every delete, so it Resets.
+
+The window is a **duration**, resolved through the same per-shard time index time travel
+uses (the floor is the sequence that was current `WatchRetain` ago). Setting it also
+starts those checkpoints, at most one per shard per minute — or per window, when the window
+is shorter than that — written into the segment arena as markers that ride the existing
+msync. A count of commit sequences cannot express the
+promise, because the same count is hours on an idle shard and seconds on a busy one, while
+the thing a caller can actually size is how long a consumer may be away.
+
+The in-memory delete journal does not survive the restart. Its horizon is raised to the
+recovered commit sequence, which is what sends a cursor from before the restart to the
+markers in storage; left at zero it would instead answer that nothing had been deleted.
 
 **Persistent append-only collections** (`Archive`, and so `db.ArchiveTable`) keep their
 epoch across a **clean** restart, so a cursor issued before `Close` resumes after
@@ -82,6 +102,34 @@ epoch the previous process proved safe:
 A store directory copied while cleanly closed carries its marker; reopening an *older*
 copy is only caught while its head is still behind the cursor (the ahead-of-head
 check). Delete `watch.epoch` when restoring a store from a copy.
+
+## Stamps: a version a client can compare
+
+The cursor is a vector clock — one `commitSeq` per shard — so it resumes exactly but cannot
+be compared: there is no "is this one newer than that one". A consumer that has to publish a
+single ordered version (a Kubernetes `resourceVersion`, say) needs a scalar, and
+`WatchEvent.Stamp` is it.
+
+A stamp is a hybrid logical clock reading, assigned per shard when a commit is tracked for
+publication: `max(nowMicros(), last+1)`. So it is wall-clock microseconds that never repeat
+and never go backwards within a shard, and it costs no cross-shard coordination on the write
+path.
+
+`Collection.WatchWatermark()` is the collection-wide scalar: the highest stamp such that every
+shard has handed every change at or below it to every attached watcher's buffer. It is a
+**minimum across shards**, which makes it a liveness property rather than a safety one — it
+catches up with what was delivered, and a shard with nothing in flight claims the present so
+that an idle shard cannot pin the whole collection.
+
+Stamps survive a clean restart: the high-water mark rides in the same `watch.epoch` marker as
+the epoch, and `Open` starts every shard past it. That is not belt-and-braces. A stamp is read
+off the wall clock, and a clock can step backwards while the process is down (NTP, a resumed
+snapshot, a host that disagrees about now); without the carried mark, a reconnecting watcher
+would be handed stamps it already holds.
+
+A stamp is **not a position**. Resume still goes through the cursor, so a client reconnecting
+to a different replica hands back the cursor it holds, not a stamp. Resolving a stamp to a
+position would need stamps in the per-segment bounds and a change to the cursor format.
 
 ## Collection Watch: catch-up then live
 
@@ -321,6 +369,8 @@ makes resume at-least-once. On restart, call `Watch(lastCursor)`.
   Fine for independent full-ad updates; not a global change log.
 - **Deletes beyond the retention horizon**, and a `Truncate`, cannot be replayed
   precisely → full replay + client-side reconcile. This is the one inherent limit.
+  `WatchHistory` sets the in-memory horizon and `WatchRetain` the durable one; beyond
+  both, a `Reset` is the honest answer rather than a silent miss.
 - **Very slow clients** are demoted to a fresh catch-up rather than throttling writers.
 
 ## Status of the plan
@@ -346,14 +396,20 @@ Also done:
    archive failed to drop segments because it tried to unlink a sidecar that was never
    written.)
 
+5. **Mutable Collection resume** — a mutable collection with `Options.WatchRetain` set
+   carries its epoch across a clean restart and answers a resuming cursor from the delete
+   markers in storage, so a watcher reconnecting after a restart is told precisely which
+   keys went away instead of being sent back for a full replay. The window bounds both how
+   long markers are held and how far back a cursor may resume from.
+6. **Stamps** — `WatchEvent.Stamp` and `Collection.WatchWatermark()` give a scalar,
+   comparable version alongside the resumable cursor; the high-water mark is persisted with
+   the epoch. See **Stamps: a version a client can compare**.
+
 Deferred:
 
-5. **Collection catch-up efficiency** — currently a full `seq`-filtered scan of every
+7. **Collection catch-up efficiency** — currently a full `seq`-filtered scan of every
    segment (correct, O(records)). Per-segment `[minSeq,maxSeq]` to skip old segments
    is a follow-up.
-6. **Mutable Collection epoch persistence** — a mutable collection's epoch is
-   per-process, so **a reopened persistent table gets a new epoch and forces watchers
-   to full-replay** (safe, but not incremental across a server restart). Persisting
-   the delete journal under `Dir` as well, and reusing the archive's clean-shutdown
-   marker, is a follow-up. Append-only collections already resume across a clean
-   reopen.
+8. **Resume by stamp** — a stamp identifies a version but not a position, so a client
+   moving between replicas resumes from its cursor. Stamps in the per-segment bounds plus a
+   cursor-format change would close that.
