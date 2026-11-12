@@ -317,8 +317,9 @@ func Open(opts Options) (*Collection, error) {
 	// consumed BEFORE any segment is mapped or any seq issued, so a crash from here on
 	// rotates the epoch instead of letting recovery reissue seqs a cursor already covers.
 	var watchHW []uint64
+	var watchStamp uint64
 	if c.hub != nil && (opts.AppendOnly || opts.WatchRetain > 0) {
-		if watchHW, err = c.claimWatchEpoch(opts.Dir); err != nil {
+		if watchHW, watchStamp, err = c.claimWatchEpoch(opts.Dir); err != nil {
 			return nil, err
 		}
 	}
@@ -364,6 +365,19 @@ func Open(opts Options) (*Collection, error) {
 	for i, hw := range watchHW {
 		if sh := c.shards[i]; hw > sh.commitSeq {
 			sh.commitSeq = hw
+		}
+	}
+	// A stamp is taken from the wall clock, so nothing but the clock stops this process
+	// reissuing one the last process already handed out -- and a clock does move backwards
+	// (an NTP step, a resumed snapshot, a host that disagrees about now). Start every shard
+	// past the recorded high-water mark so a stamp is monotonic across the restart, which is
+	// what lets a consumer publish it as a version rather than as a hint.
+	if watchStamp > 0 {
+		for _, sh := range c.shards {
+			sh.pub.mu.Lock()
+			sh.pub.last = max(sh.pub.last, watchStamp)
+			sh.pub.doneStamp = max(sh.pub.doneStamp, watchStamp)
+			sh.pub.mu.Unlock()
 		}
 	}
 	// Nothing records what an earlier process reclaimed, so a paged-read cursor issued before
@@ -1535,7 +1549,15 @@ func (c *Collection) teardown(discard bool) error {
 	}
 	// Only now, with every segment flushed, may the epoch be vouched for across a restart.
 	if watchClean && firstErr == nil {
-		c.persistWatchEpoch(watchSeqs)
+		// The highest stamp any shard issued. Taken after the shard loop and under pub's own
+		// lock only, so it introduces no ordering between sh.mu and pub.mu.
+		var watchStamp uint64
+		for _, sh := range c.shards {
+			sh.pub.mu.Lock()
+			watchStamp = max(watchStamp, sh.pub.last)
+			sh.pub.mu.Unlock()
+		}
+		c.persistWatchEpoch(watchSeqs, watchStamp)
 	}
 	// The columnar-block cache is NOT closed here: c.colCache is the process-wide cache for this
 	// collection's kind, shared with every other open collection of that kind, and it lives for the

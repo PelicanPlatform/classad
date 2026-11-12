@@ -37,6 +37,11 @@ import (
 //     issued before the restart is never reissued even when its record is no longer on disk
 //     (Truncate, or Rotate emptying a shard).
 //
+// The marker also carries the stamp high-water mark (see pubOrder.stampLocked). Sequences are
+// this store's own counter and cannot go backwards, but a stamp is read off the wall clock,
+// which can: without carrying it, a clock that stepped back while the process was down would
+// reissue stamps a watcher already holds. Open starts every shard past the recorded mark.
+//
 // A MUTABLE collection carries its epoch across a clean restart only when WatchRetain
 // promises a retention window, and rotates it otherwise. Its deletes are durable --
 // del appends a marker naming the key at its commit seq (writeDeleteMarker) -- but nothing
@@ -56,19 +61,29 @@ import (
 // watch.epoch when restoring a store from a copy.
 
 const (
-	watchEpochFile    = "watch.epoch"
-	watchEpochMagic   = 0x48435745 // "EWCH"
-	watchEpochVersion = 1
+	watchEpochFile  = "watch.epoch"
+	watchEpochMagic = 0x48435745 // "EWCH"
+	// watchEpochVersion 2 appends the stamp high-water mark. Version 1 markers (written by
+	// releases before stamps existed) are still accepted and read as stamp 0, so upgrading
+	// does not throw away an archive's epoch and Reset every watcher it has.
+	watchEpochVersion   = 2
+	watchEpochVersionV1 = 1
 )
 
 // watchEpochMark is the content of a clean-shutdown watch.epoch marker.
 type watchEpochMark struct {
 	epoch uint64
 	seqs  []uint64 // per-shard commitSeq at Close (the high-water mark)
+	// stamp is the highest watch stamp any shard had issued at Close. A stamp comes from the
+	// wall clock (pubOrder.stampLocked), so without carrying it a backwards clock across a
+	// restart -- NTP stepping, a VM resuming from a snapshot, a container host with a
+	// different notion of now -- would reissue stamps a watcher has already seen, and a
+	// consumer publishing them as a version would move backwards. 0 means "not recorded".
+	stamp uint64
 }
 
 func encodeWatchEpoch(m watchEpochMark) []byte {
-	b := make([]byte, 0, 24+8*len(m.seqs)+4)
+	b := make([]byte, 0, 32+8*len(m.seqs)+4)
 	b = binary.LittleEndian.AppendUint32(b, watchEpochMagic)
 	b = binary.LittleEndian.AppendUint32(b, watchEpochVersion)
 	b = binary.LittleEndian.AppendUint64(b, m.epoch)
@@ -76,6 +91,7 @@ func encodeWatchEpoch(m watchEpochMark) []byte {
 	for _, s := range m.seqs {
 		b = binary.LittleEndian.AppendUint64(b, s)
 	}
+	b = binary.LittleEndian.AppendUint64(b, m.stamp)
 	return binary.LittleEndian.AppendUint32(b, crc32.ChecksumIEEE(b))
 }
 
@@ -84,19 +100,27 @@ func decodeWatchEpoch(b []byte) (watchEpochMark, bool) {
 		return watchEpochMark{}, false
 	}
 	body, sum := b[:len(b)-4], binary.LittleEndian.Uint32(b[len(b)-4:])
+	ver := binary.LittleEndian.Uint32(body[4:])
 	if crc32.ChecksumIEEE(body) != sum ||
 		binary.LittleEndian.Uint32(body[0:]) != watchEpochMagic ||
-		binary.LittleEndian.Uint32(body[4:]) != watchEpochVersion {
+		(ver != watchEpochVersion && ver != watchEpochVersionV1) {
 		return watchEpochMark{}, false
 	}
 	m := watchEpochMark{epoch: binary.LittleEndian.Uint64(body[8:])}
 	n := binary.LittleEndian.Uint64(body[16:])
-	if m.epoch == 0 || uint64(len(body)) != 24+8*n {
+	want := 24 + 8*n
+	if ver == watchEpochVersion {
+		want += 8
+	}
+	if m.epoch == 0 || uint64(len(body)) != want {
 		return watchEpochMark{}, false
 	}
 	m.seqs = make([]uint64, n)
 	for i := range m.seqs {
 		m.seqs[i] = binary.LittleEndian.Uint64(body[24+8*i:])
+	}
+	if ver == watchEpochVersion {
+		m.stamp = binary.LittleEndian.Uint64(body[24+8*n:])
 	}
 	return m, true
 }
@@ -138,17 +162,20 @@ func syncDir(dir string) error {
 // Watch enabled: consume the marker and adopt its epoch if it is valid for this shard count
 // (otherwise keep the random one New chose). Returns the marker's high-water seqs to apply once
 // the shards are loaded, or nil.
-func (c *Collection) claimWatchEpoch(dir string) ([]uint64, error) {
+// It also returns the stamp high-water mark to resume from (0 when the marker predates
+// stamps or there was none), which Open installs on every shard so no stamp this process
+// issues can repeat one the last process already handed out.
+func (c *Collection) claimWatchEpoch(dir string) ([]uint64, uint64, error) {
 	m, ok, err := consumeWatchEpoch(dir)
 	if err != nil {
-		return nil, fmt.Errorf("watch epoch: %w", err)
+		return nil, 0, fmt.Errorf("watch epoch: %w", err)
 	}
 	c.watchEpochDir = dir
 	if !ok || len(m.seqs) != len(c.shards) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	c.hub.epoch = m.epoch
-	return m.seqs, nil
+	return m.seqs, m.stamp, nil
 }
 
 // persistWatchEpoch is Close's half: called only after every segment flushed cleanly, it makes
@@ -156,7 +183,7 @@ func (c *Collection) claimWatchEpoch(dir string) ([]uint64, error) {
 // commitSeq, captured under the shard lock during Close. A failure is deliberately not a Close
 // error: Open already consumed the previous marker, so the only consequence of writing none is
 // that the next Open rotates the epoch (watchers Reset) -- the safe direction.
-func (c *Collection) persistWatchEpoch(seqs []uint64) {
+func (c *Collection) persistWatchEpoch(seqs []uint64, stamp uint64) {
 	if c.watchEpochDir == "" {
 		return
 	}
@@ -166,7 +193,7 @@ func (c *Collection) persistWatchEpoch(seqs []uint64) {
 		}
 	}
 	if writeFileDurable(filepath.Join(c.watchEpochDir, watchEpochFile),
-		encodeWatchEpoch(watchEpochMark{epoch: c.hub.epoch, seqs: seqs})) != nil {
+		encodeWatchEpoch(watchEpochMark{epoch: c.hub.epoch, seqs: seqs, stamp: stamp})) != nil {
 		// A rename that landed without its directory fsync may or may not survive; either
 		// outcome is safe, since the segments were made durable first.
 		return
