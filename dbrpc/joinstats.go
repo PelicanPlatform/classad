@@ -177,6 +177,10 @@ func readJoinStats(r *reader) (db.JoinStats, string, bool) {
 // point it stopped.
 func (c *Client) JoinStats(ctx context.Context, jr JoinRequest, yield func(row string) bool, rep *JoinStatsReport) error {
 	o, feat := joinOpFor(jr, opJoin, opJoinChain, FeatJoin, FeatJoinChain)
+	if err := refuseJoinBand(jr.Spec); err != nil {
+		rep.finish(err)
+		return err
+	}
 	want := c.wantJoinStats(rep)
 	if !c.SupportsNewer(feat) {
 		return c.featureRefusal(feat, ErrJoinUnsupported)

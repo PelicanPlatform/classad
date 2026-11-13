@@ -197,6 +197,10 @@ type JoinStep struct {
 	// Equi are the equality conjuncts of Cond that drive this step's hash. Left is written
 	// over the accumulated row and Right over this step's own table; see JoinEqui.
 	Equi []JoinEqui
+	// Band are the ordered-range conjuncts of Cond, each a window over one attribute of
+	// this step's table. A step with no Equi and one Band is searched rather than scanned;
+	// see JoinBand and db/joinband.go.
+	Band []JoinBand
 }
 
 // JoinSpec is a planned join of two or more tables.
@@ -223,6 +227,9 @@ type JoinSpec struct {
 	Post []string
 	// Equi are the equality conjuncts of Cond whose halves each read only one side.
 	Equi []JoinEqui
+	// Band are the ordered-range conjuncts of Cond, each a window over one attribute of
+	// Right. See JoinBand.
+	Band []JoinBand
 
 	// Limit stops after this many joined rows (<= 0 = all).
 	Limit int
@@ -299,10 +306,19 @@ type JoinStats struct {
 	// On this path HashRows is a HIGH-WATER MARK over the batches rather than a total.
 	OuterDrivenBatches int
 	ScanRows           int // rows streamed from the other side
-	Pairs              int // candidate pairs examined
-	Rows               int // joined rows produced
-	Groups             int // groups a reduced join returned (0 when the rows were not reduced)
-	Err                error
+	// BandWindows counts the windows a band join binary-searched, one for each accumulated
+	// row that reached a banded step, and BandCandidates the rows those windows admitted.
+	// BandWindows is 0 for every other plan, which is what tells a join that ran banded
+	// from one where the step was scanned whole -- the rows are the same either way.
+	//
+	// BandCandidates against BandWindows times the sorted side's rows is the saving: the
+	// second is the pairs the same step would have examined with no band at all.
+	BandWindows    int
+	BandCandidates int
+	Pairs          int // candidate pairs examined
+	Rows           int // joined rows produced
+	Groups         int // groups a reduced join returned (0 when the rows were not reduced)
+	Err            error
 
 	// ProbeAttr and ProbeKeys describe an index-based equi join: the attribute the hashed
 	// side's scan was narrowed on, and how many distinct key values it was narrowed to.
@@ -411,10 +427,11 @@ func (s JoinSide) empty() bool {
 func (s JoinSpec) chain() ([]JoinSide, []JoinStep, error) {
 	if len(s.Steps) == 0 {
 		return []JoinSide{s.Left, s.Right}, []JoinStep{{
-			Kind: s.Kind, Side: s.Right, Cond: s.Cond, Equi: s.Equi,
+			Kind: s.Kind, Side: s.Right, Cond: s.Cond, Equi: s.Equi, Band: s.Band,
 		}}, nil
 	}
-	if !s.Right.empty() || s.Kind != JoinInner || len(s.Cond) > 0 || len(s.Equi) > 0 {
+	if !s.Right.empty() || s.Kind != JoinInner || len(s.Cond) > 0 || len(s.Equi) > 0 ||
+		len(s.Band) > 0 {
 		return nil, nil, fmt.Errorf("a join spec carries both the two-table spelling and a " +
 			"chain of steps; use one or the other")
 	}
@@ -535,6 +552,9 @@ type joinStepPlan struct {
 	// them, so a step whose halves are mixed still has probeable equalities even though
 	// rowReadsOnlySide0 is false for the step as a whole.
 	rowOnSide0 []bool
+	// band are this step's compiled JoinBands. The first drives the sort when the step has
+	// no equality to hash on; the rest are evaluated per candidate. See db/joinband.go.
+	band []*bandPlan
 	// estRowBytes is what one held row of this step's side is expected to cost, from the
 	// side's sampled ad width (see db/joinmem.go). 0 means the width could not be sampled,
 	// and the byte budget is then not applied to this step.
@@ -775,6 +795,13 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 			return nil, err
 		}
 		sp.condAlias = compileAliasedCond(st.Cond, p.aliases)
+		// Its own name rather than the function's err, which the ON check above shadows:
+		// assigning the outer one here is what makes that shadow reachable.
+		band, bandErr := compileBands(st.Band, p.aliases, sp.side, st.Kind)
+		if bandErr != nil {
+			return nil, bandErr
+		}
+		sp.band = band
 		for j, e := range st.Equi {
 			row, rerr := classad.ParseExpr(e.Left)
 			if rerr != nil {
@@ -970,6 +997,11 @@ type joinStage struct {
 	// each accumulated row is paired against all of them and the condition alone decides.
 	all    []*joinRow
 	hashed bool
+	// banded says all is sorted ascending by the first band's attribute and bandVals holds
+	// that attribute's value for each row, so a window over it is a binary search rather
+	// than a scan. Only a stage with no equality to hash on is sorted.
+	banded   bool
+	bandVals []float64
 
 	// preserved, base and matched exist only for a joinRightOuter step, where the HASHED
 	// side is the one whose unmatched rows the join must still produce. They give every
@@ -1144,6 +1176,13 @@ func buildStage(p *joinPlan, step *joinStepPlan, seq iter.Seq[*joinRow], stats *
 		}
 		st.buckets[k] = append(st.buckets[k], ad)
 	}
+	// Sorted once, here, for the whole join: every accumulated row searches this one
+	// ordering rather than scanning the side again. A stage that hashes keeps its bands but
+	// is not sorted -- the bucket has already narrowed it, and there is no one ordering a
+	// window could be searched over.
+	if !st.hashed && len(step.band) > 0 {
+		noKey = append(noKey, st.sortBand()...)
+	}
 	if rightOuter {
 		st.indexPreserved(noKey)
 	}
@@ -1159,8 +1198,22 @@ func buildStage(p *joinPlan, step *joinStepPlan, seq iter.Seq[*joinRow], stats *
 // already free (see joinbuildside.go).
 func (st *joinStage) indexPreserved(noKey []*joinRow) {
 	if !st.hashed {
-		// No equality to bucket on, so the rows are already one dense slice.
-		st.preserved = st.all
+		// No equality to bucket on, so the rows are already one dense slice. A banded
+		// stage has moved the rows no window can admit out of it, and they go on the end
+		// exactly as the rows with no key do: preserved rows that matched nothing.
+		//
+		// noKey is empty for every stage that reaches here TODAY: only a banded stage
+		// fills it, and a banded join is never swapped (see planBuildSide), so it is
+		// never the right-outer step this preserves rows for. Written to carry them
+		// anyway, because the alternative is a branch that silently drops rows the day
+		// those two facts stop coinciding, and this costs an append of nothing.
+		//
+		// Copied into a slice of its own rather than appended onto st.all, which would
+		// write into the spare capacity sortBand leaves behind it -- st.all is what the
+		// walk searches, and it must not grow rows a window would then step into.
+		st.preserved = make([]*joinRow, 0, len(st.all)+len(noKey))
+		st.preserved = append(st.preserved, st.all...)
+		st.preserved = append(st.preserved, noKey...)
 		st.matched = make([]atomic.Bool, len(st.preserved))
 		return
 	}
@@ -1475,6 +1528,38 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 				}
 			}
 		}
+		// The band narrows the same way the hash does, by picking out the candidates that
+		// can match before any of them is looked at -- a contiguous window of the sorted
+		// side rather than a bucket. A window that admits nothing is the band's undefined
+		// key: no candidate, and the step's own kind decides what that means for the row.
+		if st.banded {
+			// Counted HERE, before the search can decline, so it reports the windows
+			// this step DECIDED rather than the ones that happened to hold something.
+			// A counter that skipped the empty ones would read as "the band did not
+			// run" on exactly the joins where it did the most work.
+			stats.BandWindows++
+			lo, hi, ok := st.bandWindow(p, rows, wk.resolve)
+			if !ok {
+				candidates = nil
+			} else {
+				candidates = st.all[lo:hi]
+				// Where the window starts IS where its candidates start in
+				// preserved, since a stage with no equality lays its rows out in
+				// one slice. Only a right-outer step reads base, and a banded join
+				// is never one -- set because the two lines belong together, not
+				// because anything reaches it.
+				base = lo
+				stats.BandCandidates += hi - lo
+			}
+		}
+		// Band 0 is decided by the window for every candidate it yielded, so only the
+		// rest are evaluated per pair. Where there is no window -- a step that hashes --
+		// every band is evaluated here.
+		bandFrom := 0
+		if st.banded {
+			bandFrom = 1
+		}
+		checkBands := len(st.step.band) > bandFrom
 		// A semi or anti step asks only whether a match EXISTS. It contributes no side to
 		// the row, so there is nothing to descend once per match with: the walk stops at the
 		// first matching candidate and descends once, or not at all.
@@ -1488,6 +1573,9 @@ func makeWalk[T any](p *joinPlan, stages []*joinStage, wk *joinWalk, stats *Join
 				return true
 			}
 			rows[st.step.side] = r
+			if checkBands && !p.bandsHold(st.step, rows, wk.resolve, bandFrom) {
+				continue
+			}
 			// The hash only narrowed the candidates; the condition decides, in full,
 			// with ClassAd's own semantics.
 			if !p.condHolds(st.step, rows, wk.resolve) {
