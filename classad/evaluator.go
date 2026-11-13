@@ -785,6 +785,53 @@ func (e *Evaluator) nowValue() Value {
 	return currentTimeValue()
 }
 
+// Bare scope keywords. Under HTCondor's old ClassAd semantics a few names
+// resolve to an ad rather than to an attribute: SELF and MY are the ad the
+// reference is evaluated in, ROOT and TOPLEVEL the outermost ad of its scope
+// chain, and PARENT the enclosing one. The reference engine turns these on in
+// the same call that makes CurrentTime magic (SetOldClassAdSemantics,
+// src/classad/classad.cpp), and this package implements that mode
+// unconditionally -- CurrentTime included, see currenttime.go -- so they are
+// always in effect here too.
+//
+// Their value is an ad, which is why they matter beyond a missing-attribute
+// lookup: condor_submit switches on the TYPE a request_<tag> evaluates to, and
+// an ad is neither a number nor undefined, so `request_gpus = MY` asks for
+// nothing where `request_gpus = undefined` still asks for a count.
+const (
+	selfAttr     = "self"
+	myAttr       = "my"
+	rootAttr     = "root"
+	topLevelAttr = "toplevel"
+	parentAttr   = "parent"
+)
+
+// resolveBareScopeName resolves an unscoped reference that names one of the
+// scope keywords, against the scope level ad where an ordinary lookup for it
+// just failed. The second result reports whether norm is such a keyword at all.
+// ad is the scope level being walked and is never nil; a non-nil ad always has
+// a root, so only PARENT can come up empty, at the top of the chain.
+//
+// A keyword resolves at that level instead of continuing up the enclosing
+// chain, matching the reference engine, which returns from inside its own
+// scope-walking loop (ClassAd::LookupInScope). An attribute of the same name
+// therefore shadows the keyword only in the ads at or below the one that
+// defines it, never from an enclosing scope.
+func (e *Evaluator) resolveBareScopeName(ad *ClassAd, norm string) (Value, bool) {
+	switch norm {
+	case selfAttr, myAttr:
+		return NewClassAdValue(ad), true
+	case rootAttr, topLevelAttr:
+		return NewClassAdValue(rootOf(ad)), true
+	case parentAttr:
+		if ad.parent == nil {
+			return NewUndefinedValue(), true
+		}
+		return NewClassAdValue(ad.parent), true
+	}
+	return NewUndefinedValue(), false
+}
+
 func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value {
 	if e.partial != nil {
 		if v, ok := e.partial(ref.Name, ref.Scope); ok {
@@ -832,6 +879,12 @@ func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value
 		for ad := e.classad; ad != nil; ad = ad.parent {
 			if expr := ad.lookupNorm(norm); expr != nil {
 				return e.evalAttrExpr(ad, norm, expr)
+			}
+			// Checked after the lookup at each level, so a real attribute
+			// shadows the keyword, and before walking up, so an unshadowed
+			// keyword resolves here rather than against an enclosing scope.
+			if v, ok := e.resolveBareScopeName(ad, norm); ok {
+				return v
 			}
 		}
 		// Old-ClassAd matchmaking fallthrough: an unqualified reference not found
