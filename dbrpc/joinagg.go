@@ -66,6 +66,9 @@ func (c *Client) JoinAggregate(ctx context.Context, jr JoinAggRequest) ([]db.Agg
 // JoinAggregateStats is the exported form.
 func (c *Client) joinAggregate(ctx context.Context, jr JoinAggRequest, rep *JoinStatsReport) ([]db.AggRow, error) {
 	wantStats := c.wantJoinStats(rep)
+	if err := refuseJoinBand(jr.Spec.Join); err != nil {
+		return nil, err
+	}
 	if !c.SupportsNewer(FeatJoinAgg) {
 		return nil, c.featureRefusal(FeatJoinAgg, ErrJoinAggUnsupported)
 	}

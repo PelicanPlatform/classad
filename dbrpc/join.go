@@ -503,6 +503,23 @@ func joinExprs(spec db.JoinSpec) []string {
 		for _, e := range st.Equi {
 			out = append(out, e.Left, e.Right)
 		}
+		out = append(out, bandExprs(st.Band)...)
+	}
+	// A band's bounds are expressions the server would evaluate, so they belong in this
+	// list for the same reason a step's constraint does. No band reaches a server today --
+	// refuseJoinBand stops every client path before one is encoded -- so this adds nothing
+	// to any request that is currently sent. It is here so that the gate is already right
+	// on the day the wire carries one, rather than being the thing that has to be
+	// remembered then.
+	out = append(out, bandExprs(spec.Band)...)
+	return out
+}
+
+// bandExprs is the expressions a set of bands would have the server evaluate.
+func bandExprs(bands []db.JoinBand) []string {
+	out := make([]string, 0, 2*len(bands))
+	for _, b := range bands {
+		out = append(out, b.Lo, b.Hi)
 	}
 	return out
 }
@@ -650,6 +667,9 @@ func (c *Client) JoinWire(ctx context.Context, jr JoinRequest, redact bool, yiel
 // they do with a short stream.
 func (c *Client) joinWire(ctx context.Context, jr JoinRequest, redact bool, yield func(row []byte) bool, rep *JoinStatsReport) error {
 	o, feat := joinOpFor(jr, opJoinWire, opJoinChainWire, FeatJoinWire, FeatJoinChainWire)
+	if err := refuseJoinBand(jr.Spec); err != nil {
+		return err
+	}
 	wantStats := c.wantJoinStats(rep)
 	if !c.SupportsNewer(feat) {
 		return c.featureRefusal(feat, ErrJoinWireUnsupported)

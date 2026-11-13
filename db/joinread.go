@@ -53,7 +53,10 @@ type joinReadProjection [][]string
 //     side is read as `alias.Attr`;
 //   - each equality's two halves: the one reading the accumulated row, which names a side
 //     the same way the ON terms do, and the one reading the step's own table, written
-//     against that table's ad.
+//     against that table's ad;
+//   - each band's attribute, read from the step's own table, and its two bounds, read over
+//     the accumulated row. A band is not in any ON term -- it is declared beside them -- so
+//     an attribute windowed on and nowhere else is exactly the attribute this would drop.
 //
 // A nil output projection on a side means the caller wants that side's whole ad, so there is
 // nothing to narrow it to and it is read whole.
@@ -183,6 +186,21 @@ func planJoinRead(spec JoinSpec) joinReadProjection {
 				sets[r.Alias].add(r.Name)
 			}
 		}
+		// A band reads the same two places an equality does, and is accounted for the same
+		// way: the attribute from the step's own table, the bounds over the row so far.
+		for _, b := range st.Band {
+			if name := strings.TrimSpace(b.Attr); name == "" || !addSideRefs(sets[side], name) {
+				ok[side] = false
+			}
+			for _, src := range []string{b.Lo, b.Hi} {
+				if strings.TrimSpace(src) == "" {
+					continue
+				}
+				if !addRowHalfRefs(sets, aliases, src) {
+					return whole
+				}
+			}
+		}
 	}
 
 	out := make(joinReadProjection, len(sides))
@@ -203,6 +221,52 @@ func sideIndexOf(sides []JoinSide, alias string) int {
 		}
 	}
 	return 0
+}
+
+// addRowHalfRefs accounts for a term written over the accumulated row -- a band's bound --
+// by adding what it reads to the sides it reads from.
+//
+// It returns false when the term cannot be accounted for at all and every side must be read
+// whole. A bare reference is taken as the FROM side's, which is what it means at the first
+// step and what rowHalfScope evaluates it against; past the first step compileBands has
+// already refused a term naming no side it may read.
+func addRowHalfRefs(sets []*attrSet, aliases []string, src string) bool {
+	q, err := vm.ParseAliases(src, aliases)
+	if err != nil || !q.AliasNative() {
+		return false
+	}
+	refs := q.AliasRefs()
+	if len(refs) == 0 {
+		// No qualified reference in it: either a constant, which reads nothing, or the
+		// bare spelling, which reads the FROM side. The two have to be told apart, and
+		// addSideRefs cannot do it -- it answers "is this a bare attribute name", so a
+		// constant comes back false, which would widen every side's read to the whole ad
+		// over a bound that reads nothing at all.
+		//
+		// SelfRefs names what the bare form reads and returns an empty list for a
+		// constant, which is the answer "reads nothing" rather than "could not be read".
+		// partialSafe is false where the refs cannot be known statically -- an eval() in
+		// the bound -- and that one really is unaccountable.
+		ex, perr := parser.ParseExpr(src)
+		if perr != nil {
+			return false
+		}
+		names, safe := vm.SelfRefsSafe(ex)
+		if !safe {
+			return false
+		}
+		for _, n := range names {
+			sets[0].add(n)
+		}
+		return true
+	}
+	for _, r := range refs {
+		if r.Alias < 0 || r.Alias >= len(sets) {
+			return false
+		}
+		sets[r.Alias].add(r.Name)
+	}
+	return true
 }
 
 // addSideRefs adds the attributes src reads on its own side, reporting false if it cannot

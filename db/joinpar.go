@@ -369,6 +369,8 @@ func tryAcquireJoin(sem chan struct{}, n int) int {
 // and a walker's own count includes rows produced after an early stop.
 func mergeJoinStats(dst, src *JoinStats) {
 	dst.ScanRows += src.ScanRows
+	dst.BandWindows += src.BandWindows
+	dst.BandCandidates += src.BandCandidates
 	dst.Pairs += src.Pairs
 	if dst.Err == nil && src.Err != nil {
 		dst.Err = src.Err

@@ -672,6 +672,9 @@ func (c *Client) ExplainJoin(ctx context.Context, jr JoinRequest) (*db.JoinExpla
 	if !c.SupportsNewer(FeatJoinExplain) {
 		return nil, c.featureRefusal(FeatJoinExplain, ErrJoinUnsupported)
 	}
+	if err := refuseJoinBand(jr.Spec); err != nil {
+		return nil, err
+	}
 	o, _ := joinOpFor(jr, opJoinExplain, opJoinChainExplain, FeatJoinExplain, FeatJoinExplain)
 	status, body, err := c.callCtx(ctx, joinFrameOp(jr, o, false, false, false))
 	if err != nil {

@@ -97,6 +97,15 @@ func (cat *Catalog) planBuildSide(spec JoinSpec, limits JoinLimits, unordered bo
 	case spec.Kind != JoinInner && spec.Kind != JoinCross && spec.Kind != JoinLeft:
 		return keep("a join of kind %d does not have a second orientation to compare",
 			int(spec.Kind))
+	// A band is not symmetric the way an equality is. `e.Ts BETWEEN j.Lo AND j.Hi` swapped
+	// is a window over neither attribute: it asks, for one value of Ts, which of two
+	// attributes of the other side bracket it. swapSides exchanges the sides and flips each
+	// equality's halves, and there is no flip of a band that says the same thing -- so a
+	// swap here would either refuse the plan on a bound that now reads its own side, or
+	// window the wrong table. Neither orientation is compared instead.
+	case len(spec.Band) > 0:
+		return keep("%s is windowed on %s, which is a window over that side and not a "+
+			"condition between the two", spec.Right.Alias, spec.Band[0].Attr)
 	case !unordered && !cat.orderFree(spec.Left):
 		return keep("%s is read in a fixed order, which is the order the join's rows come "+
 			"out in; set the archive's Unordered to let the planner choose", spec.Left.Alias)

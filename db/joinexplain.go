@@ -144,6 +144,16 @@ type JoinStepExplain struct {
 	// which is the point of reporting them.
 	Cond []string   `json:"cond,omitempty"`
 	Equi []JoinEqui `json:"equi,omitempty"`
+	// Band are the step's windows, and Banded says the step will be SEARCHED over the
+	// first of them rather than scanned whole. The two differ: a step that also hashes
+	// keeps its bands and is narrowed by the bucket instead, so Band is set there and
+	// Banded is not.
+	//
+	// Banded is a promise, not an eligibility, and is the same test the walk makes. A
+	// reader comparing it against JoinStats.BandWindows is comparing the plan against what
+	// ran.
+	Band   []JoinBand `json:"band,omitempty"`
+	Banded bool       `json:"banded,omitempty"`
 }
 
 // joinKindName spells a JoinKind for a reader.
@@ -285,6 +295,8 @@ func (cat *Catalog) ExplainJoin(spec JoinSpec, want JoinLimits) (JoinExplain, er
 			EstRecords: rows,
 			Cond:       steps[i].Cond,
 			Equi:       steps[i].Equi,
+			Band:       steps[i].Band,
+			Banded:     len(steps[i].Equi) == 0 && len(steps[i].Band) > 0,
 		})
 	}
 	if outerDriven {

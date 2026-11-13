@@ -291,6 +291,15 @@ func chainToStar(spec JoinSpec) (*chainStar, string) {
 			return nil, fmt.Sprintf("the step folding in %s has %d equalities and a chain "+
 				"is re-centred on one join key", aliases[side], len(st.Equi))
 		}
+		// A re-centred chain is REBUILT from its join keys: every step below is
+		// constructed fresh from the star's attributes, carrying the conditions across
+		// but nothing else. A band is not a join key and would not be carried, and a
+		// step that quietly lost one of its conjuncts answers with rows it should not
+		// have. So a chain holding one is left in the order it was written.
+		if len(st.Band) > 0 {
+			return nil, fmt.Sprintf("the step folding in %s is windowed on %s, which is "+
+				"not a join key a chain can be re-centred on", aliases[side], st.Band[0].Attr)
+		}
 		// The step's own half is written against its table's ad, so it is a bare attribute.
 		attr := bareAttrName(st.Equi[0].Right)
 		if attr == "" {
