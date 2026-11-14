@@ -308,6 +308,8 @@ type WatchEvent struct {
     Key    []byte
     Ad     *classad.ClassAd // set for WatchUpsert
     Cursor []byte           // opaque; persist after processing (set on live events + Synced)
+    Stamp  uint64           // comparable version (live events; the watermark on Synced)
+    Reason WatchResetReason // on WatchReset only: why
 }
 
 // Watch replays everything that may have changed since cursor (nil ⇒ full replay from
@@ -325,6 +327,24 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 | `WatchReset` | discard local state; an authoritative full snapshot of `Upsert`s follows | — |
 | `WatchSynced` | catch-up complete, now live | `Cursor` (durable resume point; swap the shadow here) |
 | `WatchResync` | live stream lagged, or the collection was truncated — reconnect with the last cursor | — |
+
+### Why a Reset happened
+
+A `Reset` is one event kind with causes that want completely different responses, so
+`WatchEvent.Reason` names which one. A consumer that treats them alike cannot tell records
+it **lost** from records it is merely being **re-sent**, and so cannot tell an operator
+which of the two happened.
+
+| `Reason` | Cause | What it means |
+|------|---------|---------|
+| `WatchResetInitial` | no cursor was supplied | First subscribe. Nothing was missed; the snapshot is the point. |
+| `WatchResetEpoch` | the cursor names another store generation | A restart. For a mutable collection, any restart without `WatchRetain`; for an append-only one, an unclean shutdown. The records are still there. |
+| `WatchResetRetention` | the cursor is older than what is still held | Below the append floor, or past the delete horizon. **The records between the cursor and the replay's start are gone.** Size the window, or chase a lagging consumer. |
+| `WatchResetAhead` | the cursor is ahead of the head | A restored backup, a rollback, or a store copied while open. Its sequences will be handed to records it never saw. The one worth paging on. |
+| `WatchResetCursorInvalid` | the cursor did not decode, or names another shard count | Not this store's cursor. |
+
+Only `WatchResetRetention` is a loss. The HTTP change feed turns it into a `gap` event
+carrying the window, in front of the reset (see `docs/changefeed.md`).
 
 `Upsert`/`Delete` are applied identically whether catching up or live — there is no
 separate "mode". The only control the client must honor is `Reset`, which conveys

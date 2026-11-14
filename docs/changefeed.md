@@ -94,7 +94,7 @@ One JSON object per line (SSE `data:` payload is one event). `ad` present only o
 ```json
 {"kind":"upsert","src":"ap40","ver":812,"key":"12.0","ad":{"Owner":"alice","JobStatus":4},"cursor":"eyJ...=="}
 {"kind":"delete","src":"ap40","ver":813,"key":"9.0","cursor":"eyJ...=="}
-{"kind":"reset","src":"ap40","cursor":"eyJ...=="}
+{"kind":"reset","src":"ap40","reason":"retention","cursor":"eyJ...=="}
 {"kind":"synced","src":"ap40","cursor":"eyJ...=="}
 {"kind":"gap","src":"ap40","fromMillis":1700000000000,"toMillis":1700086400000}
 ```
@@ -107,11 +107,27 @@ One JSON object per line (SSE `data:` payload is one event). `ad` present only o
 | `key`   | source storage key (addressed the `QueryKeys` way — never a self-reported attribute). |
 | `ad`    | the record as JSON (upsert only); projected if `project=` was requested. |
 | `cursor`| opaque resume/ACK token (base64 of the `db.Watch` cursor). |
+| `reason`| on a `reset` only: why (see below). |
 
-- `reset` — discard derived state for `src`; a fresh snapshot follows (first sync, or retention gap).
+- `reset` — discard derived state for `src`; a fresh snapshot follows. `reason` says why:
+
+  | `reason` | cause | the records are |
+  |---|---|---|
+  | `initial` | no cursor was supplied — first subscribe | — nothing was missed |
+  | `epoch` | the source restarted (uncleanly, for an archive) | still there, being re-sent |
+  | `retention` | the cursor is older than what the source still keeps | **gone** |
+  | `ahead` | the cursor is ahead of the source's head — a restored backup or a rollback | suspect; the one worth paging on |
+  | `cursor-invalid` | the cursor did not decode | — |
+
+  Only `retention` is a loss, and it is the only one that comes with a `gap`.
 - `synced` — caught up to head; `cursor` is a safe resume/ACK point.
 - `gap` — **advisory**: records lost to source retention before this sink caught up (like the
-  archivedropbox loss report). Not silently swallowed.
+  archivedropbox loss report). Not silently swallowed. It is sent **in front of** the `reset`
+  it describes, so a sink sees the loss before the replay that does not contain it.
+  `fromMillis` is what the source last recorded this subscriber acking — `0` if it has no
+  record, which an in-memory registry will not after the source restarts, and a sink that
+  tracks its own applied timestamp knows that end better than the source does. `toMillis` is
+  where the source's retained history now starts.
 
 Rationale for NDJSON: language-neutral and self-describing, so a non-Go sink parses it trivially.
 
@@ -127,6 +143,7 @@ GET /changefeed/v1/subscribe
     &cursor=<opaque>             # resume point; empty = from the source's current floor; "@begin" = full replay
     &constraint=<classad expr>   # optional server-side filter (selective)
     &project=Attr1,Attr2         # optional attribute projection (trim payload)
+    &since=<unix-millis>         # bound a replay the source COULD NOT resume (archive feeds only)
 Accept: text/event-stream
 Authorization: Bearer <token>    # non-CEDAR auth; token → src label + authorization
 
@@ -136,6 +153,21 @@ Authorization: Bearer <token>    # non-CEDAR auth; token → src label + authori
     data: {"kind":"synced","cursor":"..."}
     ...                          # unbounded until the client disconnects
 ```
+
+`since=` is the subscriber's own floor on a replay it did not ask to receive in full: when
+the cursor has fallen out of retention, the source skips records older than it rather than
+re-shipping everything it still holds. A federation upgrade that restarts hundreds of sources
+has each of them independently decide to replay its whole archive at one collector; `since`
+is how the collector bounds its own exposure without depending on how much any source
+retains.
+
+It applies **only** to a catch-up that lost history. A cursor that resumed cleanly is
+delivering records the sink has not seen and expects, and dropping those would skip them for
+good. It is **refused** (400), not ignored, on a mutable table — bounding a state replay
+leaves a half-built view — and where the feed stamps no record timestamp (`AgeAttr`). Records
+the source cannot timestamp are never skipped. The `gap` still names where the source's
+history starts, not where the subscriber chose to begin: those are different facts and only
+the first is a loss.
 
 ### 5.2 ACK (small POST, sink → source) — **the GC signal**
 ```
