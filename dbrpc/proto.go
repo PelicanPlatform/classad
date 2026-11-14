@@ -543,13 +543,110 @@ const (
 	// The group cells are tagged VALUES, as opAggregateTyped's are: there is no older peer
 	// to send the rendered text to, so the reply that needs no parse-back is the only one.
 	opJoinAgg op = 80
+
+	// opJoinBand, opJoinBandWire and opJoinBandExplain are opJoin, opJoinWire and
+	// opJoinExplain over a plan carrying BANDS -- ordered windows over one attribute of a
+	// folded side (db.JoinBand), which is how a range join gets an algorithm instead of a
+	// nested loop.
+	//
+	// SEPARATE OPCODES RATHER THAN A LONGER BODY, because a band cannot be allowed to go
+	// missing. It is a conjunct of the match: drop it and the rows outside the window pair
+	// anyway, so the answer has MORE rows than were asked for and nothing says so. A server
+	// built before bands would read appended band bytes as the next part of the frame, which
+	// is why the stats byte could be appended to opJoin and this cannot -- the stats byte
+	// changes what is reported, a band changes what matches.
+	//
+	// THREE OPCODES, NOT SIX. Each carries a leading LAYOUT byte naming its body, for
+	// opJoinAgg's reason: these ship knowing about both the pair and the chain spelling, so
+	// there is no older peer whose frame a flag would be changing, and the chain is a bit
+	// rather than three more opcodes. The byte is a mask -- bit 0 chain, bit 1 band -- and
+	// on these opcodes bit 1 must be set, since a plan with no band belongs on the opcode
+	// that predates them. An unknown bit is REFUSED.
+	//
+	// The reduce funnel needs no opcode: opJoinAgg already leads with this byte and already
+	// refuses a value it does not know, so bands reach it as two new values of a field that
+	// is there.
+	//
+	// [layout u8][join plan: opJoin's body, or opJoinChain's when bit 0, each with
+	//            [nBand i32]{[attr][lo][hi][ends u8]} after the equalities it belongs to]
+	//   [stats u8]
+	//     -> stream of [adText], then a stStreamJoinStats trailer when stats asked for one
+	//
+	// ends is a mask of the window's OPEN ends -- bit 0 lo, bit 1 hi -- rather than two
+	// bytes, because the pair is one fact about the window and splitting it invites a frame
+	// carrying half of it.
+	opJoinBand op = 81
+	// opJoinBandWire is opJoinBand with its rows in WIRE FORM, batched many per frame: the
+	// body is opJoinBand's with a redact byte appended before the stats byte, exactly as
+	// opJoinWire's is opJoin's, and the reply is opJoinWire's.
+	opJoinBandWire op = 82
+	// opJoinBandExplain reports how a banded join WOULD run, reading no records. The body is
+	// opJoinBand's without the stats byte -- a plan that runs nothing has no statistics --
+	// and the reply is opJoinExplain's.
+	//
+	// It is the only way to find out whether a band ENGAGED: a band narrows a step that has
+	// no equality, so a plan carrying both answers the same rows by hashing, and
+	// JoinStepExplain.Banded is what distinguishes the two.
+	//
+	// [opJoinBand body without the stats byte] -> [json db.JoinExplain]
+	opJoinBandExplain op = 83
 )
 
-// joinOpCarriesChain reports whether an opcode's body is a chain of steps rather than a pair
-// of sides. It is the one place the two body layouts are told apart, so the encoder and the
-// decoder cannot disagree about which they are looking at.
-func joinOpCarriesChain(o op) bool {
-	return o == opJoinChain || o == opJoinChainWire || o == opJoinChainExplain
+// joinLayout names a join request body: which spelling it uses, and whether it carries
+// bands. It rides as the leading byte of every opcode that accepts more than one layout.
+//
+// A mask rather than an enumeration so the two questions stay independent -- a chain may or
+// may not carry bands, and both combinations are plans a caller writes.
+type joinLayout uint8
+
+const (
+	// layoutChain is the chain spelling: the FROM side then one step per table folded in.
+	// Clear means the two-table spelling.
+	layoutChain joinLayout = 1 << 0
+	// layoutBand means each side or step carries its bands after its equalities.
+	layoutBand joinLayout = 1 << 1
+	// maxJoinLayout is every bit this build defines. A byte above it names a layout from a
+	// newer peer, and the only safe answer to one is to refuse: the bytes that follow are
+	// not the body this build knows how to read.
+	maxJoinLayout = layoutChain | layoutBand
+)
+
+func (l joinLayout) chain() bool { return l&layoutChain != 0 }
+func (l joinLayout) band() bool  { return l&layoutBand != 0 }
+
+// readJoinLayout reads the leading layout byte, refusing one this build does not define.
+//
+// want is the bits the opcode REQUIRES: the band opcodes pass layoutBand, because a plan
+// without one belongs on the opcode that predates them and accepting it here would give the
+// same plan two spellings on the wire.
+func readJoinLayout(r *reader, want joinLayout) (joinLayout, bool) {
+	b := joinLayout(r.u8())
+	if r.err != nil || b > maxJoinLayout || b&want != want {
+		return 0, false
+	}
+	return b, true
+}
+
+// joinOpLayout is the layout an opcode's body always has, for the opcodes whose NAME is the
+// layout. It is the one place those are told apart, so the encoder and the decoder cannot
+// disagree about which they are looking at.
+//
+// The opcodes that accept more than one layout are not here; they lead with the byte instead,
+// and joinOpLeadsWithLayout names them.
+func joinOpLayout(o op) joinLayout {
+	if o == opJoinChain || o == opJoinChainWire || o == opJoinChainExplain {
+		return layoutChain
+	}
+	return 0
+}
+
+// joinOpLeadsWithLayout reports whether an opcode's body begins with a layout byte.
+//
+// opJoinAgg is absent deliberately: it leads with the byte too, but its plan is a part of a
+// larger body that it reads and writes itself, so it never reaches the helpers that consult
+// this.
+func joinOpLeadsWithLayout(o op) bool {
+	return o == opJoinBand || o == opJoinBandWire || o == opJoinBandExplain
 }
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real

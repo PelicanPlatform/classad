@@ -171,6 +171,22 @@ const (
 	// that turns out wrong.
 	FeatJoinAgg Feature = "joinagg"
 
+	// FeatJoinBand is the join carrying ordered WINDOWS over a folded side (db.JoinBand):
+	// the band opcodes, and the two layout values that reach the reduce opcode. Postdates
+	// advertisement, so silence is a no.
+	//
+	// One feature for all four funnels, unlike the chain, which has one per funnel. The
+	// thing that made those separate does not apply: a band is a property of the CATALOG's
+	// join -- it either honours a window or it does not -- and no funnel can have it while
+	// another lacks it. What a funnel can lack is the funnel, so a banded request asks for
+	// this AND for the feature its unbanded form would have needed.
+	//
+	// It is the feature whose absence matters most to get right. Every other one here
+	// degrades to a slower path or a less precise answer; a band that went missing would
+	// pair the rows its window excludes, and a superset of the right rows is not a
+	// recognisable failure.
+	FeatJoinBand Feature = "joinband"
+
 	// FeatJoinStats is the join's EXECUTION statistics, returned as a trailer on the join
 	// opcodes when the request asks for them (db.JoinStats: which access path each step
 	// took and why, what the planner priced the orientations at, and how much work it did).
@@ -227,6 +243,7 @@ var serverFeatures = []Feature{
 	FeatTypedGroups,
 	FeatJoinAgg,
 	FeatJoinStats,
+	FeatJoinBand,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar
@@ -290,6 +307,16 @@ func (s *Server) SessionAttrs() map[string]string {
 		// that then fails.
 		if f == FeatJoinAgg {
 			if _, ok := s.cat.(joinAggCatalog); !ok {
+				continue
+			}
+		}
+		// A band needs a catalog that HONOURS one, which having a Join method does not
+		// say: a catalog from a build that predates bands has the same method and would
+		// run the join with the window dropped. Of all the yes-that-is-wrong cases here
+		// this is the one that does not announce itself, because the answer it produces
+		// is a superset rather than an error.
+		if f == FeatJoinBand {
+			if _, ok := s.cat.(joinCatalog); !ok || !catalogJoinsBands(s.cat) {
 				continue
 			}
 		}

@@ -572,6 +572,15 @@ type joinStepPlan struct {
 // question a relay needs answered.
 func (cat *Catalog) JoinsChains() bool { return true }
 
+// JoinsBands reports that this catalog's join understands a JoinBand.
+//
+// A capability marker for the same reason JoinsChains is one, and a sharper case of it. A
+// band is a CONJUNCT of the match, not a hint: a catalog that ignored one would pair rows
+// the window excludes and answer with more rows than were asked for. A build whose join
+// predates bands satisfies the same join interface and would do exactly that, so a relay
+// deciding whether to advertise the band opcodes has to ask rather than infer.
+func (cat *Catalog) JoinsBands() bool { return true }
+
 // Join pairs two or more tables and streams the joined rows.
 //
 // Setup problems -- an unknown table, an expression that does not parse -- are returned

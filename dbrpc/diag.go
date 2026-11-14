@@ -669,14 +669,12 @@ func (c *Client) ExplainTable(ctx context.Context, table, constraint string) (*d
 // A server that does not implement the opcode reports ErrJoinUnsupported, the same sentinel
 // Join uses, so a caller classifies both the same way.
 func (c *Client) ExplainJoin(ctx context.Context, jr JoinRequest) (*db.JoinExplain, error) {
-	if !c.SupportsNewer(FeatJoinExplain) {
-		return nil, c.featureRefusal(FeatJoinExplain, ErrJoinUnsupported)
-	}
-	if err := refuseJoinBand(jr.Spec); err != nil {
+	o, layout, err := c.joinSend(jr, opJoinExplain, opJoinChainExplain, opJoinBandExplain,
+		FeatJoinExplain, FeatJoinExplain, ErrJoinUnsupported)
+	if err != nil {
 		return nil, err
 	}
-	o, _ := joinOpFor(jr, opJoinExplain, opJoinChainExplain, FeatJoinExplain, FeatJoinExplain)
-	status, body, err := c.callCtx(ctx, joinFrameOp(jr, o, false, false, false))
+	status, body, err := c.callCtx(ctx, joinFrameOp(jr, o, layout, false, false, false))
 	if err != nil {
 		return nil, err
 	}
