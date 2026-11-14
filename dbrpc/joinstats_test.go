@@ -260,8 +260,8 @@ func TestJoinStatsAbsenceIsDistinguishableFromNoIndex(t *testing.T) {
 // every client has always sent. A server of any vintage must read it unchanged.
 func TestJoinStatsRequestByteIsOptional(t *testing.T) {
 	jr := statsProbeRequest()
-	plain := joinFrameOp(jr, opJoin, false, false, false)(1)
-	asking := joinFrameOp(jr, opJoin, false, false, true)(1)
+	plain := joinFrameOp(jr, opJoin, joinOpLayout(opJoin), false, false, false)(1)
+	asking := joinFrameOp(jr, opJoin, joinOpLayout(opJoin), false, false, true)(1)
 	if len(asking) != len(plain)+1 {
 		t.Fatalf("the stats byte changed the frame by %d bytes", len(asking)-len(plain))
 	}
@@ -278,7 +278,7 @@ func TestJoinStatsRequestByteIsOptional(t *testing.T) {
 			if !ok {
 				t.Fatal("the request frame has no readable header")
 			}
-			if _, ok := readJoinRequest(body, false); !ok {
+			if _, ok := readJoinRequest(body, 0); !ok {
 				t.Fatal("the frame did not decode")
 			}
 			if got := readJoinStatsByte(body); got != tc.want {

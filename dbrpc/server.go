@@ -813,19 +813,39 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opQueryRawWireOpts:
 		sc.s.streamQueryRawWireOpts(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opJoin:
-		sc.s.streamJoin(sc.ctx, reqID, body, priv, false, sc.write, sc.qlog)
+		sc.s.streamJoin(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinWire:
-		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, false, sc.write, sc.qlog)
+		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinChain:
-		sc.s.streamJoin(sc.ctx, reqID, body, priv, true, sc.write, sc.qlog)
+		sc.s.streamJoin(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinChainWire:
-		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, true, sc.write, sc.qlog)
+		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinAgg:
 		sc.s.streamJoinAggregate(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opJoinExplain:
-		sc.write(sc.s.explainJoin(reqID, body, priv, false))
+		sc.write(sc.s.explainJoin(reqID, body, priv, joinOpLayout(o)))
 	case opJoinChainExplain:
-		sc.write(sc.s.explainJoin(reqID, body, priv, true))
+		sc.write(sc.s.explainJoin(reqID, body, priv, joinOpLayout(o)))
+	// The banded opcodes lead with their layout, so the byte is read here and a value this
+	// build does not define is refused before any of it is interpreted as a plan.
+	case opJoinBand:
+		if l, ok := readJoinLayout(body, layoutBand); ok {
+			sc.s.streamJoin(sc.ctx, reqID, body, priv, l, sc.write, sc.qlog)
+		} else {
+			sc.write(respBad(reqID))
+		}
+	case opJoinBandWire:
+		if l, ok := readJoinLayout(body, layoutBand); ok {
+			sc.s.streamJoinWire(sc.ctx, reqID, body, priv, l, sc.write, sc.qlog)
+		} else {
+			sc.write(respBad(reqID))
+		}
+	case opJoinBandExplain:
+		if l, ok := readJoinLayout(body, layoutBand); ok {
+			sc.write(sc.s.explainJoin(reqID, body, priv, l))
+		} else {
+			sc.write(respBad(reqID))
+		}
 	case opQueryValues:
 		sc.s.streamQueryValues(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchSorted:

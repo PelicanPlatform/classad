@@ -176,16 +176,13 @@ func readJoinStats(r *reader) (db.JoinStats, string, bool) {
 // yielded. When one does, rep.Complete is false and rep.Stats describes the join up to the
 // point it stopped.
 func (c *Client) JoinStats(ctx context.Context, jr JoinRequest, yield func(row string) bool, rep *JoinStatsReport) error {
-	o, feat := joinOpFor(jr, opJoin, opJoinChain, FeatJoin, FeatJoinChain)
-	if err := refuseJoinBand(jr.Spec); err != nil {
-		rep.finish(err)
+	o, layout, err := c.joinSend(jr, opJoin, opJoinChain, opJoinBand, FeatJoin, FeatJoinChain,
+		ErrJoinUnsupported)
+	if err != nil {
 		return err
 	}
 	want := c.wantJoinStats(rep)
-	if !c.SupportsNewer(feat) {
-		return c.featureRefusal(feat, ErrJoinUnsupported)
-	}
-	err := c.streamEachTrailer(ctx, joinFrameOp(jr, o, false, false, want), yield,
+	err = c.streamEachTrailer(ctx, joinFrameOp(jr, o, layout, false, false, want), yield,
 		stStreamJoinStats, rep.take)
 	if errors.Is(err, ErrBadRequest) {
 		err = ErrJoinUnsupported

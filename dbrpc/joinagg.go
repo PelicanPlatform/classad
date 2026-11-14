@@ -66,13 +66,24 @@ func (c *Client) JoinAggregate(ctx context.Context, jr JoinAggRequest) ([]db.Agg
 // JoinAggregateStats is the exported form.
 func (c *Client) joinAggregate(ctx context.Context, jr JoinAggRequest, rep *JoinStatsReport) ([]db.AggRow, error) {
 	wantStats := c.wantJoinStats(rep)
-	if err := refuseJoinBand(jr.Spec.Join); err != nil {
-		return nil, err
-	}
 	if !c.SupportsNewer(FeatJoinAgg) {
 		return nil, c.featureRefusal(FeatJoinAgg, ErrJoinAggUnsupported)
 	}
 	chain := len(jr.Spec.Join.Steps) > 0
+	layout := joinLayout(0)
+	if chain {
+		layout |= layoutChain
+	}
+	// A band rides this opcode as two more values of the layout byte rather than an opcode
+	// of its own: the byte is already here and already refuses a value it does not know, so
+	// an older server rejects a banded request instead of serving it with the window
+	// dropped. The feature is still asked for, so the rejection costs no round trip.
+	if joinSpecHasBand(jr.Spec.Join) {
+		if !c.SupportsNewer(FeatJoinBand) {
+			return nil, c.featureRefusal(FeatJoinBand, ErrJoinBandUnsupported)
+		}
+		layout |= layoutBand
+	}
 	// A chain rides this opcode under a flag, but it still needs a server whose join folds
 	// in a third table, and that is what FeatJoinChain says. Asking for both is what keeps
 	// a chain from reaching a two-table server as a request it will refuse after a round
@@ -84,7 +95,7 @@ func (c *Client) joinAggregate(ctx context.Context, jr JoinAggRequest, rep *Join
 		return nil, err
 	}
 	nGroup, nAgg := len(jr.Spec.GroupCols), len(jr.Spec.Aggs)
-	_, frames, strm, err := c.callStream(joinAggFrame(jr, chain, wantStats))
+	_, frames, strm, err := c.callStream(joinAggFrame(jr, layout, wantStats))
 	if err != nil {
 		return nil, err
 	}
@@ -143,10 +154,10 @@ func refuseJoinAggSpec(spec db.JoinAggSpec) error {
 // joinAggFrame encodes the request: the join plan through the SAME encoder the row-streaming
 // join opcodes use, then the reduction. Sharing the encoder is what keeps the plan from
 // acquiring a second spelling here -- the decoder is likewise readJoinRequest, unchanged.
-func joinAggFrame(jr JoinAggRequest, chain, wantStats bool) func(uint64) []byte {
+func joinAggFrame(jr JoinAggRequest, layout joinLayout, wantStats bool) func(uint64) []byte {
 	return func(id uint64) []byte {
-		b := putU8(req(id, opJoinAgg), boolByte(chain))
-		b = appendJoinPlan(b, JoinRequest{Spec: jr.Spec.Join, Limits: jr.Limits}, chain)
+		b := putU8(req(id, opJoinAgg), uint8(layout))
+		b = appendJoinPlan(b, JoinRequest{Spec: jr.Spec.Join, Limits: jr.Limits}, layout)
 		b = putI32(b, int32(jr.Spec.MaxGroups))
 		b = putI32(b, int32(jr.Spec.MaxListValues))
 		b = putI32(b, int32(len(jr.Spec.GroupCols)))
@@ -187,13 +198,15 @@ const maxJoinAggGroupCols = 1024
 // streamJoinAggregate serves opJoinAgg.
 func (s *Server) streamJoinAggregate(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
 	start := time.Now()
-	chainByte := r.u8()
-	if r.err != nil || chainByte > 1 {
+	// This byte has always been read strictly, which is what lets bands arrive as two new
+	// values of it: a server that predates them refuses the request rather than reading
+	// the plan and serving it with the window gone.
+	layout, ok := readJoinLayout(r, 0)
+	if !ok {
 		write(respBad(reqID))
 		return
 	}
-	chain := chainByte == 1
-	jr, ok := readJoinRequest(r, chain)
+	jr, ok := readJoinRequest(r, layout)
 	if !ok {
 		write(respBad(reqID))
 		return
@@ -223,7 +236,7 @@ func (s *Server) streamJoinAggregate(ctx context.Context, reqID uint64, r *reade
 	var stats db.JoinStats
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: joinOpName("JoinAggregate", chain), Table: joinTables(jr.Spec),
+			qlog(QueryLog{Op: joinOpName("JoinAggregate", layout), Table: joinTables(jr.Spec),
 				Constraint: joinLogConstraint(jr.Spec), Limit: jr.Spec.Limit,
 				Rows: stats.Rows, Duration: time.Since(start)})
 		}()
@@ -249,7 +262,7 @@ func (s *Server) streamJoinAggregate(ctx context.Context, reqID uint64, r *reade
 	}
 
 	jc, ok := s.cat.(joinAggCatalog)
-	if !ok || (chain && !catalogJoinsChains(s.cat)) {
+	if !ok || !joinCatalogServes(s.cat, layout) {
 		write(respBad(reqID)) // this catalog serves no such aggregate; the client reduces for itself
 		return
 	}

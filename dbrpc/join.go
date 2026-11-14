@@ -80,9 +80,16 @@ func (c *Client) JoinRows(ctx context.Context, jr JoinRequest) ([]string, error)
 // wantStats appends the statistics byte, and only when the caller asked for them: a request
 // that does not ask is byte-for-byte the request every client has always sent, so a server
 // cannot tell a build that knows about the trailer from one that does not.
-func joinFrameOp(jr JoinRequest, o op, withRedact, redact, wantStats bool) func(uint64) []byte {
+func joinFrameOp(jr JoinRequest, o op, layout joinLayout, withRedact, redact, wantStats bool) func(uint64) []byte {
 	return func(id uint64) []byte {
-		b := appendJoinPlan(req(id, o), jr, joinOpCarriesChain(o))
+		b := req(id, o)
+		// The opcodes that accept more than one layout say which one they are sending;
+		// for the rest the opcode is the name, and writing a byte they do not expect
+		// would shift the whole body by one.
+		if joinOpLeadsWithLayout(o) {
+			b = putU8(b, uint8(layout))
+		}
+		b = appendJoinPlan(b, jr, layout)
 		if withRedact {
 			b = putU8(b, boolByte(redact))
 		}
@@ -102,11 +109,12 @@ func readJoinStatsByte(r *reader) bool {
 }
 
 // appendJoinPlan writes the plan itself, with the body layout named rather than derived from
-// an opcode. It is the mirror of readJoinRequest, which takes the same bool for the same
+// an opcode. It is the mirror of readJoinRequest, which takes the same layout for the same
 // reason: an opcode that carries a plan as part of a LARGER request -- opJoinAgg, whose body
-// continues with the reduction -- has no entry in joinOpCarriesChain and says which layout it
+// continues with the reduction -- is not named by its opcode alone and says which layout it
 // is sending instead.
-func appendJoinPlan(b []byte, jr JoinRequest, chain bool) []byte {
+func appendJoinPlan(b []byte, jr JoinRequest, layout joinLayout) []byte {
+	chain := layout.chain()
 	b = append(b, byte(jr.Spec.Kind))
 	b = putI32(b, int32(jr.Spec.Limit))
 	b = putI32(b, int32(jr.Limits.MaxHashRows))
@@ -122,14 +130,77 @@ func appendJoinPlan(b []byte, jr JoinRequest, chain bool) []byte {
 			b = putJoinSide(b, st.Side)
 			b = putStrs(b, st.Cond)
 			b = putJoinEqui(b, st.Equi)
+			if layout.band() {
+				b = putJoinBands(b, st.Band)
+			}
 		}
 		return b
 	}
 	b = putJoinSide(b, jr.Spec.Right)
 	b = putStrs(b, jr.Spec.Cond)
 	b = putStrs(b, jr.Spec.Post)
-	return putJoinEqui(b, jr.Spec.Equi)
+	b = putJoinEqui(b, jr.Spec.Equi)
+	if layout.band() {
+		b = putJoinBands(b, jr.Spec.Band)
+	}
+	return b
 }
+
+// putJoinBands writes a side's windows. readJoinBands reverses it.
+func putJoinBands(b []byte, bands []db.JoinBand) []byte {
+	b = putI32(b, int32(len(bands)))
+	for _, bd := range bands {
+		b = putStr(putStr(putStr(b, bd.Attr), bd.Lo), bd.Hi)
+		b = putU8(b, bandEnds(bd))
+	}
+	return b
+}
+
+// bandEnds packs which ends of the window are OPEN: bit 0 lo, bit 1 hi.
+func bandEnds(b db.JoinBand) uint8 {
+	var ends uint8
+	if b.LoOpen {
+		ends |= 1
+	}
+	if b.HiOpen {
+		ends |= 2
+	}
+	return ends
+}
+
+// readJoinBands reads a side's windows, refusing a count this build will not allocate for
+// and an ends byte with a bit it does not define.
+//
+// The unknown bit is refused rather than masked off because of what the bit means: a newer
+// peer's open end read as closed admits the boundary row, which is a wrong answer and not a
+// missing feature.
+func readJoinBands(r *reader) ([]db.JoinBand, bool) {
+	n := int(r.i32())
+	if r.err != nil || n < 0 || n > maxJoinBands {
+		return nil, false
+	}
+	if n == 0 {
+		return nil, true
+	}
+	out := make([]db.JoinBand, 0, n)
+	for i := 0; i < n; i++ {
+		bd := db.JoinBand{Attr: r.str(), Lo: r.str(), Hi: r.str()}
+		ends := r.u8()
+		if r.err != nil || ends > 3 {
+			return nil, false
+		}
+		bd.LoOpen = ends&1 != 0
+		bd.HiOpen = ends&2 != 0
+		out = append(out, bd)
+	}
+	return out, r.err == nil
+}
+
+// maxJoinBands caps the windows one side may carry. It bounds an allocation made from a
+// count read off the wire; a side windowed on more attributes than this is a plan nobody
+// writes, and only the first band of a step is searched in any case -- the rest are checked
+// as ordinary comparisons.
+const maxJoinBands = 16
 
 func putJoinEqui(b []byte, eq []db.JoinEqui) []byte {
 	b = putI32(b, int32(len(eq)))
@@ -174,9 +245,9 @@ func readJoinSide(r *reader) db.JoinSide {
 }
 
 // streamJoin serves opJoin.
-func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includePrivate, chain bool, write func([]byte), qlog func(QueryLog)) {
+func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includePrivate bool, layout joinLayout, write func([]byte), qlog func(QueryLog)) {
 	start := time.Now()
-	jr, ok := readJoinRequest(r, chain)
+	jr, ok := readJoinRequest(r, layout)
 	if !ok {
 		write(respBad(reqID))
 		return
@@ -187,7 +258,7 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 	var stats db.JoinStats
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: joinOpName("Join", chain), Table: joinTables(jr.Spec),
+			qlog(QueryLog{Op: joinOpName("Join", layout), Table: joinTables(jr.Spec),
 				Constraint: joinLogConstraint(jr.Spec), Limit: jr.Spec.Limit,
 				Rows: stats.Rows, Duration: time.Since(start)})
 		}()
@@ -206,7 +277,7 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 	}
 
 	jc, ok := s.cat.(joinCatalog)
-	if !ok || (chain && !catalogJoinsChains(s.cat)) {
+	if !ok || !joinCatalogServes(s.cat, layout) {
 		write(respBad(reqID)) // this catalog serves no such join; the client joins for itself
 		return
 	}
@@ -253,9 +324,9 @@ func writeJoinStats(reqID uint64, want bool, stats db.JoinStats, write func([]by
 //
 // A single over-budget row still gets its own frame, which is exactly opJoin's
 // one-frame-per-row behaviour -- so a jumbo joined row is never unshippable.
-func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, includePrivate, chain bool, write func([]byte), qlog func(QueryLog)) {
+func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, includePrivate bool, layout joinLayout, write func([]byte), qlog func(QueryLog)) {
 	start := time.Now()
-	jr, ok := readJoinRequest(r, chain)
+	jr, ok := readJoinRequest(r, layout)
 	if !ok {
 		write(respBad(reqID))
 		return
@@ -273,7 +344,7 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 	var stats db.JoinStats
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: joinOpName("JoinWire", chain), Table: joinTables(jr.Spec),
+			qlog(QueryLog{Op: joinOpName("JoinWire", layout), Table: joinTables(jr.Spec),
 				Constraint: joinLogConstraint(jr.Spec), Limit: jr.Spec.Limit,
 				Rows: stats.Rows, Duration: time.Since(start)})
 		}()
@@ -287,7 +358,7 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 		return
 	}
 	jc, ok := s.cat.(joinWireCatalog)
-	if !ok || (chain && !catalogJoinsChains(s.cat)) {
+	if !ok || !joinCatalogServes(s.cat, layout) {
 		write(respBad(reqID)) // this catalog serves no such join; the client takes the text one
 		return
 	}
@@ -354,7 +425,7 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 //
 // maxJoinChainSides bounds what one request may ask to be joined, because the step count is
 // read off the wire before anything is allocated for it.
-func readJoinRequest(r *reader, chain bool) (JoinRequest, bool) {
+func readJoinRequest(r *reader, layout joinLayout) (JoinRequest, bool) {
 	var jr JoinRequest
 	jr.Spec.Kind = db.JoinKind(r.u8())
 	jr.Spec.Limit = int(r.i32())
@@ -362,11 +433,18 @@ func readJoinRequest(r *reader, chain bool) (JoinRequest, bool) {
 	jr.Limits.MaxPairs = int(r.i32())
 	jr.Limits.MaxRows = int(r.i32())
 	jr.Spec.Left = readJoinSide(r)
-	if !chain {
+	if !layout.chain() {
 		jr.Spec.Right = readJoinSide(r)
 		jr.Spec.Cond = readStrs(r)
 		jr.Spec.Post = readStrs(r)
 		jr.Spec.Equi = readJoinEqui(r)
+		if layout.band() {
+			bands, ok := readJoinBands(r)
+			if !ok {
+				return jr, false
+			}
+			jr.Spec.Band = bands
+		}
 		return jr, r.err == nil
 	}
 	// A chain's kind byte is written and ignored; the kinds that matter are per step.
@@ -381,6 +459,13 @@ func readJoinRequest(r *reader, chain bool) (JoinRequest, bool) {
 		st.Side = readJoinSide(r)
 		st.Cond = readStrs(r)
 		st.Equi = readJoinEqui(r)
+		if layout.band() {
+			bands, ok := readJoinBands(r)
+			if !ok {
+				return jr, false
+			}
+			st.Band = bands
+		}
 		jr.Spec.Steps = append(jr.Spec.Steps, st)
 	}
 	return jr, r.err == nil
@@ -404,8 +489,11 @@ func readJoinEqui(r *reader) []db.JoinEqui {
 }
 
 // joinOpName labels the query log, so a slow chain is not filed under the two-table op.
-func joinOpName(base string, chain bool) string {
-	if chain {
+func joinOpName(base string, layout joinLayout) string {
+	if layout.band() {
+		base += "Band"
+	}
+	if layout.chain() {
 		return base + "Chain"
 	}
 	return base
@@ -426,6 +514,34 @@ type joinChainCatalog interface {
 func catalogJoinsChains(cat any) bool {
 	jc, ok := cat.(joinChainCatalog)
 	return ok && jc.JoinsChains()
+}
+
+// joinBandCatalog is the optional capability to honour a db.JoinBand.
+//
+// A marker for joinChainCatalog's reason, and a case where getting it wrong is worse. A
+// chain a catalog cannot fold answers a different query; a band a catalog ignores answers
+// the SAME query with the window removed, so the result is a superset of the right rows and
+// looks exactly like a correct answer to a laxer question.
+type joinBandCatalog interface {
+	JoinsBands() bool
+}
+
+// catalogJoinsBands reports whether this server's catalog honours a band.
+func catalogJoinsBands(cat any) bool {
+	jc, ok := cat.(joinBandCatalog)
+	return ok && jc.JoinsBands()
+}
+
+// joinCatalogServes reports whether this catalog can honour every part of a layout.
+//
+// One place rather than a condition per handler, because the failure it prevents is a
+// handler that checks the chain half and forgets the band half: the request would be served,
+// correctly as far as the code could tell, with a conjunct of the match missing.
+func joinCatalogServes(cat any, layout joinLayout) bool {
+	if layout.chain() && !catalogJoinsChains(cat) {
+		return false
+	}
+	return !layout.band() || catalogJoinsBands(cat)
 }
 
 // joinCatalog is the optional Catalog capability to run a join. Optional for the same reason
@@ -450,13 +566,13 @@ type joinExplainCatalog interface {
 // It goes through the same private-attribute gate the join itself does. The report names
 // the plan's expressions back to the caller, so a caller barred from referencing a private
 // attribute in a condition must not be able to get it echoed out of the explainer either.
-func (s *Server) explainJoin(reqID uint64, r *reader, includePrivate, chain bool) []byte {
-	jr, ok := readJoinRequest(r, chain)
+func (s *Server) explainJoin(reqID uint64, r *reader, includePrivate bool, layout joinLayout) []byte {
+	jr, ok := readJoinRequest(r, layout)
 	if !ok {
 		return respBad(reqID)
 	}
 	cat, ok := s.cat.(joinExplainCatalog)
-	if !ok {
+	if !ok || !joinCatalogServes(s.cat, layout) {
 		return respBad(reqID)
 	}
 	// BOTH gates the join itself applies, for the same reasons and in the same order. The
@@ -505,12 +621,8 @@ func joinExprs(spec db.JoinSpec) []string {
 		}
 		out = append(out, bandExprs(st.Band)...)
 	}
-	// A band's bounds are expressions the server would evaluate, so they belong in this
-	// list for the same reason a step's constraint does. No band reaches a server today --
-	// refuseJoinBand stops every client path before one is encoded -- so this adds nothing
-	// to any request that is currently sent. It is here so that the gate is already right
-	// on the day the wire carries one, rather than being the thing that has to be
-	// remembered then.
+	// A band's bounds are expressions the server evaluates against real ads, so they belong
+	// in this list for the same reason a step's constraint does.
 	out = append(out, bandExprs(spec.Band)...)
 	return out
 }
@@ -666,15 +778,13 @@ func (c *Client) JoinWire(ctx context.Context, jr JoinRequest, redact bool, yiel
 // exported form. One body rather than two, so the two entry points cannot diverge in what
 // they do with a short stream.
 func (c *Client) joinWire(ctx context.Context, jr JoinRequest, redact bool, yield func(row []byte) bool, rep *JoinStatsReport) error {
-	o, feat := joinOpFor(jr, opJoinWire, opJoinChainWire, FeatJoinWire, FeatJoinChainWire)
-	if err := refuseJoinBand(jr.Spec); err != nil {
+	o, layout, err := c.joinSend(jr, opJoinWire, opJoinChainWire, opJoinBandWire,
+		FeatJoinWire, FeatJoinChainWire, ErrJoinWireUnsupported)
+	if err != nil {
 		return err
 	}
 	wantStats := c.wantJoinStats(rep)
-	if !c.SupportsNewer(feat) {
-		return c.featureRefusal(feat, ErrJoinWireUnsupported)
-	}
-	_, ch, strm, err := c.callStream(joinFrameOp(jr, o, true, redact, wantStats))
+	_, ch, strm, err := c.callStream(joinFrameOp(jr, o, layout, true, redact, wantStats))
 	if err != nil {
 		return err
 	}
