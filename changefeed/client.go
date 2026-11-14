@@ -26,15 +26,17 @@ type PullConfig struct {
 	Constraint string   // optional server-side filter
 	Project    []string // optional attribute projection
 
-	// SinceMillis bounds a replay the source could NOT resume, in unix milliseconds: when
-	// the cursor has fallen out of retention, the source skips records older than this
-	// instead of re-shipping everything it still holds. It does not apply to a cursor that
-	// resumed cleanly -- those records are ones this sink has not seen and expects.
+	// SinceMillis bounds a FULL REPLAY, in unix milliseconds: the source skips records older
+	// than this instead of shipping everything it still holds. It applies to a cursor that
+	// could not be resumed for any reason, and to a first subscribe asking to be backfilled
+	// only so far. It does NOT apply to a cursor that resumed cleanly -- those records are
+	// ones this sink has not seen and expects, and the cursor it then commits is past them.
 	//
 	// It is how a collector bounds its own exposure independently of how much a source
 	// happens to retain. A fleet upgrade that restarts hundreds of sources uncleanly has
 	// each of them decide, on its own, to replay its whole archive at one collector;
-	// without this the collector cannot refuse, and the gap it is left with is silent.
+	// without this the collector cannot refuse. Those restarts produce `epoch` resets rather
+	// than `retention` ones, which is why this is not gated on the reason.
 	//
 	// Append-only (archive) feeds only, and only where the source stamps a record
 	// timestamp (ServerOptions.AgeAttr); the source rejects the subscription otherwise

@@ -191,3 +191,82 @@ func int64str(v int64) string {
 	}
 	return string(b)
 }
+
+// TestSinceBoundsEveryFullReplay is the correction to gating `since` on a retention reset.
+// The motivating case -- a federation upgrade restarting hundreds of sources -- produces
+// `epoch` resets, not `retention` ones, so the bound was silently dropped in exactly the
+// scenario it was written for. A first subscribe asking to be backfilled only so far is the
+// same shape. For an append-only sink, dropping records older than its own floor is safe on
+// ANY replay; what is not safe is dropping them from a clean incremental resume.
+func TestSinceBoundsEveryFullReplay(t *testing.T) {
+	const base = 1700000000
+
+	t.Run("epoch-reset", func(t *testing.T) {
+		dir := t.TempDir()
+		cat, a := openArchiveAt(t, dir)
+		srv := httptest.NewServer(Handler(cat, ServerOptions{AgeAttr: ageAttr, Heartbeat: time.Hour}))
+		for i := range 5 {
+			appendAt(t, a, i, base+int64(i))
+		}
+		evs := readEvents(t, srv.URL, url.Values{"table": {"transfers"}, "subscriber": {"c1"}, "src": {"s"}})
+		cursor := base64.StdEncoding.EncodeToString(evs[len(evs)-1].Cursor)
+		srv.Close()
+		if err := cat.Close(); err != nil {
+			t.Fatal(err)
+		}
+		crashTheSource(t, dir)
+
+		cat2, a2 := openArchiveAt(t, dir)
+		defer cat2.Close()
+		srv2 := httptest.NewServer(Handler(cat2, ServerOptions{AgeAttr: ageAttr, Heartbeat: time.Hour}))
+		defer srv2.Close()
+		for i := 5; i < 60; i++ {
+			appendAt(t, a2, i, base+int64(i))
+		}
+
+		q := url.Values{"table": {"transfers"}, "subscriber": {"c1"}, "src": {"s"}, "cursor": {cursor}}
+		full := upsertTS(readEvents(t, srv2.URL, q))
+		if len(full) < 10 {
+			t.Fatalf("epoch replay delivered %d records; too few to bound meaningfully", len(full))
+		}
+		since := full[len(full)/2]
+		q.Set("since", int64str(since))
+		bounded := upsertTS(readEvents(t, srv2.URL, q))
+		if len(bounded) == 0 {
+			t.Fatal("bounded epoch replay delivered nothing")
+		}
+		if len(bounded) >= len(full) {
+			t.Errorf("since did not bound an epoch replay: %d records with a floor, %d without", len(bounded), len(full))
+		}
+		for _, ts := range bounded {
+			if ts < since {
+				t.Errorf("record at %d is below the requested floor %d", ts, since)
+			}
+		}
+	})
+
+	t.Run("first-subscribe", func(t *testing.T) {
+		cat, a := rotatingArchive(t, "transfers")
+		srv := httptest.NewServer(Handler(cat, ServerOptions{AgeAttr: ageAttr, Heartbeat: time.Hour}))
+		defer srv.Close()
+		for i := range 40 {
+			appendAt(t, a, i, base+int64(i))
+		}
+		q := url.Values{"table": {"transfers"}, "subscriber": {"new"}, "src": {"s"}}
+		full := upsertTS(readEvents(t, srv.URL, q))
+		if len(full) < 10 {
+			t.Fatalf("first replay delivered %d records; too few to bound", len(full))
+		}
+		since := full[len(full)/2]
+		q.Set("since", int64str(since))
+		bounded := upsertTS(readEvents(t, srv.URL, q))
+		if len(bounded) >= len(full) || len(bounded) == 0 {
+			t.Errorf("since did not bound a first subscribe: %d with a floor, %d without", len(bounded), len(full))
+		}
+		for _, ts := range bounded {
+			if ts < since {
+				t.Errorf("record at %d is below the requested floor %d", ts, since)
+			}
+		}
+	})
+}

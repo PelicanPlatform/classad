@@ -233,8 +233,12 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 	// A retention Reset is held until the first replayed record reveals where the retained
 	// history now starts, so the Gap announcing the loss can name both ends of the window.
 	// held is empty once they have been written.
-	var held []Event
-	catchingUp, lostHistory := true, false
+	// heldReset is a Reset waiting for the first replayed record to reveal where the source's
+	// retained history now starts. Until that is known the handler cannot say whether the
+	// subscriber lost anything, and nothing may overtake the Reset in the meantime.
+	var heldReset *replicate.Change
+	var heldAck int64
+	catchingUp, fullReplay := true, false
 	for {
 		select {
 		case <-ctx.Done():
@@ -254,23 +258,17 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 				continue // resync: not sink-visible
 			}
 			ver++
-			if ch.Kind == replicate.KindReset && ch.Reason == replicate.ResetRetention {
-				// Records between this subscriber's cursor and the replay's start are GONE,
-				// not merely re-sent. Hold the Reset: the Gap that says so goes out in front
-				// of it, and its far end is not known until the next record arrives.
-				lostHistory = true
-				// The Gap goes out first, so it takes the version the Reset was assigned and
-				// the Reset takes the next one. Versions stay strictly monotonic in the order
-				// the subscriber receives them, which is what a sink dedupes on.
-				gap := Event{Kind: replicate.KindGap, Src: g.Src, Ver: ch.Ver, FromMillis: s.ackOf(table, g.Subscriber)}
-				ch.Ver = ver
-				ver++
-				resetEv, err := ToEvent(ch)
-				if err != nil {
-					return
+			if ch.Kind == replicate.KindReset {
+				fullReplay = true
+				if len(cursor) > 0 {
+					// This subscriber presented a position and could not be resumed from it,
+					// whatever the reason. Hold the Reset until the replay's start is known;
+					// only then can the handler tell whether anything is missing.
+					heldAck = s.ackOf(table, g.Subscriber)
+					held := ch
+					heldReset = &held
+					continue
 				}
-				held = []Event{gap, resetEv}
-				continue
 			}
 			var ts int64
 			if ch.Kind == replicate.KindUpsert && ch.Ad != nil {
@@ -278,25 +276,39 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 				// now starts, which a subscriber's filter has no say in.
 				ts = stampTS(ch.Ad, s.opts.AgeAttr)
 			}
-			if len(held) > 0 {
+			if heldReset != nil {
 				// On the FIRST event after the Reset, whatever it is: the Reset has to
-				// precede the replay it introduces, so nothing may overtake it while the
-				// window's far end is still unknown. ts is 0 when that event is not a
+				// precede the replay it introduces. ts is 0 when that event is not a
 				// timestamped record, which is the honest answer for an end we cannot see.
-				held[0].ToMillis = ts
-				for i := range held {
-					if err := s.writeSSE(w, flusher, held[i]); err != nil {
+				rst := *heldReset
+				heldReset = nil
+				if gapWanted(rst.Reason, heldAck, ts) {
+					// The Gap goes out first, so it takes the version the Reset was assigned
+					// and the Reset takes the next one. Versions stay monotonic in the order
+					// the subscriber receives them, which is what a sink dedupes on.
+					gap := Event{Kind: replicate.KindGap, Src: g.Src, Ver: rst.Ver,
+						FromMillis: heldAck, ToMillis: ts}
+					if err := s.writeSSE(w, flusher, gap); err != nil {
 						return
 					}
+					rst.Ver = ver
+					ver++
 				}
-				held = nil
+				rstEv, err := ToEvent(rst)
+				if err != nil {
+					return
+				}
+				if err := s.writeSSE(w, flusher, rstEv); err != nil {
+					return
+				}
 			}
 			if ch.Kind == replicate.KindUpsert && ch.Ad != nil {
 				// since is the subscriber's own floor on a replay it did not ask to receive
-				// in full. It applies only to a catch-up that LOST history: a cursor that
-				// resumed cleanly is delivering records the subscriber has not seen and
-				// expects, and silently dropping those would skip them for good.
-				if since > 0 && catchingUp && lostHistory && ts > 0 && ts < since {
+				// in full. It applies to any FULL REPLAY -- a cursor that could not be
+				// resumed, and a first subscribe asking to be backfilled only so far -- but
+				// never to a clean incremental resume, whose records are ones the sink has
+				// not seen and expects, and which silently dropping would skip for good.
+				if since > 0 && catchingUp && fullReplay && ts > 0 && ts < since {
 					continue
 				}
 				if matcher != nil && !matcher.Matches(ch.Ad) {
@@ -320,6 +332,26 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// gapWanted reports whether a subscriber that could not be resumed should be told it may
+// have lost records. ackMillis is what the source last recorded it persisting (0 = unknown)
+// and oldestMillis is where the source's retained history now starts (0 = unknown).
+//
+// The rule is "say so unless it can be ruled out", because the alternative failure is
+// silent. A retention reset is proof of loss: the cursor was below the append floor, which
+// is what the sequence numbers showed. Every other reason is NOT proof that nothing went
+// missing -- an unclean restart rotates the epoch, and a source that also rotated while it
+// was down has both lost records and no comparable sequence to show it with, since a cursor
+// from a different store generation cannot be measured against this one's floor. The one
+// case that CAN be ruled out is an ack at or past the oldest record still retained: whatever
+// else happened, everything from there on is still here and about to be replayed.
+func gapWanted(reason replicate.ResetReason, ackMillis, oldestMillis int64) bool {
+	if reason == replicate.ResetRetention {
+		return true
+	}
+	bothKnown := ackMillis > 0 && oldestMillis > 0
+	return !bothKnown || ackMillis < oldestMillis
 }
 
 // ackOf returns what the source last recorded this subscriber as having durably persisted,

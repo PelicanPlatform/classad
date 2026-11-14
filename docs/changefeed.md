@@ -114,20 +114,35 @@ One JSON object per line (SSE `data:` payload is one event). `ad` present only o
   | `reason` | cause | the records are |
   |---|---|---|
   | `initial` | no cursor was supplied — first subscribe | — nothing was missed |
-  | `epoch` | the source restarted (uncleanly, for an archive) | still there, being re-sent |
+  | `epoch` | the source restarted (uncleanly, for an archive) | **unknown** — see below |
   | `retention` | the cursor is older than what the source still keeps | **gone** |
   | `ahead` | the cursor is ahead of the source's head — a restored backup or a rollback | suspect; the one worth paging on |
   | `cursor-invalid` | the cursor did not decode | — |
 
-  Only `retention` is a loss, and it is the only one that comes with a `gap`.
+  `retention` is proof of loss: the cursor was below the append floor, which the sequence
+  numbers showed. `epoch` is **not** proof that nothing went missing — a cursor from another
+  store generation cannot be measured against this one's floor, so a source that rotated
+  while it was down has lost records and no sequence to show it with. Do not read a reason
+  other than `retention` as "nothing was lost"; read the presence or absence of a `gap`.
 - `synced` — caught up to head; `cursor` is a safe resume/ACK point.
-- `gap` — **advisory**: records lost to source retention before this sink caught up (like the
-  archivedropbox loss report). Not silently swallowed. It is sent **in front of** the `reset`
-  it describes, so a sink sees the loss before the replay that does not contain it.
-  `fromMillis` is what the source last recorded this subscriber acking — `0` if it has no
-  record, which an in-memory registry will not after the source restarts, and a sink that
-  tracks its own applied timestamp knows that end better than the source does. `toMillis` is
-  where the source's retained history now starts.
+- `gap` — **advisory**: records may have been lost before this sink caught up. Not silently
+  swallowed. It is sent **in front of** the `reset` it describes, so a sink sees the loss
+  before the replay that does not contain it.
+
+  **A `gap` is sent whenever a subscriber that presented a cursor could not be resumed from
+  it, unless loss can be ruled out.** It is ruled out only by an ack at or past the oldest
+  record the source still retains: whatever made the cursor unusable, everything from there
+  on is still here and about to be replayed. So no `gap` means either a clean resume, a first
+  subscribe (no cursor was presented — nothing could have been missed), or an ack that
+  provably covers the retained history. The rule is "say so unless it can be ruled out",
+  because the alternative failure is silent.
+
+  `toMillis` is where the source's retained history now starts. `fromMillis` is what the
+  source last recorded this subscriber acking, and is **`0` when that is unknown** — which an
+  in-memory registry always is after the source restarts, i.e. in precisely the unclean-restart
+  case. `0` is a missing lower bound, not a claim that the window starts at the epoch: a sink
+  should use `max(fromMillis, its own applied timestamp)`, which it knows better than the
+  source does. A durable registry is what makes `fromMillis` dependable.
 
 Rationale for NDJSON: language-neutral and self-describing, so a non-Go sink parses it trivially.
 
@@ -143,7 +158,7 @@ GET /changefeed/v1/subscribe
     &cursor=<opaque>             # resume point; empty = from the source's current floor; "@begin" = full replay
     &constraint=<classad expr>   # optional server-side filter (selective)
     &project=Attr1,Attr2         # optional attribute projection (trim payload)
-    &since=<unix-millis>         # bound a replay the source COULD NOT resume (archive feeds only)
+    &since=<unix-millis>         # bound a FULL REPLAY (archive feeds only)
 Accept: text/event-stream
 Authorization: Bearer <token>    # non-CEDAR auth; token → src label + authorization
 
@@ -154,16 +169,17 @@ Authorization: Bearer <token>    # non-CEDAR auth; token → src label + authori
     ...                          # unbounded until the client disconnects
 ```
 
-`since=` is the subscriber's own floor on a replay it did not ask to receive in full: when
-the cursor has fallen out of retention, the source skips records older than it rather than
-re-shipping everything it still holds. A federation upgrade that restarts hundreds of sources
-has each of them independently decide to replay its whole archive at one collector; `since`
-is how the collector bounds its own exposure without depending on how much any source
-retains.
+`since=` is the subscriber's own floor on a replay it did not ask to receive in full: the
+source skips records older than it rather than shipping everything it still holds. A
+federation upgrade that restarts hundreds of sources has each of them independently decide to
+replay its whole archive at one collector; `since` is how the collector bounds its own
+exposure without depending on how much any source retains.
 
-It applies **only** to a catch-up that lost history. A cursor that resumed cleanly is
-delivering records the sink has not seen and expects, and dropping those would skip them for
-good. It is **refused** (400), not ignored, on a mutable table — bounding a state replay
+It applies to **every full replay** — a cursor that could not be resumed for any reason, and
+a first subscribe (or an explicit `@begin`) asking to be backfilled only so far. It does
+**not** apply to a clean incremental resume: those records are ones the sink has not seen and
+expects, and dropping them would skip them for good, since the cursor the sink then commits
+is past them. It is **refused** (400), not ignored, on a mutable table — bounding a state replay
 leaves a half-built view — and where the feed stamps no record timestamp (`AgeAttr`). Records
 the source cannot timestamp are never skipped. The `gap` still names where the source's
 history starts, not where the subscriber chose to begin: those are different facts and only
