@@ -90,8 +90,8 @@ func readEvents(t *testing.T, base string, q url.Values) []Event {
 
 func kinds(evs []Event) []replicate.Kind {
 	out := make([]replicate.Kind, 0, len(evs))
-	for _, e := range evs {
-		out = append(out, e.Kind)
+	for i := range evs {
+		out = append(out, evs[i].Kind)
 	}
 	return out
 }
@@ -122,9 +122,9 @@ func staleCursor(t *testing.T, srv *httptest.Server, a *db.ArchiveTable, table s
 	}
 	// What the replay will now start from: the oldest record still retained.
 	after := readEvents(t, srv.URL, url.Values{"table": {table}, "subscriber": {"probe"}, "src": {"s"}})
-	for _, e := range after {
-		if e.Kind == replicate.KindUpsert {
-			return base64.StdEncoding.EncodeToString(cur), e.TS
+	for i := range after {
+		if after[i].Kind == replicate.KindUpsert {
+			return base64.StdEncoding.EncodeToString(cur), after[i].TS
 		}
 	}
 	t.Fatal("replay yielded no records")

@@ -16,9 +16,9 @@ import (
 // upsertTS returns the timestamps of the upserts in a replay, in delivery order.
 func upsertTS(evs []Event) []int64 {
 	var out []int64
-	for _, e := range evs {
-		if e.Kind == replicate.KindUpsert {
-			out = append(out, e.TS)
+	for i := range evs {
+		if evs[i].Kind == replicate.KindUpsert {
+			out = append(out, evs[i].TS)
 		}
 	}
 	return out

@@ -284,8 +284,8 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 				// window's far end is still unknown. ts is 0 when that event is not a
 				// timestamped record, which is the honest answer for an end we cannot see.
 				held[0].ToMillis = ts
-				for _, ev := range held {
-					if err := s.writeSSE(w, flusher, ev); err != nil {
+				for i := range held {
+					if err := s.writeSSE(w, flusher, held[i]); err != nil {
 						return
 					}
 				}

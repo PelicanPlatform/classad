@@ -98,8 +98,8 @@ func TestWatchResetReasons(t *testing.T) {
 		if cursor == nil {
 			t.Fatal("no cursor from the initial sync")
 		}
-		if err := c.Close(); err != nil {
-			t.Fatal(err)
+		if cerr := c.Close(); cerr != nil {
+			t.Fatal(cerr)
 		}
 		c2, err := Open(Options{Dir: dir, Shards: 1, WatchHistory: 1024})
 		if err != nil {
