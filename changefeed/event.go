@@ -24,11 +24,15 @@ type Event struct {
 
 	FromMillis int64 `json:"fromMillis,omitempty"`
 	ToMillis   int64 `json:"toMillis,omitempty"`
+
+	// Reason, on a reset, says why (see replicate.ResetReason).
+	Reason replicate.ResetReason `json:"reason,omitempty"`
 }
 
 // ToEvent renders a Change as its wire Event (marshaling the ad to JSON).
 func ToEvent(c replicate.Change) (Event, error) {
-	e := Event{Kind: c.Kind, Src: c.Src, Ver: c.Ver, Key: c.Key, Cursor: c.Cursor, TS: c.TS, FromMillis: c.FromMillis, ToMillis: c.ToMillis}
+	e := Event{Kind: c.Kind, Src: c.Src, Ver: c.Ver, Key: c.Key, Cursor: c.Cursor, TS: c.TS,
+		FromMillis: c.FromMillis, ToMillis: c.ToMillis, Reason: c.Reason}
 	if c.Kind == replicate.KindUpsert && c.Ad != nil {
 		b, err := c.Ad.MarshalJSON()
 		if err != nil {
@@ -41,7 +45,8 @@ func ToEvent(c replicate.Change) (Event, error) {
 
 // ToChange parses a wire Event back into an in-memory Change (unmarshaling the ad JSON).
 func ToChange(e Event) (replicate.Change, error) {
-	c := replicate.Change{Kind: e.Kind, Src: e.Src, Ver: e.Ver, Key: e.Key, Cursor: e.Cursor, TS: e.TS, FromMillis: e.FromMillis, ToMillis: e.ToMillis}
+	c := replicate.Change{Kind: e.Kind, Src: e.Src, Ver: e.Ver, Key: e.Key, Cursor: e.Cursor, TS: e.TS,
+		FromMillis: e.FromMillis, ToMillis: e.ToMillis, Reason: e.Reason}
 	if e.Kind == replicate.KindUpsert && len(e.Ad) > 0 {
 		ad := classad.New()
 		if err := ad.UnmarshalJSON(e.Ad); err != nil {

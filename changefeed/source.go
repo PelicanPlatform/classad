@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"iter"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,14 +96,18 @@ type watchable interface {
 	WatchRedacted(ctx context.Context, cursor []byte) (iter.Seq[db.WatchEvent], error)
 }
 
-func (s *server) resolve(table string) (watchable, bool) {
+// resolve finds the table and reports whether it is append-only (an archive). The two are
+// watched identically but replay very differently: an archive's replay is an event log a
+// consumer appends, a mutable table's is a state snapshot it rebuilds from. Only the first
+// can have its replay bounded without leaving the consumer with a half-built view.
+func (s *server) resolve(table string) (w watchable, appendOnly, ok bool) {
 	if a, ok := s.cat.ArchiveTable(table); ok {
-		return a, true
+		return a, true, true
 	}
 	if d, ok := s.cat.Table(table); ok {
-		return d, true
+		return d, false, true
 	}
-	return nil, false
+	return nil, false, false
 }
 
 func (s *server) authOf(r *http.Request) (Grant, bool) {
@@ -128,7 +133,7 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "table required", http.StatusBadRequest)
 		return
 	}
-	tbl, ok := s.resolve(table)
+	tbl, appendOnly, ok := s.resolve(table)
 	if !ok {
 		http.Error(w, "no such table: "+table, http.StatusNotFound)
 		return
@@ -137,6 +142,25 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "bad cursor", http.StatusBadRequest)
 		return
+	}
+	since, err := parseSince(q.Get("since"))
+	if err != nil {
+		http.Error(w, "bad since: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if since > 0 {
+		// Refused rather than ignored, both times: a subscriber that asked to bound its
+		// replay and was quietly given the whole thing is the failure this parameter exists
+		// to prevent.
+		if !appendOnly {
+			http.Error(w, "since is only supported on an append-only (archive) table: "+
+				"dropping records from a mutable table's replay would leave a half-built state view", http.StatusBadRequest)
+			return
+		}
+		if s.opts.AgeAttr == "" {
+			http.Error(w, "since requires the feed to be configured with an age attribute", http.StatusBadRequest)
+			return
+		}
 	}
 	var matcher *vm.Query
 	if c := strings.TrimSpace(q.Get("constraint")); c != "" {
@@ -206,6 +230,11 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 	hb := time.NewTicker(s.opts.Heartbeat)
 	defer hb.Stop()
 	var ver uint64
+	// A retention Reset is held until the first replayed record reveals where the retained
+	// history now starts, so the Gap announcing the loss can name both ends of the window.
+	// held is empty once they have been written.
+	var held []Event
+	catchingUp, lostHistory := true, false
 	for {
 		select {
 		case <-ctx.Done():
@@ -225,11 +254,55 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 				continue // resync: not sink-visible
 			}
 			ver++
+			if ch.Kind == replicate.KindReset && ch.Reason == replicate.ResetRetention {
+				// Records between this subscriber's cursor and the replay's start are GONE,
+				// not merely re-sent. Hold the Reset: the Gap that says so goes out in front
+				// of it, and its far end is not known until the next record arrives.
+				lostHistory = true
+				// The Gap goes out first, so it takes the version the Reset was assigned and
+				// the Reset takes the next one. Versions stay strictly monotonic in the order
+				// the subscriber receives them, which is what a sink dedupes on.
+				gap := Event{Kind: replicate.KindGap, Src: g.Src, Ver: ch.Ver, FromMillis: s.ackOf(table, g.Subscriber)}
+				ch.Ver = ver
+				ver++
+				resetEv, err := ToEvent(ch)
+				if err != nil {
+					return
+				}
+				held = []Event{gap, resetEv}
+				continue
+			}
+			var ts int64
 			if ch.Kind == replicate.KindUpsert && ch.Ad != nil {
+				// Before the constraint: the window's far end is where the SOURCE's history
+				// now starts, which a subscriber's filter has no say in.
+				ts = stampTS(ch.Ad, s.opts.AgeAttr)
+			}
+			if len(held) > 0 {
+				// On the FIRST event after the Reset, whatever it is: the Reset has to
+				// precede the replay it introduces, so nothing may overtake it while the
+				// window's far end is still unknown. ts is 0 when that event is not a
+				// timestamped record, which is the honest answer for an end we cannot see.
+				held[0].ToMillis = ts
+				for _, ev := range held {
+					if err := s.writeSSE(w, flusher, ev); err != nil {
+						return
+					}
+				}
+				held = nil
+			}
+			if ch.Kind == replicate.KindUpsert && ch.Ad != nil {
+				// since is the subscriber's own floor on a replay it did not ask to receive
+				// in full. It applies only to a catch-up that LOST history: a cursor that
+				// resumed cleanly is delivering records the subscriber has not seen and
+				// expects, and silently dropping those would skip them for good.
+				if since > 0 && catchingUp && lostHistory && ts > 0 && ts < since {
+					continue
+				}
 				if matcher != nil && !matcher.Matches(ch.Ad) {
 					continue
 				}
-				ch.TS = stampTS(ch.Ad, s.opts.AgeAttr)
+				ch.TS = ts
 				if len(project) > 0 {
 					ch.Ad = projectAd(ch.Ad, project)
 				}
@@ -242,10 +315,44 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if ch.Kind == replicate.KindSynced {
+				catchingUp = false
 				s.opts.Registry.Renew(table, g.Subscriber, time.Now())
 			}
 		}
 	}
+}
+
+// ackOf returns what the source last recorded this subscriber as having durably persisted,
+// in unix millis, or 0 if it has no record of it. 0 is the honest answer rather than a
+// guess: the default Registry is in memory, so a source that restarted has forgotten every
+// ack, and a subscriber that tracks its own applied timestamp knows this end of the window
+// better than the source does.
+func (s *server) ackOf(table, subscriber string) int64 {
+	if subscriber == "" {
+		return 0
+	}
+	for _, st := range s.opts.Registry.Subscribers(table, time.Now()) {
+		if st.Subscriber == subscriber {
+			return st.AckMillis
+		}
+	}
+	return 0
+}
+
+// parseSince parses the subscribe handler's since= parameter: unix milliseconds, or empty
+// for none.
+func parseSince(v string) (int64, error) {
+	if v = strings.TrimSpace(v); v == "" {
+		return 0, nil
+	}
+	ms, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not unix milliseconds: %q", v)
+	}
+	if ms < 0 {
+		return 0, fmt.Errorf("negative: %d", ms)
+	}
+	return ms, nil
 }
 
 func (s *server) writeSSE(w http.ResponseWriter, f http.Flusher, ev Event) error {
