@@ -31,6 +31,10 @@ type Catalog struct {
 	// at startup as well as on demand -- gets the same delta-record setting. See CatalogConfig.
 	deltaMax    int
 	deltaMaxFor map[string]int
+	// watchRetain and watchRetainFor are carried from CatalogConfig for the same reason
+	// deltaMax is. See CatalogConfig.WatchRetain.
+	watchRetain    time.Duration
+	watchRetainFor map[string]time.Duration
 	// disableReadVerify is CatalogConfig.DisableReadVerification, applied to every table.
 	disableReadVerify bool
 
@@ -127,6 +131,24 @@ type CatalogConfig struct {
 	SealMigrationWorkers int
 	// QueryParallelism applies Config.QueryParallelism to every table the catalog opens.
 	QueryParallelism int
+
+	// WatchRetain sets Config.WatchRetain -- how far back in time a table keeps its delete
+	// markers, so a watcher that reconnects after a restart can be told which keys went away
+	// instead of being sent back for a full replay -- for every table this catalog opens.
+	// WatchRetainFor overrides it per table name, as DeltaMaxFor does. 0 (the default) keeps
+	// nothing extra; the window is paid for in segments that cannot be reclaimed yet.
+	//
+	// Both belong on the CATALOG for the reason DeltaMax does: catalog open reopens every
+	// existing table directory at startup, so a per-CreateTable option would take effect the
+	// first time a table was created and be silently ignored on every restart after -- which
+	// is exactly when a resuming watcher needs the window.
+	//
+	// This reaches MUTABLE tables only. An archive is append-only, has no deletes to retain,
+	// and already carries its watch epoch across a clean shutdown unconditionally (see
+	// collections/watchepoch.go); a name in WatchRetainFor that belongs to an archive has no
+	// effect.
+	WatchRetain    time.Duration
+	WatchRetainFor map[string]time.Duration
 }
 
 // OpenCatalog opens the catalog rooted at dir with no encryption. See OpenCatalogConfig
@@ -206,6 +228,8 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		sealWorkers:       cfg.SealMigrationWorkers,
 		deltaMax:          cfg.DeltaMax,
 		deltaMaxFor:       cfg.DeltaMaxFor,
+		watchRetain:       cfg.WatchRetain,
+		watchRetainFor:    cfg.WatchRetainFor,
 	}
 	if cfg.Dir == "" {
 		return cat, nil
@@ -290,6 +314,7 @@ func (cat *Catalog) tableConfig(dir string) Config {
 		SealMigrationWorkers:    cat.sealWorkers,
 		QueryParallelism:        cat.queryPar,
 		DeltaMax:                cat.deltaMaxForDir(dir),
+		WatchRetain:             cat.watchRetainForDir(dir),
 	}
 	if cat.onSealMigration != nil {
 		// Name the table the count belongs to: the per-table hook cannot know it, and the catalog can.
@@ -318,6 +343,18 @@ func (cat *Catalog) deltaMaxForDir(dir string) int {
 		}
 	}
 	return cat.deltaMax
+}
+
+// watchRetainForDir returns the watch retention window for the table living in dir: its
+// per-table override if one is configured, else the catalog-wide setting. As for
+// deltaMaxForDir, the table name is the directory's base name.
+func (cat *Catalog) watchRetainForDir(dir string) time.Duration {
+	if len(cat.watchRetainFor) > 0 && dir != "" {
+		if v, ok := cat.watchRetainFor[filepath.Base(dir)]; ok {
+			return v
+		}
+	}
+	return cat.watchRetain
 }
 
 // ValidTableName reports whether name is usable as a table (and a directory):
