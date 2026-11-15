@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // profiledArchive builds an archive whose eviction axis is "T", appending n records whose T
@@ -28,7 +29,7 @@ func profiledArchive(t *testing.T, dir string, n int) *Archive {
 		if i%2 == 0 {
 			tv = 1_500_000_000 + i
 		}
-		ad, err := classad.Parse(fmt.Sprintf(`[ N=%d; T=%d; Pad="%s" ]`, i, tv, profPad(64)))
+		ad, err := classad.Parse(fmt.Sprintf(`[ N=%d; T=%d; Pad=%q ]`, i, tv, profPad(64)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -162,5 +163,128 @@ func TestArchiveProfileForAnotherAttributeIsRefused(t *testing.T) {
 	}
 	if profiled != 0 {
 		t.Errorf("%d/%d segments adopted a profile built over a different attribute", profiled, sealed)
+	}
+}
+
+// A merge whose sources are not all profiled -- segments sealed before the eviction axis
+// was configured sit beside ones sealed after -- must still produce a profiled segment. The
+// merge cannot assemble one from the sources (one of them has nothing to offer, and a
+// profile over only some of the records would misreport what sits above a cutoff), so it
+// is computed from the output's own records. Left nil, the merged segment would be
+// reclaimable only by position for the rest of its life: nothing later rebuilds a profile.
+func TestMergeRecomputesProfileForUnprofiledSource(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	a, err := CreateArchive(ArchiveOptions{
+		Dir:         t.TempDir(),
+		SegmentSize: 1 << 14,
+		ZoneAttrs:   []string{"T"},
+		// No eviction axis yet: the first segments seal unprofiled.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	appendTwoEras := func(from, n int) {
+		for i := from; i < from+n; i++ {
+			tv := 1_700_000_000 + i
+			if i%2 == 0 {
+				tv = 1_500_000_000 + i
+			}
+			ad, perr := classad.Parse(fmt.Sprintf(`[ N=%d; T=%d; Pad=%q ]`, i, tv, profPad(64)))
+			if perr != nil {
+				t.Fatal(perr)
+			}
+			if err := a.Append(ad); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	appendTwoEras(0, 600)
+	a.SetRetention(Retention{EvictByAttr: "T"}) // from here on, seals are profiled
+	appendTwoEras(600, 600)
+
+	sh := a.c.shards[0]
+	sh.mu.RLock()
+	var run []*segment
+	unprofiled, profiled := 0, 0
+	for _, s := range sh.segs {
+		if s == nil || s == sh.act || s.used == 0 {
+			continue
+		}
+		run = append(run, s)
+		if s.profile == nil {
+			unprofiled++
+		} else {
+			profiled++
+		}
+	}
+	sh.mu.RUnlock()
+	if unprofiled == 0 || profiled == 0 {
+		t.Fatalf("fixture: %d unprofiled and %d profiled sealed segments; need both", unprofiled, profiled)
+	}
+	before := countMatching(t, a, "T > 0")
+
+	a.c.maintMu.Lock()
+	ok := a.c.mergeSegments(sh, run)
+	a.c.maintMu.Unlock()
+	if !ok {
+		t.Fatal("mergeSegments reported failure")
+	}
+	if after := countMatching(t, a, "T > 0"); after != before {
+		t.Fatalf("records %d -> %d across the merge", before, after)
+	}
+
+	sh.mu.RLock()
+	merged := sh.segs[run[0].id]
+	sh.mu.RUnlock()
+	p := merged.profile
+	if p == nil {
+		t.Fatal("merged segment has no profile: a merge that absorbed an unprofiled source left the output unprofiled")
+	}
+	if p.attr != "T" || !p.haveValues || p.unknownBytes != 0 || p.totalBytes <= 0 {
+		t.Errorf("profile = %+v, want a complete profile over T", p)
+	}
+	if p.valueMin >= 1_700_000_000 || p.valueMax < 1_700_000_000 {
+		t.Errorf("span = [%v,%v]; want it to cover both eras the sources held", p.valueMin, p.valueMax)
+	}
+	if len(p.breaks) < 2 {
+		t.Errorf("%d breakpoints over a %d-byte segment: not computed from the records", len(p.breaks), merged.used)
+	}
+	for i := 1; i < len(p.breaks); i++ {
+		if p.breaks[i] < p.breaks[i-1] {
+			t.Fatalf("breaks not non-decreasing: %v", p.breaks)
+		}
+	}
+	// The lower-bound invariant, checked against the records themselves: what the profile
+	// says lies below a cutoff must not exceed what actually does.
+	var below int64
+	cutoff := 1_600_000_000.0
+	tid, _ := a.c.intern.LookupID("T")
+	za := zoneAttr{name: "T", id: tid}
+	for off := 0; off < merged.used; {
+		o := uint32(off)
+		total := recTotalLen(merged.data, o)
+		if total == 0 {
+			break
+		}
+		if !recIsMarker(merged.data, o) {
+			w, werr := a.c.recordWireIn(merged, merged.data, o, nil)
+			if werr != nil {
+				t.Fatal(werr)
+			}
+			// The same lookup the trim and the profile use, so the check reads the value
+			// exactly as they do.
+			if node, has := lookupZoneNode(wire.Ad(w), za, merged.dict.Load(), sh.zoneInline); has {
+				if tv, cell := zoneValue(node); cell == zoneNumber && tv < cutoff {
+					below += int64(total)
+				}
+			}
+		}
+		off += int(total)
+	}
+	if got, _ := p.bytesBelow(cutoff); got > below {
+		t.Errorf("bytesBelow(%v) = %d, but only %d bytes of records are below it", cutoff, got, below)
 	}
 }

@@ -432,10 +432,13 @@ func (c *Collection) resealSegmentsFiltered(sh *shard, srcs []*segment, targetCo
 // re-reading records, since not re-reading them is what a merge is for.
 //
 // A source without a usable profile (never profiled, or profiled over a different attribute)
-// makes the whole output unprofiled rather than partially described: a profile that accounts
-// for only some of a segment's records would under-report what it holds above a cutoff, and
-// that is the error that drops records which should have been kept. The merged segment is then
-// reclaimable by position until something rebuilds its profile.
+// leaves the merge nothing to assemble from, so the profile is computed from out's records
+// instead, as rewriteZones does for a source without a zone map. It is never assembled from
+// the sources that DO have one: a profile that accounts for only some of a segment's records
+// would under-report what it holds above a cutoff, and that is the error that drops records
+// which should have been kept. The recompute costs one decode of the output, and it is paid
+// here because nothing later rebuilds a missing profile -- without it a merge that absorbed
+// one unprofiled segment would be reclaimable only by position for good.
 func (c *Collection) rewriteProfile(sh *shard, srcs []*segment, out *segment) *segProfile {
 	attr := sh.profileAttr()
 	if attr == "" {
@@ -448,7 +451,11 @@ func (c *Collection) rewriteProfile(sh *shard, srcs []*segment, out *segment) *s
 	}
 	bucket := sh.profileBucketBytes()
 	sh.mu.RUnlock()
-	return mergeProfiles(ps, bucket, attr)
+	if p := mergeProfiles(ps, bucket, attr); p != nil {
+		return p
+	}
+	_, p := c.zonesAndProfileFor(sh, out)
+	return p
 }
 
 // rewriteZones returns the zone map for out, a segment resealSegmentsAs rebuilt from srcs, or nil
