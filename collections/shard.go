@@ -14,6 +14,46 @@ import (
 // to the head of a bucket chain, the arena segments the records live in, and a
 // monotonic commit sequence used for MVCC scan visibility. Each shard is locked
 // independently to reduce contention.
+// profileAttr is the attribute this collection's sealed segments are profiled over, or "" for
+// none. Every shard is given the same value (construction and SetRetention set them together),
+// so any one of them answers for the collection -- and a collection that HAS profiles is
+// append-only, which is a single shard by construction.
+func (c *Collection) profileAttr() string {
+	if len(c.shards) == 0 {
+		return ""
+	}
+	return c.shards[0].profileAttr()
+}
+
+// profileAttr is the attribute this shard's sealed segments are profiled over, or "" for none.
+func (sh *shard) profileAttr() string {
+	if p := sh.profAttr.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// profileBucketBytes is the profile's quantile resolution: the configured value, or one
+// derived from the segment size so a segment always offers enough breakpoints for a cutoff
+// to be placed INSIDE it. Without that a segment is all-or-nothing and can only be dropped
+// whole, which is the one thing trimming exists to avoid.
+func (sh *shard) profileBucketBytes() int64 {
+	if sh.profBucket > 0 {
+		return sh.profBucket
+	}
+	if sh.segSize > 0 {
+		if b := int64(sh.segSize) / profileBucketsPerSegment; b > 0 {
+			return b
+		}
+	}
+	return defaultProfileBucketBytes
+}
+
+// setProfileAttr points this shard's future seals at attr ("" disables profiling).
+func (sh *shard) setProfileAttr(attr string) {
+	sh.profAttr.Store(&attr)
+}
+
 type shard struct {
 	mu   sync.RWMutex
 	dir  map[uint64]loc // key hash -> head of bucket chain (pointer-free value)
@@ -56,6 +96,17 @@ type shard struct {
 	// record written before the attribute was sealed holds its value in the clear. Set at
 	// construction; never mutated (the policy it calls is read live).
 	sealsName func(string) bool
+	// profAttr is the attribute a sealed segment's retention profile is built over
+	// (Retention.EvictByAttr, else MaxAgeAttr); empty means no profile is kept. It is an
+	// atomic because SetRetention may change the eviction axis while the store is running,
+	// while seal reads it under the shard lock. A segment keeps the profile it was sealed
+	// with: a profile over a different attribute is rejected on read (parseProfileBlob
+	// takes the wanted attribute), so changing the axis simply leaves older segments
+	// unprofiled until they are rewritten, exactly as changing ZoneAttrs does.
+	profAttr atomic.Pointer[string]
+	// profBucket is the profile's quantile resolution in stored bytes, when configured
+	// explicitly. Zero derives it from segSize. Set at construction.
+	profBucket int64
 
 	commitSeq uint64 // bumped once per committed batch; scan snapshots capture it
 	count     int    // number of live keys, system-keyed ones included

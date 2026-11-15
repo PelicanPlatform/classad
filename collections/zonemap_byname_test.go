@@ -161,7 +161,8 @@ func legacyizeZones(t *testing.T, dir string, ids map[string]uint32, swap map[st
 		if err != nil {
 			t.Fatal(err)
 		}
-		attr, key, col, zone, used, dictRec, ok := splitSegmentSidecarV4(data)
+		sc := parseSidecar(data)
+		attr, key, col, zone, used, dictRec, ok := sc.attr, sc.key, sc.col, sc.zone, sc.used, sc.dictRec, sc.ok
 		if !ok || len(zone) == 0 {
 			continue
 		}

@@ -737,16 +737,21 @@ func TestRecoverPastDamageNonColumnar(t *testing.T) {
 
 	t.Run("untrusted-extent", func(t *testing.T) {
 		dir, target, key := damage(t)
-		// Zero the extent the trailer records: the sidecar is no longer trusted for it.
+		// Drop the extent the sidecar records, so recovery cannot trust it and must rewalk.
+		// Expressed by rebuilding the container rather than by poking the trailer: where the
+		// extent sits is a property of the container version, and this test is about what
+		// recovery does without a trusted extent, not about the byte layout.
 		b, err := os.ReadFile(target + ".idx")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if binary.LittleEndian.Uint32(b[len(b)-4:]) != sidecarContainerMagicV4 {
-			t.Fatal("the fixture's sidecar is not a v4 container")
+		sc := parseSidecar(b)
+		if !sc.ok {
+			t.Fatal("the fixture's sidecar does not parse")
 		}
-		binary.LittleEndian.PutUint64(b[len(b)-sidecarTrailerLenV4+16:], 0)
-		if err := os.WriteFile(target+".idx", b, 0o644); err != nil {
+		sc = sc.clone()
+		sc.used = 0
+		if err := os.WriteFile(target+".idx", buildSidecar(sc), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		c, oc := openCounting(t, internedStoreOpts(dir))
@@ -785,30 +790,48 @@ func TestDamageSidecarFormat(t *testing.T) {
 	}
 
 	key := []byte("key-section")
-	v5 := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, 0, encodeDamage(dm))
-	if sc, isV5 := splitSidecarV5(v5); !sc.ok || !isV5 || !bytes.Equal(sc.key, key) || sc.used != 4096 || sc.dictRec != 8 {
-		t.Fatalf("v5 split: %+v, v5=%v", sc, isV5)
+	withDamage := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, 0, encodeDamage(dm))
+	sc := parseSidecar(withDamage)
+	if !sc.ok || !bytes.Equal(sc.key, key) || sc.used != 4096 || sc.dictRec != 8 {
+		t.Fatalf("container split: %+v", sc)
 	}
-	// A pre-v5 reader finds its container magic in the last four bytes of a trailer of its own
-	// length, and none of them is there.
-	tail := binary.LittleEndian.Uint32(v5[len(v5)-4:])
-	for _, m := range []uint32{sidecarContainerMagic, sidecarContainerMagicV2, sidecarContainerMagicV3, sidecarContainerMagicV4} {
+	if d, ok := decodeDamage(sc.damage); !ok || d.len() != 2 {
+		t.Errorf("the damage set did not survive the container: ok=%v set=%v", ok, d)
+	}
+	// A reader of an older container version looks for ITS magic in the last four bytes of a
+	// trailer of its own length. None of them may be there, or that reader slices this
+	// container on a layout it does not have -- which is not detectably wrong to it.
+	tail := binary.LittleEndian.Uint32(withDamage[len(withDamage)-4:])
+	for _, m := range []uint32{sidecarContainerMagic, sidecarContainerMagicV2, sidecarContainerMagicV3,
+		sidecarContainerMagicV4, sidecarContainerMagicV5, sidecarContainerMagicV6} {
 		if tail == m {
-			t.Errorf("a v5 container ends in the pre-v5 magic %#x", m)
+			t.Errorf("the current container ends in the older magic %#x", m)
 		}
 	}
-	if _, k, _, _, ok := splitSegmentSidecar(v5); !ok || !bytes.Equal(k, key) {
-		t.Error("splitSegmentSidecar does not read a v5 container")
+	if _, k, _, _, ok := splitSegmentSidecar(withDamage); !ok || !bytes.Equal(k, key) {
+		t.Error("splitSegmentSidecar does not read the current container")
 	}
 	path := filepath.Join(t.TempDir(), "seg.idx")
-	if err := os.WriteFile(path, v5, 0o644); err != nil {
+	if err := os.WriteFile(path, withDamage, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// readSidecarTrailer reads the trailer (and, now, the section directory) without mapping
+	// the sidecar, so it is a separate reader that has to agree with the one above.
 	if f := readSidecarTrailer(path); f.used != 4096 || f.dictRec != 8 || f.damage.len() != 2 {
 		t.Errorf("readSidecarTrailer = %d, %d, %v", f.used, f.dictRec, f.damage)
 	}
-	if v4 := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, 0, nil); binary.LittleEndian.Uint32(v4[len(v4)-4:]) != sidecarContainerMagicV4 {
-		t.Error("a segment without damage no longer writes a v4 container")
+	// A segment with no damage still records its extent and reads back with no damage set --
+	// absence of the section, not an empty one that decode has to tolerate.
+	noDamage := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, 0, nil)
+	if sc := parseSidecar(noDamage); !sc.ok || sc.used != 4096 || sc.damage != nil {
+		t.Errorf("no-damage container: ok=%v used=%d damage=%v", sc.ok, sc.used, sc.damage)
+	}
+	ndPath := filepath.Join(t.TempDir(), "nodmg.idx")
+	if err := os.WriteFile(ndPath, noDamage, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if f := readSidecarTrailer(ndPath); f.used != 4096 || f.dictRec != 8 || f.damage.len() != 0 {
+		t.Errorf("readSidecarTrailer on a no-damage container = %d, %d, %v", f.used, f.dictRec, f.damage)
 	}
 
 	// The key-index proof refuses an index that does not describe the segment: one whose hashes come

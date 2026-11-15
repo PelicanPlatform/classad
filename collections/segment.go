@@ -143,6 +143,13 @@ type segment struct {
 	// the frozen window snapshot).
 	zones map[uint32]zoneRange
 
+	// profile is this sealed segment's byte-weighted value profile over the retention
+	// attribute (see segprofile.go), computed on the same walk as zones. Nil means
+	// "nothing known", which size-driven eviction reads as "not orderable by value" and
+	// falls back to position for -- never as "holds nothing below the cutoff". Guarded and
+	// immutable exactly as zones is.
+	profile *segProfile
+
 	codec Codec // the codec that compressed this segment's records (immutable)
 
 	// idx is this segment's value/categorical index, or nil if not yet built. It is

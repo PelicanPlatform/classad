@@ -423,13 +423,19 @@ func (c *Collection) persistColSeg(sh *shard, seg *segment) {
 	if err != nil {
 		return
 	}
-	attr, key, _, zone, ok := splitSegmentSidecar(data)
-	if !ok {
+	sc := parseSidecar(data)
+	if !sc.ok {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return
 	}
-	container := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...), colBlob,
-		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
+	// Clone before the rewrite: the sections alias the mapping, which closes below. Every
+	// section this path does not set is carried through -- including ones this build does
+	// not know, which a newer build may have written.
+	sc = sc.clone()
+	sc.col = colBlob
+	sc.damage = encodeDamage(seg.damaged())
+	sc.used, sc.dictRec, sc.colRec = seg.used, seg.dictRecOff(), seg.colRecOff()
+	container := buildSidecar(sc)
 	_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	c.installSidecar(sh, seg, path, container)
 }

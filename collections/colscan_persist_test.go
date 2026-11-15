@@ -1,7 +1,6 @@
 package collections
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -159,46 +158,27 @@ func TestSchemaScanReloadCorruptSection(t *testing.T) {
 	}
 	c.Close()
 
-	// Corrupt the columnar body of exactly one v2 sidecar (flip a byte just before the 16-byte
-	// container trailer, inside the col section; the trailer stays intact so the container still
-	// parses and yields the section, but its CRC now fails).
+	// Corrupt the columnar body of exactly one sidecar: the container still parses and still
+	// yields the section, but the section's own CRC now fails. Done by rebuilding the
+	// container around a damaged col section rather than by flipping a byte at a computed
+	// offset -- where a section sits is a property of the container version, and this test
+	// is about what a reopen does with an unusable columnar block.
 	corrupted := ""
 	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || filepath.Ext(p) != ".idx" || corrupted != "" {
 			return nil
 		}
 		b, e := os.ReadFile(p)
-		if e != nil || len(b) < sidecarTrailerLenV2+colSectionHdr+1 {
+		if e != nil {
 			return nil
 		}
-		// Locate the columnar section by its recorded length rather than by position: a v3
-		// container appends a zone section after it, so "just before the trailer" is no
-		// longer the col body.
-		var attrLen, keyLen, colLen int
-		switch binary.LittleEndian.Uint32(b[len(b)-4:]) {
-		case sidecarContainerMagicV4:
-			t := b[len(b)-sidecarTrailerLenV4:]
-			attrLen = int(binary.LittleEndian.Uint32(t[0:]))
-			keyLen = int(binary.LittleEndian.Uint32(t[4:]))
-			colLen = int(binary.LittleEndian.Uint32(t[8:]))
-		case sidecarContainerMagicV3:
-			t := b[len(b)-sidecarTrailerLenV3:]
-			attrLen = int(binary.LittleEndian.Uint32(t[0:]))
-			keyLen = int(binary.LittleEndian.Uint32(t[4:]))
-			colLen = int(binary.LittleEndian.Uint32(t[8:]))
-		case sidecarContainerMagicV2:
-			t := b[len(b)-sidecarTrailerLenV2:]
-			attrLen = int(binary.LittleEndian.Uint32(t[0:]))
-			keyLen = int(binary.LittleEndian.Uint32(t[4:]))
-			colLen = int(binary.LittleEndian.Uint32(t[8:]))
-		default:
-			return nil // v1 (no columnar section)
+		sc := parseSidecar(b)
+		if !sc.ok || len(sc.col) < colSectionHdr+1 {
+			return nil // no columnar section in this one
 		}
-		if colLen == 0 {
-			return nil
-		}
-		b[attrLen+keyLen+colLen-1] ^= 0xFF // last byte of the col body
-		if e := os.WriteFile(p, b, 0o644); e != nil {
+		sc = sc.clone()
+		sc.col[len(sc.col)-1] ^= 0xFF // last byte of the col body: header intact, CRC now wrong
+		if e := os.WriteFile(p, buildSidecar(sc), 0o644); e != nil {
 			t.Fatal(e)
 		}
 		corrupted = p

@@ -481,7 +481,8 @@ func stripKIDXFlags(t *testing.T, path string) {
 	}
 	v5, _ := splitSidecarV5(data)
 	used, dictRec := 0, uint32(0)
-	if _, _, _, _, u, d, ok := splitSegmentSidecarV4(data); ok {
+	if sc := parseSidecar(data); sc.ok {
+		u, d := sc.used, sc.dictRec
 		used, dictRec = u, d
 	}
 	nk := append([]byte(nil), key...)

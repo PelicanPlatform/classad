@@ -200,6 +200,25 @@ func (c *Collection) resealSegments(sh *shard, srcs []*segment, targetCodec Code
 // resealSegmentsAs is resealSegments writing its output under an explicit file-name prefix,
 // so a merge can stage the result where recovery will not see it until it is renamed.
 func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Codec, prefix string) *segment {
+	out, _ := c.resealSegmentsFiltered(sh, srcs, targetCodec, prefix, nil)
+	return out
+}
+
+// resealSegmentsFiltered is resealSegmentsAs with an optional record filter: keep decides,
+// from the decoded ad, whether a record is carried into the output. It returns how many
+// records it left behind.
+//
+// A filtered reseal is how retention trims a segment that holds data on both sides of an
+// eviction cutoff -- the segment cannot be dropped whole, so the part below the cutoff is
+// rewritten away. It goes through the same staging and swap as a merge, because the hard part
+// is not the rewrite but being crash-safe about the replacement.
+//
+// Unlike an unfiltered reseal, the output does NOT hold its sources' records, so it does not
+// inherit their zone map or profile: both are recomputed from what was actually written. A
+// profile inherited across a filter would report bytes the output no longer holds, and a pass
+// reading it would believe it could free space that is already gone.
+func (c *Collection) resealSegmentsFiltered(sh *shard, srcs []*segment, targetCodec Codec, prefix string, keep *resealFilter) (*segment, int) {
+	filtered := 0
 	live := srcs[:0:0]
 	for _, s := range srcs {
 		if s != nil && s.used > 0 {
@@ -208,11 +227,11 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	}
 	srcs = live
 	if len(srcs) == 0 {
-		return nil
+		return nil, 0
 	}
 	for _, s := range srcs {
 		if !verifyForRewrite(s) {
-			return nil // damaged framing: leave the sources as they are
+			return nil, 0 // damaged framing: leave the sources as they are
 		}
 	}
 	// A persistent collection reseals INTERNED: records carry segment-local ids against a
@@ -286,7 +305,7 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 			// the superseded fragments its collapse left behind.
 			if recIsDelta(src.data, o) {
 				if recSuperseded(src.data, o) == seqMax {
-					return nil
+					return nil, 0
 				}
 				resealDroppedDeltas.Add(1)
 				dropped++
@@ -300,25 +319,30 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 			// columnarize again -- losing an accelerator is fine, losing attributes is not.
 			wireBytes, err := c.recordWireIn(src, src.data, o, nil)
 			if err != nil {
-				return nil
+				return nil, 0
+			}
+			if keep != nil && !keep.keeps(wire.Ad(wireBytes), src.dict.Load(), sh.zoneInline) {
+				filtered++
+				off += int(rl)
+				continue
 			}
 			ad, err := c.decodeWireDict(src.dict.Load(), wireBytes) // honor the source's own encoding
 			if err != nil {
-				return nil
+				return nil, 0
 			}
 			// A value that will not seal refuses the reseal, as a record that will not decode does:
 			// the segment is left as it is rather than rebuilt with that value in the clear.
 			var stored []byte
 			if intern {
 				if wireBuf, err = c.encodeInterned(wireBuf[:0], ad, table, hot); err != nil {
-					return nil
+					return nil, 0
 				}
 				refreshHot()
 				stored = targetCodec.Compress(nil, wireBuf)
 			} else {
 				raw, err := c.encodeAd(ad)
 				if err != nil {
-					return nil
+					return nil, 0
 				}
 				stored = targetCodec.Compress(nil, raw)
 			}
@@ -331,7 +355,7 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	// delta -- the state a collapse leaves a segment in. That one is rebuilt holding only its
 	// dictionary; refusing it left the segment, and whatever it held, in place for good.
 	if total == 0 && (dropped == 0 || !intern) {
-		return nil
+		return nil, 0
 	}
 	// The dict (interned only) is a trailing record; size the segment to include it exactly.
 	var dictBytes []byte
@@ -351,7 +375,7 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	} else {
 		s, err := sh.allocNamed(srcs[0].id, size, targetCodec, prefix)
 		if err != nil {
-			return nil
+			return nil, 0
 		}
 		newseg = s
 	}
@@ -360,12 +384,12 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	for _, e := range entries {
 		if e.marker {
 			if !newseg.appendMarker(e.seq, e.millis) {
-				return nil
+				return nil, 0
 			}
 			continue
 		}
 		if _, ok := newseg.append(e.seq, noLoc, e.key, e.stored); !ok {
-			return nil
+			return nil, 0
 		}
 	}
 	// Interned: append the dictionary as a trailing record and publish the segment's dict so its
@@ -373,7 +397,7 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	if intern {
 		doff, ok := newseg.appendDict(dictBytes)
 		if !ok {
-			return nil
+			return nil, 0
 		}
 		newseg.dict.Store(&segDictHandle{data: newseg.data, base: doff + recKeyOff + 4, rec: doff})
 	}
@@ -381,15 +405,50 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	// segments out by it, and the sidecar the post-swap reindex writes persists it -- so a
 	// segment published without one is scanned in full and never aged out, until a reopen
 	// recomputes it from every record.
-	newseg.zones = c.rewriteZones(sh, srcs, newseg)
+	if keep == nil {
+		newseg.zones = c.rewriteZones(sh, srcs, newseg)
+		// The retention profile travels with the zone map, and for the same reason: a rebuilt
+		// segment published without one is never aged out by value, only by position.
+		newseg.profile = c.rewriteProfile(sh, srcs, newseg)
+	} else {
+		// A filtered output holds fewer records than its source, so neither the union of the
+		// sources' zones nor the merge of their profiles describes it. Both are computed from
+		// the segment that was actually written.
+		newseg.zones, newseg.profile = c.zonesAndProfileFor(sh, newseg)
+	}
 	// Persistent segments: flush the written extent so recovery sees a complete segment.
 	if newseg.persistent {
 		newseg.synced = newseg.used
 		if err := newseg.flush(); err != nil {
-			return nil
+			return nil, 0
 		}
 	}
-	return newseg
+	return newseg, filtered
+}
+
+// rewriteProfile returns the retention profile for out, a segment resealSegmentsAs rebuilt from
+// srcs. out holds exactly the records of srcs with the same values, so its distribution is
+// theirs combined -- which mergeProfiles assembles from their breakpoint vectors rather than by
+// re-reading records, since not re-reading them is what a merge is for.
+//
+// A source without a usable profile (never profiled, or profiled over a different attribute)
+// makes the whole output unprofiled rather than partially described: a profile that accounts
+// for only some of a segment's records would under-report what it holds above a cutoff, and
+// that is the error that drops records which should have been kept. The merged segment is then
+// reclaimable by position until something rebuilds its profile.
+func (c *Collection) rewriteProfile(sh *shard, srcs []*segment, out *segment) *segProfile {
+	attr := sh.profileAttr()
+	if attr == "" {
+		return nil
+	}
+	sh.mu.RLock()
+	ps := make([]*segProfile, len(srcs))
+	for i, s := range srcs {
+		ps[i] = s.profile
+	}
+	bucket := sh.profileBucketBytes()
+	sh.mu.RUnlock()
+	return mergeProfiles(ps, bucket, attr)
 }
 
 // rewriteZones returns the zone map for out, a segment resealSegmentsAs rebuilt from srcs, or nil
@@ -450,4 +509,54 @@ func (c *Collection) rewriteZones(sh *shard, srcs []*segment, out *segment) map[
 		}
 	}
 	return merged
+}
+
+// resealFilter decides which records a filtered reseal carries. It reads the attribute
+// through the same lookup and classification the zone map and the retention profile use
+// (lookupZoneNode + zoneValue), so a trim and the profile that chose it cannot disagree
+// about what a record's value is.
+type resealFilter struct {
+	attr   zoneAttr
+	cutoff float64
+}
+
+// keeps reports whether a record survives the trim. A record whose value is BELOW the
+// cutoff is dropped; everything else is kept, and that deliberately includes records whose
+// value cannot be bounded -- an expression, a sealed value, a non-numeric, or the attribute
+// missing entirely. Those are the profile's "unknown bytes", which it never offers up for
+// eviction, so the trim must not remove them either: nothing has established that they are
+// below the cutoff, and a dropped record cannot be recovered to find out.
+func (f *resealFilter) keeps(ad wire.Ad, dict *segDictHandle, inline bool) bool {
+	node, ok := lookupZoneNode(ad, f.attr, dict, inline)
+	if !ok {
+		return true
+	}
+	v, cell := zoneValue(node)
+	if cell != zoneNumber {
+		return true
+	}
+	return v >= f.cutoff
+}
+
+// zonesAndProfileFor computes a rebuilt segment's zone map and retention profile from the
+// segment itself. It is the path a FILTERED reseal takes: its output does not hold its
+// sources' records, so nothing about the sources describes it.
+func (c *Collection) zonesAndProfileFor(sh *shard, out *segment) (map[uint32]zoneRange, *segProfile) {
+	sh.mu.RLock()
+	attrs, inline, appendOnly := sh.zoneAttrs, sh.zoneInline, sh.appendOnly
+	bucket := sh.profileBucketBytes()
+	sh.mu.RUnlock()
+	if !appendOnly || len(attrs) == 0 {
+		return nil, nil
+	}
+	var prof *profileAcc
+	if attr := sh.profileAttr(); attr != "" {
+		prof = &profileAcc{attr: attr}
+	}
+	zones := computeSegZonesProfiled(c, out, out.used, attrs, inline, sh.sealsName, prof)
+	if prof == nil {
+		return zones, nil
+	}
+	now := int64(nowMillis() / 1000)
+	return zones, prof.finish(bucket, now, now)
 }

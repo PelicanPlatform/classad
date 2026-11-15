@@ -282,122 +282,54 @@ const (
 	sidecarTrailerLenV6     = 40 // v5 + colRec (u32)
 )
 
-// buildSegmentSidecar packs the attribute-index blob (may be empty), the key-index blob, and the
-// columnar blob (may be empty) into the container byte layout. An empty colBlob yields the v1
-// (2-section) layout, identical to a pre-columnar sidecar.
-// segUsed is the sealed segment's written extent. Recording it lets recovery skip walking and
-// CRC-verifying every record just to find where durable data ends -- a sealed segment's extent
-// is final, so re-deriving it on every open is a full integrity scan of the whole archive
-// masquerading as recovery. Zero means "not recorded" and the reader falls back to scanning.
+// buildSegmentSidecar packs a freshly built set of sections into a container. It is the
+// entry point for the paths that build a sidecar from scratch (seal, reindex, the
+// columnarized rewrite); a path that REWRITES an existing container parses it with
+// parseSidecar and rebuilds with buildSidecar instead, so that sections it does not touch
+// -- including ones written by a newer build -- survive.
 //
-// damageBlob is the segment's damaged spans (encodeDamage), which every walk must skip. A segment
-// with any is written as v5, which adds that section after the zone map and its length to the
-// trailer: [attr][key][col][zone][damage][attrLen|keyLen|colLen|zoneLen|damageLen u32 | segUsed u64 |
-// dictRec u32 | magic("SCN5") u32]. A build that predates v5 does not recognise the container, so it
-// neither trusts the extent nor adopts the key index: it walks the segment, as it would with no
-// sidecar, and stops at the damage rather than read through it. A segment without damage is written
-// as before.
+// segUsed is the sealed segment's written extent. Recording it lets recovery skip walking
+// and CRC-verifying every record just to find where durable data ends -- a sealed
+// segment's extent is final, so re-deriving it on every open is a full integrity scan of
+// the whole archive masquerading as recovery. Zero means "not recorded" and the reader
+// falls back to scanning. dictRec and colRec locate the dictionary and columnar payload
+// records, sparing a reopen the walk that would otherwise look for them.
 //
-// colRec is where the segment's columnar payload record is, which a segment that has one is written
-// as v6 to carry: [attr][key][col][zone][damage][the five lengths | segUsed u64 | dictRec u32 |
-// colRec u32 | magic("SCN6") u32], the damage section empty when there is none. A build that
-// predates v6 does not recognise the container and falls back to walking the segment, so the field
-// costs nothing but the search it saves.
+// Output is always the v7 section-table container (see sidecar_sections.go). The older
+// fixed-trailer layouts are still READ, so existing sidecars keep working; they are no
+// longer written.
 func buildSegmentSidecar(attrBlob, keyBlob, colBlob, zoneBlob []byte, segUsed int, dictRec, colRec uint32, damageBlob []byte) []byte {
-	// v6, written only for a segment that HAS a columnar payload record: its offset, like the
-	// dictionary's, is what spares a reopen the walk that would otherwise look for it -- a walk
-	// over every record of the segment, and so over every record of the store. A segment without
-	// one writes exactly the container it did before, so nothing else on disk changes shape.
-	if colRec > 0 {
-		b := make([]byte, 0, len(attrBlob)+len(keyBlob)+len(colBlob)+len(zoneBlob)+len(damageBlob)+sidecarTrailerLenV6)
-		b = append(b, attrBlob...)
-		b = append(b, keyBlob...)
-		b = append(b, colBlob...)
-		b = append(b, zoneBlob...)
-		b = append(b, damageBlob...)
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(colBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(zoneBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(damageBlob)))
-		b = binary.LittleEndian.AppendUint64(b, uint64(segUsed))
-		b = binary.LittleEndian.AppendUint32(b, dictRec)
-		b = binary.LittleEndian.AppendUint32(b, colRec)
-		b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagicV6)
-		return b
-	}
-	if len(damageBlob) > 0 {
-		b := make([]byte, 0, len(attrBlob)+len(keyBlob)+len(colBlob)+len(zoneBlob)+len(damageBlob)+sidecarTrailerLenV5)
-		b = append(b, attrBlob...)
-		b = append(b, keyBlob...)
-		b = append(b, colBlob...)
-		b = append(b, zoneBlob...)
-		b = append(b, damageBlob...)
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(colBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(zoneBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(damageBlob)))
-		b = binary.LittleEndian.AppendUint64(b, uint64(segUsed))
-		b = binary.LittleEndian.AppendUint32(b, dictRec)
-		b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagicV5)
-		return b
-	}
-	if len(zoneBlob) > 0 || segUsed > 0 || dictRec > 0 {
-		b := make([]byte, 0, len(attrBlob)+len(keyBlob)+len(colBlob)+len(zoneBlob)+sidecarTrailerLenV4)
-		b = append(b, attrBlob...)
-		b = append(b, keyBlob...)
-		b = append(b, colBlob...)
-		b = append(b, zoneBlob...)
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(colBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(zoneBlob)))
-		b = binary.LittleEndian.AppendUint64(b, uint64(segUsed))
-		b = binary.LittleEndian.AppendUint32(b, dictRec)
-		b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagicV4)
-		return b
-	}
-	if len(colBlob) == 0 {
-		b := make([]byte, 0, len(attrBlob)+len(keyBlob)+sidecarTrailerLen)
-		b = append(b, attrBlob...)
-		b = append(b, keyBlob...)
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
-		b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
-		b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagic)
-		return b
-	}
-	b := make([]byte, 0, len(attrBlob)+len(keyBlob)+len(colBlob)+sidecarTrailerLenV2)
-	b = append(b, attrBlob...)
-	b = append(b, keyBlob...)
-	b = append(b, colBlob...)
-	b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
-	b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
-	b = binary.LittleEndian.AppendUint32(b, uint32(len(colBlob)))
-	b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagicV2)
-	return b
+	return buildSegmentSidecarProfiled(attrBlob, keyBlob, colBlob, zoneBlob, nil, segUsed, dictRec, colRec, damageBlob)
 }
 
-// splitSegmentSidecar returns the attribute, key, and columnar sub-slices of a container. col is
-// nil for a v1 (2-section) container -- a pre-columnar sidecar, read unchanged. ok=false if data
-// is not a well-formed container (bare/old sidecar, or corruption).
+// buildSegmentSidecarProfiled is buildSegmentSidecar with the segment's retention profile.
+// The two are separate because most build sites have no profile to write and the extra
+// argument would read as "nil because nobody thought about it" at all of them.
+func buildSegmentSidecarProfiled(attrBlob, keyBlob, colBlob, zoneBlob, profileBlob []byte, segUsed int, dictRec, colRec uint32, damageBlob []byte) []byte {
+	return buildSidecar(sidecarSections{
+		attr: attrBlob, key: keyBlob, col: colBlob, zone: zoneBlob, damage: damageBlob,
+		profile: profileBlob,
+		used:    segUsed, dictRec: dictRec, colRec: colRec,
+	})
+}
+
+// splitSegmentSidecar returns the attribute, key, and columnar sub-slices of a container of
+// ANY version. col is nil for a v1 (2-section) container -- a pre-columnar sidecar, read
+// unchanged. ok=false if data is not a well-formed container (bare/old sidecar, or
+// corruption). A caller that needs the damage or profile sections, or that is going to
+// write the container back, uses parseSidecar instead.
 func splitSegmentSidecar(data []byte) (attr, key, col, zone []byte, ok bool) {
-	a, k, c, z, _, o := splitSegmentSidecarFull(data)
-	return a, k, c, z, o
+	sc := parseSidecar(data)
+	return sc.attr, sc.key, sc.col, sc.zone, sc.ok
 }
 
-// splitSegmentSidecarFull also returns the recorded sealed extent (0 when absent).
+// splitSidecarLegacy splits the fixed-trailer containers, v4 and older (v5/v6 are handled by
+// splitSidecarV5, v7 by splitSidecarV7). It is reachable only through parseSidecar, which
+// tries the current layouts first -- calling it directly reads a v7 container as malformed,
+// which is why it does not carry a version-neutral name.
 //
 //nolint:gocritic // the results ARE the container's sections; a struct would only rename them
-func splitSegmentSidecarFull(data []byte) (attr, key, col, zone []byte, segUsed int, ok bool) {
-	a, k, c, z, u, _, o := splitSegmentSidecarV4(data)
-	return a, k, c, z, u, o
-}
-
-// splitSegmentSidecarV4 also returns the recorded dictionary record offset (0 when absent).
-//
-//nolint:gocritic // the results ARE the container's sections; a struct would only rename them
-func splitSegmentSidecarV4(data []byte) (attr, key, col, zone []byte, segUsed int, dictRec uint32, ok bool) {
+func splitSidecarLegacy(data []byte) (attr, key, col, zone []byte, segUsed int, dictRec uint32, ok bool) {
 	if v5, isV5 := splitSidecarV5(data); isV5 {
 		return v5.attr, v5.key, v5.col, v5.zone, v5.used, v5.dictRec, v5.ok
 	}
@@ -753,6 +685,11 @@ type sidecarFacts struct {
 // v3 containers carry the extent but no record offsets. A v5 container also carries the segment's
 // damaged spans; one whose set does not parse returns nothing at all, so the segment is walked
 // rather than trusted without knowing what to skip.
+//
+// A v7 container is read through its section directory rather than by position: nothing here may
+// assume where the key or damage section sits, because the directory is what decides. This reads
+// the trailer and the directory -- two short ReadAts -- instead of mapping the whole sidecar,
+// which is the point of this function.
 func readSidecarTrailer(path string) (out sidecarFacts) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -803,6 +740,67 @@ func readSidecarTrailer(path string) (out sidecarFacts) {
 			return nil, 0, false
 		}
 		return d, used, true
+	}
+	// readDamageAt is readDamage for a v7 container, where the damage section is located by
+	// the directory rather than by sitting immediately before the trailer.
+	readDamageAt := func(at, dl int64, used int) (*damageSet, int, bool) {
+		if used <= 0 || dl < 0 || at < 0 {
+			return nil, 0, false
+		}
+		if dl == 0 {
+			return nil, used, true
+		}
+		b := make([]byte, dl)
+		if _, err := f.ReadAt(b, at); err != nil {
+			return nil, 0, false
+		}
+		d, ok := decodeDamage(b)
+		if !ok {
+			return nil, 0, false
+		}
+		return d, used, true
+	}
+	if st.Size() >= int64(sidecarTrailerLenV7) {
+		var t [sidecarTrailerLenV7]byte
+		if _, err := f.ReadAt(t[:], st.Size()-int64(sidecarTrailerLenV7)); err == nil &&
+			binary.LittleEndian.Uint32(t[20:]) == sidecarContainerMagicV7 {
+			used := int(binary.LittleEndian.Uint64(t[0:]))
+			n := int(binary.LittleEndian.Uint32(t[16:]))
+			dirLen := int64(n) * sidecarDirEntryLen
+			if used <= 0 || n < 0 || n > sidecarMaxSections || st.Size() < int64(sidecarTrailerLenV7)+dirLen {
+				return sidecarFacts{}
+			}
+			dirAt := st.Size() - int64(sidecarTrailerLenV7) - dirLen
+			dir := make([]byte, dirLen)
+			if _, err := f.ReadAt(dir, dirAt); err != nil {
+				return sidecarFacts{}
+			}
+			var keyOff, keyLen, dmgOff, dmgLen, off int64
+			for i := 0; i < n; i++ {
+				e := dir[i*sidecarDirEntryLen:]
+				ln := int64(binary.LittleEndian.Uint32(e[4:]))
+				if ln < 0 || off+ln > dirAt {
+					return sidecarFacts{}
+				}
+				switch binary.LittleEndian.Uint16(e[0:]) {
+				case secKey:
+					keyOff, keyLen = off, ln
+				case secDamage:
+					dmgOff, dmgLen = off, ln
+				}
+				off += ln
+			}
+			if off != dirAt {
+				return sidecarFacts{}
+			}
+			d, u, ok := readDamageAt(dmgOff, dmgLen, used)
+			if !ok {
+				return sidecarFacts{}
+			}
+			return sidecarFacts{used: u, dictRec: binary.LittleEndian.Uint32(t[8:]),
+				colRec: binary.LittleEndian.Uint32(t[12:]),
+				flags:  kidxFlags(uint32(keyOff), uint32(keyLen)), damage: d}
+		}
 	}
 	if st.Size() >= int64(sidecarTrailerLenV6) {
 		var t [sidecarTrailerLenV6]byte

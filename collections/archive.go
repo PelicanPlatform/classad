@@ -78,6 +78,36 @@ type Retention struct {
 	// / MaxAge still evict even younger-than-MinAge data under pressure. Zero ⇒ consumed
 	// records may be GC'd as soon as the floor passes them.
 	MinAge float64
+	// EvictByAttr names the numeric attribute that SIZE-driven eviction orders by, lowest
+	// value first. Empty falls back to MaxAgeAttr, and if that is empty too, to the
+	// positional policy -- dropping the oldest segment by append order, which is correct
+	// only while append order tracks the attribute being retained against.
+	//
+	// In a hub/spoke archive it does not: a spoke replaying a year of backfill appends
+	// records far older than the ones already in the oldest segment, so a size-driven pass
+	// evicts recent data and keeps the backfill. Setting this makes the pass order by the
+	// records' own values, using each sealed segment's byte-weighted profile.
+	//
+	// There is deliberately no default. The attribute must be the one whose values mean
+	// "how old is this record" in THIS store, and binding that in the library would point
+	// eviction at whatever happened to carry a familiar name.
+	EvictByAttr string
+	// TargetBytes is the low mark for size-driven eviction: a pass triggered by MaxBytes
+	// frees down to this rather than to just under the ceiling, so it runs rarely instead
+	// of on every append that crosses the line. Zero ⇒ evict to just under MaxBytes.
+	//
+	// This is the hysteresis gap that MergeOptions.TriggerSegments/TargetSegments and the
+	// index budget's high/low fractions both have, and that retention did not.
+	TargetBytes int64
+}
+
+// evictAttr is the attribute size-driven eviction orders by: EvictByAttr, else MaxAgeAttr,
+// else "" for the positional fallback.
+func (r Retention) evictAttr() string {
+	if r.EvictByAttr != "" {
+		return r.EvictByAttr
+	}
+	return r.MaxAgeAttr
 }
 
 // ArchiveOptions configures an Archive.
@@ -121,8 +151,15 @@ type ArchiveOptions struct {
 	// a range/equality constraint on one can skip whole segments. ValueAttrs are
 	// automatically included.
 	ZoneAttrs []string
+	// ProfileBucketBytes is the quantile resolution of each sealed segment's retention
+	// profile (see Options.ProfileBucketBytes). 0 derives it from SegmentSize.
+	ProfileBucketBytes int64
 	// Retention bounds what rotation keeps. Zero ⇒ keep everything.
 	Retention Retention
+	// OnHighMarkError reports a failed reclaim from the seal-time size eviction that keeps
+	// the archive under Retention.MaxBytes between maintenance passes (see
+	// Options.OnHighMarkError). nil discards it.
+	OnHighMarkError func(error)
 	// IndexBackfillBytes bounds how far back Reindex carries an index configuration change
 	// (see Options.IndexBackfillBytes). 0 carries it across the whole archive.
 	IndexBackfillBytes int64
@@ -211,6 +248,8 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		ValueComponentAttrs:       opts.ValueComponentAttrs,
 		ZoneAttrs:                 opts.ZoneAttrs,
 		Retention:                 opts.Retention,
+		ProfileBucketBytes:        opts.ProfileBucketBytes,
+		OnHighMarkError:           opts.OnHighMarkError,
 		InternAtSeal:              opts.InternAtSeal, // intern each segment eagerly at seal
 		IndexBackfillBytes:        opts.IndexBackfillBytes,
 		RowGroupBytes:             opts.RowGroupBytes,
@@ -318,9 +357,11 @@ func (a *Archive) AppendDeferred(ad *classad.ClassAd) error {
 // sealed/interned), and are serialized against the periodic passes. Skipped when neither
 // is configured (nothing to do).
 func (a *Archive) afterAppend() {
+	sealed := false
 	if a.c.internAtSeal || a.c.hasSegmentIndexes() {
 		if seal := a.c.appendSealSeq(); seal != a.lastSeal {
 			a.lastSeal = seal
+			sealed = true
 			if a.c.internAtSeal {
 				a.c.InternSealed()
 			}
@@ -328,6 +369,34 @@ func (a *Archive) afterAppend() {
 				a.c.Reindex()
 			}
 		}
+	} else if seal := a.c.appendSealSeq(); seal != a.lastSeal {
+		// Neither eager path is configured, but the size ceiling still has to be noticed at
+		// a seal: that is the only moment the store's size changes by a whole segment.
+		a.lastSeal = seal
+		sealed = true
+	}
+	if sealed {
+		a.enforceHighMark()
+	}
+}
+
+// enforceHighMark frees space at a segment seal when the archive is over its MaxBytes
+// ceiling. Rotate runs on the maintenance tick, so without this nothing bounds growth
+// between ticks -- a spoke replaying a backlog overshoots the ceiling by however much
+// arrives in one interval, which is what the ceiling exists to prevent.
+//
+// Only at a seal, and only when a byte ceiling is configured: in the steady state this is a
+// comparison against a bound that is not set, or a pass that finds the archive under it.
+// The eviction itself is bounded work -- segments are unlinked, not rewritten -- and it runs
+// on the appending goroutine rather than a goroutine of its own, as the eager intern and
+// reindex above it do.
+func (a *Archive) enforceHighMark() {
+	r := a.c.Retention()
+	if r.MaxBytes <= 0 {
+		return
+	}
+	if _, err := a.c.EvictOverHighMark(); err != nil && a.c.onHighMarkErr != nil {
+		a.c.onHighMarkErr(err)
 	}
 }
 

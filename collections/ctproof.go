@@ -448,17 +448,21 @@ func (c *Collection) persistCTProof(seg *segment) {
 	if err != nil {
 		return
 	}
-	attr, key, col, zone, ok := splitSegmentSidecar(data)
-	if !ok {
+	sc := parseSidecar(data)
+	if !sc.ok {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return
 	}
-	if ki, err := parseKeyIndex(key); err != nil || int(ki.upto) != seg.used {
+	if ki, err := parseKeyIndex(sc.key); err != nil || int(ki.upto) != seg.used {
 		_ = closer() //nolint:errcheck // not this segment's index: leave it for a reindex to rebuild
 		return
 	}
-	container := buildSegmentSidecar(append([]byte(nil), attr...), c.segKeyIndex(seg), append([]byte(nil), col...),
-		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
+	// Clone before the rewrite: the sections alias the mapping, which closes below.
+	sc = sc.clone()
+	sc.key = c.segKeyIndex(seg)
+	sc.damage = encodeDamage(seg.damaged())
+	sc.used, sc.dictRec, sc.colRec = seg.used, seg.dictRecOff(), seg.colRecOff()
+	container := buildSidecar(sc)
 	_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	if writeFileAtomic(path, container) == nil {
 		seg.ct.persisted.Store(true)

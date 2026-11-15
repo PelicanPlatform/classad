@@ -34,12 +34,17 @@ func (c *Collection) publishSidecar(seg *segment, path string) bool {
 	if err != nil {
 		return false
 	}
-	attr, key, col, zone, ok := splitSegmentSidecar(data)
-	if !ok {
+	sc := parseSidecar(data)
+	if !sc.ok {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
+	attr, key, col, zone := sc.attr, sc.key, sc.col, sc.zone
 	c.adoptPersistedZones(seg, zone)
+	// The profile is adopted here rather than recomputed for the same reason the zones are:
+	// rebuilding it decodes every record of every segment, which is what made reopen scale
+	// with the archive instead of with its segment count.
+	c.adoptPersistedProfile(seg, sc.profile, c.profileAttr())
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
@@ -152,8 +157,9 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		}
 		attrBlob = b
 	}
-	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(seg), c.colBlobForSeg(seg),
-		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
+	container := buildSegmentSidecarProfiled(attrBlob, c.segKeyIndex(seg), c.colBlobForSeg(seg),
+		buildZoneBlob(seg.zones, c.intern.Name), buildProfileBlob(seg.profile),
+		seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
@@ -182,32 +188,35 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	if err != nil {
 		return false
 	}
-	attr, _, col, zone, ok := splitSegmentSidecar(data)
+	sc := parseSidecar(data)
 	// A zone section that is PRESENT but unreadable has to be rewritten, not skipped.
 	// parseZoneBlob rejects a non-empty blob whose length does not match its count or
 	// whose range is inverted, and adoption then leaves seg.zones nil -- so the caller
 	// recomputes. Treating "present" as "nothing to do" meant that segment decoded every
 	// record on every open, forever, with no way to tell from the outside.
-	if !ok {
+	if !sc.ok {
 		_ = closer() //nolint:errcheck // the container itself is unreadable; leave it for a reindex to rebuild
 		return false
 	}
 	// A legacy section (id-keyed, or ZNM2 with ranges that skipped expressions) is well-formed
 	// but cannot be trusted (see buildZoneBlob), so it is rewritten too; only a current section
 	// is left alone.
-	if len(zone) > 0 {
-		if _, st := parseZoneBlob(zone, c.intern.LookupID); st == zoneBlobOK {
+	if len(sc.zone) > 0 {
+		if _, st := parseZoneBlob(sc.zone, c.intern.LookupID); st == zoneBlobOK {
 			_ = closer() //nolint:errcheck // a usable zone section: genuinely nothing to upgrade
 			return false
 		}
 	}
 	// The sections alias the mapping; copy them before unmapping so the rebuilt container is
-	// independent of the file we are about to replace.
-	attrCopy := append([]byte(nil), attr...)
-	colCopy := append([]byte(nil), col...)
+	// independent of the file we are about to replace. Sections this path does not set --
+	// including any a newer build wrote -- ride through the clone.
+	sc = sc.clone()
 	_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
-	container := buildSegmentSidecar(attrCopy, c.segKeyIndex(seg), colCopy,
-		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
+	sc.key = c.segKeyIndex(seg)
+	sc.zone = buildZoneBlob(seg.zones, c.intern.Name)
+	sc.damage = encodeDamage(seg.damaged())
+	sc.used, sc.dictRec, sc.colRec = seg.used, seg.dictRecOff(), seg.colRecOff()
+	container := buildSidecar(sc)
 	// Report the write. Discarding this error is how a permanently slow start stays
 	// invisible: the recompute recurs every open and nothing anywhere says the repair
 	// that was supposed to make it one-time never landed.
@@ -256,24 +265,24 @@ func (c *Collection) persistSegTrailerHintsUpgrade(seg *segment, haveColRec uint
 	if err != nil {
 		return false
 	}
-	attr, key, col, zone, ok := splitSegmentSidecar(data)
-	if !ok {
+	sc := parseSidecar(data)
+	if !sc.ok {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
-	reflagged := reflagKeyIndex(key, ki.flags|want)
+	reflagged := reflagKeyIndex(sc.key, ki.flags|want)
 	if reflagged == nil {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	// The sections alias the mapping; copy them before unmapping so the rebuilt container is
 	// independent of the file about to be replaced.
-	attrCopy := append([]byte(nil), attr...)
-	colCopy := append([]byte(nil), col...)
-	zoneCopy := append([]byte(nil), zone...)
+	sc = sc.clone()
 	_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
-	container := buildSegmentSidecar(attrCopy, reflagged, colCopy, zoneCopy,
-		seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
+	sc.key = reflagged
+	sc.damage = encodeDamage(seg.damaged())
+	sc.used, sc.dictRec, sc.colRec = seg.used, seg.dictRecOff(), seg.colRecOff()
+	container := buildSidecar(sc)
 	return writeFileAtomic(path, container) == nil
 }
 
@@ -337,8 +346,9 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 	if err != nil {
 		return false
 	}
-	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(seg), c.colBlobPreserve(seg),
-		buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
+	container := buildSegmentSidecarProfiled(attrBlob, c.segKeyIndex(seg), c.colBlobPreserve(seg),
+		buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), buildProfileBlob(seg.profile),
+		seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	return c.installSidecar(sh, seg, path, container)
 }
 
@@ -360,12 +370,17 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	if err != nil {
 		return false
 	}
-	attr, key, col, zone, ok := splitSegmentSidecar(data)
-	if !ok {
+	sc := parseSidecar(data)
+	if !sc.ok {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
+	attr, key, col, zone := sc.attr, sc.key, sc.col, sc.zone
 	c.adoptPersistedZones(seg, zone)
+	// The profile is adopted here rather than recomputed for the same reason the zones are:
+	// rebuilding it decodes every record of every segment, which is what made reopen scale
+	// with the archive instead of with its segment count.
+	c.adoptPersistedProfile(seg, sc.profile, c.profileAttr())
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
 		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
@@ -582,6 +597,22 @@ func (c *Collection) adoptPersistedZones(seg *segment, zone []byte) {
 	}
 	if z, st := parseZoneBlob(zone, c.intern.LookupID); st == zoneBlobOK {
 		seg.zones = z
+	}
+}
+
+// adoptPersistedProfile restores a sealed segment's retention profile from its sidecar, for the
+// same reason zones are restored: rebuilding it means decoding every record of every segment.
+//
+// want is the attribute eviction currently orders by. A profile over a DIFFERENT attribute is
+// not adopted -- its values are in another space entirely -- so changing the eviction axis
+// leaves older segments unprofiled rather than wrongly profiled, and a size-driven pass treats
+// them as not orderable by value instead of as holding nothing.
+func (c *Collection) adoptPersistedProfile(seg *segment, profile []byte, want string) {
+	if seg == nil || seg.profile != nil || len(profile) == 0 || want == "" {
+		return
+	}
+	if p := parseProfileBlob(profile, want); p != nil {
+		seg.profile = p
 	}
 }
 

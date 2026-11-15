@@ -8,33 +8,28 @@ import (
 	"testing"
 )
 
-// TestSegmentSidecarContainer covers the sidecar container framing, including the v2 (3-section)
-// layout that carries the columnar-accelerator blob and the backward-compatible parse of a v1
-// (2-section, pre-columnar) container.
+// TestSegmentSidecarContainer covers the sidecar container framing: every section round-trips,
+// an absent section reads back absent rather than as someone else's bytes, and malformed input
+// fails cleanly instead of panicking or yielding a section sliced on a guess.
+//
+// It deliberately does NOT assert which container version the writer picks. That was the old
+// shape of this test, and it is what made every added section a version bump; the current
+// container carries a section directory, so what matters is the round-trip, not the layout.
 func TestSegmentSidecarContainer(t *testing.T) {
 	attr := []byte("ARCX-attribute-index-blob")
 	key := []byte("KIDX-key-index-blob-payload")
 	col := []byte("COLX-columnar-block-payload-bytes")
 
-	// v2: all three sections round-trip.
+	// All three sections round-trip.
 	c2 := buildSegmentSidecar(attr, key, col, nil, 0, 0, 0, nil)
-	if binary.LittleEndian.Uint32(c2[len(c2)-4:]) != sidecarContainerMagicV2 {
-		t.Fatal("v2 container: wrong trailing magic")
-	}
 	a, k, cc, _, ok := splitSegmentSidecar(c2)
 	if !ok || !bytes.Equal(a, attr) || !bytes.Equal(k, key) || !bytes.Equal(cc, col) {
 		t.Fatalf("v2 split: ok=%v attr=%q key=%q col=%q", ok, a, k, cc)
 	}
 
-	// Empty col writes the v1 layout byte-for-byte (identical to a pre-columnar sidecar): trailing
-	// magic is SCNT, length is attr+key+12, and split returns col == nil.
+	// An absent columnar section reads back as absent -- not as an empty slice carved out of
+	// whatever follows it.
 	c1 := buildSegmentSidecar(attr, key, nil, nil, 0, 0, 0, nil)
-	if binary.LittleEndian.Uint32(c1[len(c1)-4:]) != sidecarContainerMagic {
-		t.Fatal("empty col should write the v1 magic")
-	}
-	if len(c1) != len(attr)+len(key)+sidecarTrailerLen {
-		t.Fatalf("v1 length = %d, want %d", len(c1), len(attr)+len(key)+sidecarTrailerLen)
-	}
 	a, k, cc, _, ok = splitSegmentSidecar(c1)
 	if !ok || !bytes.Equal(a, attr) || !bytes.Equal(k, key) || cc != nil {
 		t.Fatalf("v1 split: ok=%v attr=%q key=%q col=%v (want col nil)", ok, a, k, cc)
