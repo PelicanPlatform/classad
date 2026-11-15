@@ -776,13 +776,23 @@ func readSidecarTrailer(path string) (out sidecarFacts) {
 				return sidecarFacts{}
 			}
 			var keyOff, keyLen, dmgOff, dmgLen, off int64
+			seen := make(map[uint16]struct{}, n)
 			for i := 0; i < n; i++ {
 				e := dir[i*sidecarDirEntryLen:]
+				id := binary.LittleEndian.Uint16(e[0:])
 				ln := int64(binary.LittleEndian.Uint32(e[4:]))
 				if ln < 0 || off+ln > dirAt {
 					return sidecarFacts{}
 				}
-				switch binary.LittleEndian.Uint16(e[0:]) {
+				// The same refusal as splitSidecarV7's: two sections claiming one id is a
+				// container the mapped reader rejects, and the two must agree on what is
+				// trusted -- or recovery would take an extent from a sidecar the open then
+				// refuses to adopt.
+				if _, dup := seen[id]; dup {
+					return sidecarFacts{}
+				}
+				seen[id] = struct{}{}
+				switch id {
 				case secKey:
 					keyOff, keyLen = off, ln
 				case secDamage:

@@ -3,6 +3,8 @@ package collections
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -231,5 +233,38 @@ func TestSidecarSectionsCloneDoesNotAlias(t *testing.T) {
 	}
 	if !bytes.Equal(cl.zone, []byte("ZONEZONE")) || !bytes.Equal(cl.profile, []byte("PROFILE!")) {
 		t.Errorf("clone aliased the source: zone=%q profile=%q", cl.zone, cl.profile)
+	}
+}
+
+// readSidecarTrailer is the third reader of the container -- recovery's, which reads the
+// trailer and directory by ReadAt without mapping the file -- and it must refuse exactly
+// what parseSidecar refuses. Were it more lenient, recovery would trust an extent (and skip
+// the walk that verifies it) from a sidecar the open then declines to adopt.
+func TestReadSidecarTrailerAgreesWithParseOnMalformed(t *testing.T) {
+	in := sampleSections()
+	in.damage = nil // the trailer reader decodes a damage section; the sample's is not one
+	good := buildSidecar(in)
+	path := filepath.Join(t.TempDir(), "seg.idx")
+
+	if err := os.WriteFile(path, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if f := readSidecarTrailer(path); f.used != in.used || f.dictRec != in.dictRec || f.colRec != in.colRec {
+		t.Fatalf("well-formed container: facts = %+v, want used=%d dictRec=%d colRec=%d", f, in.used, in.dictRec, in.colRec)
+	}
+
+	// Two sections claiming one id. parseSidecar refuses it (TestSidecarV7RefusesMalformed);
+	// the trailer reader has to as well.
+	dup := append([]byte(nil), good...)
+	dirAt := len(dup) - sidecarTrailerLenV7 - 5*sidecarDirEntryLen // five sections without damage
+	binary.LittleEndian.PutUint16(dup[dirAt+sidecarDirEntryLen:], secAttr)
+	if parseSidecar(dup).ok {
+		t.Fatal("fixture: parseSidecar accepted the duplicate-id container")
+	}
+	if err := os.WriteFile(path, dup, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if f := readSidecarTrailer(path); f.used != 0 || f.dictRec != 0 || f.colRec != 0 || f.damage != nil {
+		t.Errorf("duplicate-id container: trailer reader returned %+v, parseSidecar refuses it", f)
 	}
 }
