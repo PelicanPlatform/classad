@@ -83,6 +83,17 @@ type Options struct {
 	// a segment by its newest timestamp. Value-indexed attributes (ValueAttrs) are
 	// zoned automatically. Only meaningful with AppendOnly. Optional. See zonemap.go.
 	ZoneAttrs []string
+	// OnHighMarkError is called when the seal-time size eviction fails to unmap or unlink a
+	// segment it dropped. The eviction itself has already happened; the error is the
+	// reclaim, so discarding it silently is how a store leaks files nobody looks for.
+	// nil discards it.
+	OnHighMarkError func(error)
+	// ProfileBucketBytes is the quantile resolution of each sealed segment's retention
+	// profile, in stored bytes (see segprofile.go). 0 derives it from SegmentSize, which at
+	// the default 8 MiB segment gives 1 MiB buckets. Finer buys a tighter eviction cutoff
+	// and costs bytes in every sidecar; coarser than about an eighth of a segment leaves
+	// segments all-or-nothing, which means they can only be dropped whole, never trimmed.
+	ProfileBucketBytes int64
 	// SegmentSize is the arena segment size in bytes. Default 8 MiB.
 	SegmentSize int
 	// Hasher routes keys to shards / directory buckets. Default 64-bit FNV-1a.
@@ -625,6 +636,19 @@ type Collection struct {
 	// internAtSeal interns each append-only segment as soon as it seals (see
 	// Options.InternAtSeal), via InternSealed from the Archive.Append eager-seal hook.
 	internAtSeal bool
+	// onHighMarkErr reports a failed reclaim from the seal-time size eviction (see
+	// Options.OnHighMarkError). nil discards it.
+	onHighMarkErr func(error)
+	// maxBytesHint mirrors Retention.MaxBytes for the seal-time check, which runs on the
+	// APPENDING goroutine. Reading it through Retention() takes maintMu, which a retrain or
+	// a merge holds for minutes -- so every seal would stall behind a maintenance pass just
+	// to read a bound that is usually not set at all. Written under maintMu beside ret.
+	maxBytesHint atomic.Int64
+	// highMarkPasses/highMarkDropped count the seal-time size evictions that dropped
+	// something, and the segments they dropped. Diagnostic: the ratio of passes to seals is
+	// how you see an archive pinned to its ceiling.
+	highMarkPasses  atomic.Int64
+	highMarkDropped atomic.Int64
 	// verifyReads checks each record's CRC before its bytes are used; see
 	// Options.DisableReadVerification. On by default for a persistent collection.
 	verifyReads bool
@@ -972,13 +996,16 @@ func New(opts Options) *Collection {
 	baseSpec.setComponentAttrs(c.intern, opts.CategoricalComponentAttrs, opts.ValueComponentAttrs)
 	c.compRefused = baseSpec.setComposites(c.intern, opts.CompositeAttrs, false)
 	c.spec.Store(baseSpec)
-	// Zone maps (append-only only): cover the explicit ZoneAttrs plus every value-indexed
-	// attribute (a range query on an indexed attr should prune whole segments too), matching
-	// the archive. Each attribute carries both its folded name and its interned id so the
+	// Zone maps (append-only only): cover the explicit ZoneAttrs, every value-indexed
+	// attribute (a range query on an indexed attr should prune whole segments too), and the
+	// retention eviction axis -- a segment's profile is read off the same per-segment walk as
+	// its zone map, so an axis that is not zone-mapped yields no profile and eviction falls
+	// back to dropping the oldest segment by position, silently. Adding it here is the same
+	// rule the value-indexed attributes already get. Each attribute carries both its folded name and its interned id so the
 	// per-segment scan can read the value whether records are inline- or id-encoded; the
 	// zone map is keyed by id, which zonePrune/age-retention resolve names to via c.intern.
 	// zoneInline is finalized in Open (a persistent collection stores inline names).
-	if len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0 {
+	if len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0 || opts.Retention.evictAttr() != "" {
 		var zattrs []zoneAttr
 		seen := map[uint32]struct{}{}
 		addZone := func(name string) {
@@ -995,10 +1022,20 @@ func New(opts Options) *Collection {
 		for _, n := range topLevelNames(opts.ValueAttrs) { // value-indexed attrs are zoned automatically
 			addZone(n)
 		}
+		if a := opts.Retention.evictAttr(); a != "" && splitAttrPath(a) == nil {
+			addZone(a) // the eviction axis, or the profile it needs is never built
+		}
 		c.hasZones.Store(len(zattrs) > 0)
 		for _, sh := range shards {
 			sh.zoneAttrs = zattrs
 		}
+	}
+	// Size-driven eviction orders by this attribute, so every segment sealed from here on
+	// carries a profile of it. Empty (the default) keeps the positional policy and costs
+	// nothing: no profile is accumulated and no section is written.
+	for _, sh := range shards {
+		sh.profBucket = opts.ProfileBucketBytes
+		sh.setProfileAttr(opts.Retention.evictAttr())
 	}
 	// In-memory sealing: when this collection is in-memory (no Dir), mmap is supported, and
 	// indexes are configured, seal each sealed RAM segment's index into an anonymous mmap
@@ -1088,6 +1125,8 @@ func New(opts Options) *Collection {
 	// Persistent (Dir set) append-only only: c.inline (set later in persist setup) is exactly
 	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.
 	c.internAtSeal = opts.InternAtSeal && opts.AppendOnly && opts.Dir != ""
+	c.onHighMarkErr = opts.OnHighMarkError
+	c.maxBytesHint.Store(opts.Retention.MaxBytes)
 	// Reads are only worth verifying against a persistent segment: an in-memory
 	// arena cannot have been corrupted on disk, and its records carry the same CRC
 	// only incidentally.

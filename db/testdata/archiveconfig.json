@@ -37,6 +37,8 @@
     "MaxAgeAttr": "",
     "MaxAge": 3600,
     "MinAgeAttr": "",
-    "MinAge": 0
+    "MinAge": 0,
+    "EvictByAttr": "EnteredHistoryTime",
+    "TargetBytes": 536870912
   }
 }

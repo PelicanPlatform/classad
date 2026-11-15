@@ -389,12 +389,14 @@ func (c *Collection) persistSegDamage(seg *segment) bool {
 	if err != nil {
 		return false
 	}
-	attr, _, col, zone, ok := splitSegmentSidecar(data)
-	if !ok {
+	sc := parseSidecar(data)
+	if !sc.ok {
 		return false
 	}
-	container := buildSegmentSidecar(attr, c.segKeyIndex(seg), col,
-		zone, seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
+	sc.key = c.segKeyIndex(seg)
+	sc.damage = encodeDamage(seg.damaged())
+	sc.used, sc.dictRec, sc.colRec = seg.used, seg.dictRecOff(), seg.colRecOff()
+	container := buildSidecar(sc)
 	if writeFileAtomic(path, container) != nil {
 		return false
 	}

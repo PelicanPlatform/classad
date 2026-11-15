@@ -2,6 +2,7 @@ package collections
 
 import (
 	"math"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -38,6 +39,29 @@ import (
 // those segments (rezoneSealed). An explicit pass over the output was written first and
 // then removed -- with it and without it the pruning measured identical on every shape
 // that could be built, and a branch whose removal nothing detects is worse than none.
+
+// computeSegZones computes a sealed segment's zone map. See computeSegZonesProfiled for the
+// variant that also accumulates the retention profile on the same walk.
+func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, inline bool, sealed func(string) bool) map[uint32]zoneRange {
+	return computeSegZonesProfiled(c, seg, upto, attrs, inline, sealed, nil)
+}
+
+// lookupZoneNode resolves a zone attribute's value node in one record, in whichever encoding
+// the segment uses: a segment-local dictionary id, an inline name, or the collection's
+// interned id.
+func lookupZoneNode(ad wire.Ad, za zoneAttr, dict *segDictHandle, inline bool) ([]byte, bool) {
+	switch {
+	case dict != nil:
+		if id, has := dict.segIDOf(za.name); has {
+			return ad.Lookup(uint32(id)) //idspace:translate a dictionary-keyed record is keyed by the segID
+		}
+		return nil, false
+	case inline:
+		return ad.LookupByName(za.name)
+	default:
+		return ad.Lookup(za.id)
+	}
+}
 
 // zoneAttr is one zone-mapped attribute: its (folded) name for inline-encoded records
 // and its interned id for id-encoded records. The computed zone map is keyed by id
@@ -108,7 +132,20 @@ func zoneValue(node []byte) (float64, zoneCell) {
 // schema does not cover, and a zone map that under-reports a range makes the scan SKIP segments that
 // contain matches. That is the worst shape of wrong answer here -- silent, and faster than the
 // correct one.
-func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, inline bool, sealed func(string) bool) map[uint32]zoneRange {
+// computeSegZonesProfiled is computeSegZones plus, when prof is non-nil, the byte-weighted
+// value profile of prof.attr accumulated on the SAME walk. The walk decompresses every
+// record, which is the whole cost here, so the profile rides along for an extra attribute
+// lookup rather than a second pass over the segment.
+//
+// The profile's lookup is deliberately independent of the zone accumulators above it. A
+// zone stops looking at an attribute once some record holds an expression for it (the
+// range can no longer bound it), and the profile must keep going: those records are what
+// its unknown-byte count exists to record.
+//
+// prof is left untouched -- so the caller sees no profile at all -- when the attribute is
+// not among the zone attributes after the sealing filter, since then there is nothing to
+// read it from.
+func computeSegZonesProfiled(c *Collection, seg *segment, upto int, attrs []zoneAttr, inline bool, sealed func(string) bool, prof *profileAcc) map[uint32]zoneRange {
 	data, dict := seg.data, seg.dict.Load()
 	if sealed != nil {
 		// No zone for an attribute the sealing policy names. A sealed value already leaves its
@@ -139,6 +176,20 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 		opaque bool // some record held an expression
 	}
 	accs := make([]zoneAcc, len(attrs))
+	// The profile reads the attribute itself, so it needs that attribute's identity in this
+	// segment's encoding; without it there is nothing to profile.
+	profIdx := -1
+	if prof != nil {
+		for i, za := range attrs {
+			if strings.EqualFold(za.name, prof.attr) {
+				profIdx = i
+				break
+			}
+		}
+		if profIdx < 0 {
+			prof = nil
+		}
+	}
 	var buf []byte
 	dm := seg.damaged()
 	walked := 0
@@ -165,6 +216,15 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 		}
 		buf = w
 		ad := wire.Ad(w)
+		if prof != nil {
+			v, ok := 0.0, false
+			if node, has := lookupZoneNode(ad, attrs[profIdx], dict, inline); has {
+				if f, cell := zoneValue(node); cell == zoneNumber {
+					v, ok = f, true
+				}
+			}
+			prof.add(v, int64(total), ok)
+		}
 		for i, za := range attrs {
 			a := &accs[i]
 			if a.opaque {
@@ -286,5 +346,17 @@ func (sh *shard) sealZones(seg *segment) {
 	}
 	// nil collection: the segment being sealed is the active append target, which is whole-record by
 	// construction (only sealed segments are columnarized), so no reassembly can be needed here.
-	seg.zones = computeSegZones(nil, seg, seg.used, sh.zoneAttrs, sh.zoneInline, sh.sealsName)
+	var prof *profileAcc
+	if attr := sh.profileAttr(); attr != "" {
+		prof = &profileAcc{attr: attr}
+	}
+	seg.zones = computeSegZonesProfiled(nil, seg, seg.used, sh.zoneAttrs, sh.zoneInline, sh.sealsName, prof)
+	// recvMin/recvMax: the segment is sealed now, and an append-only segment is written over
+	// a window ending now. Both ends are stamped with the seal instant rather than the
+	// window's -- the store keeps no clock of its own on the append path, and the value is
+	// read only to tell a source stamping ITS OWN clock from one deriving from the record.
+	if prof != nil {
+		now := int64(nowMillis() / 1000)
+		seg.profile = prof.finish(sh.profileBucketBytes(), now, now)
+	}
 }

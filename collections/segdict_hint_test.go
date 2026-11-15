@@ -175,7 +175,8 @@ func TestSegDictFallsBackToWalkOnOldSidecar(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		attr, key, col, zone, used, _, ok := splitSegmentSidecarV4(data)
+		sc := parseSidecar(data)
+		attr, key, col, zone, used, ok := sc.attr, sc.key, sc.col, sc.zone, sc.used, sc.ok
 		if !ok {
 			continue
 		}
