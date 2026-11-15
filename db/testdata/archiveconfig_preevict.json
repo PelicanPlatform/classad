@@ -1,0 +1,42 @@
+{
+  "SegmentSize": 1048576,
+  "RowGroupBytes": 65536,
+  "HotAttrs": [
+    "Owner",
+    "JobStatus"
+  ],
+  "CategoricalAttrs": [
+    "Owner"
+  ],
+  "ValueAttrs": [
+    "ClusterId"
+  ],
+  "ZoneAttrs": [
+    "CompletionDate"
+  ],
+  "AutoAttrs": [
+    "ClusterId"
+  ],
+  "AutoHotAttrs": [
+    "GlobalJobId"
+  ],
+  "IndexBackfillBytes": 16777216,
+  "SchemaRequireAttrs": [
+    "DiskUsage"
+  ],
+  "SchemaRequireRuntime": [
+    "ImageSize"
+  ],
+  "GroupSchemaCount": 3,
+  "GroupStabilityRuns": 2,
+  "GroupMergeJaccard": 0.75,
+  "GroupMaxPartialFrac": 0.25,
+  "Retention": {
+    "MaxSegments": 7,
+    "MaxBytes": 1073741824,
+    "MaxAgeAttr": "",
+    "MaxAge": 3600,
+    "MinAgeAttr": "",
+    "MinAge": 0
+  }
+}

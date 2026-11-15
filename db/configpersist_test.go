@@ -34,7 +34,8 @@ func goldenArchiveConfig() ArchiveConfig {
 		GroupStabilityRuns:   2,
 		GroupMergeJaccard:    0.75,
 		GroupMaxPartialFrac:  0.25,
-		Retention:            collections.Retention{MaxSegments: 7, MaxBytes: 1 << 30, MaxAge: 3600},
+		Retention: collections.Retention{MaxSegments: 7, MaxBytes: 1 << 30, MaxAge: 3600,
+			EvictByAttr: "EnteredHistoryTime", TargetBytes: 1 << 29},
 	}
 }
 
@@ -722,5 +723,37 @@ func TestIndexConfigAutoHotTagged(t *testing.T) {
 	}
 	if got := string(data); got != `{"hot":["Owner"]}` {
 		t.Errorf("persistedIndexConfig JSON without an auto tier = %s, want autoHot omitted", got)
+	}
+}
+
+// A config written BEFORE the eviction axis existed must still open, with the new fields at
+// their zero values -- which is the positional retention every such deployment already has.
+// The fixture is a byte copy of the committed one from before those fields were added, so
+// this is literally what an upgrading archive has on disk; regenerating it would defeat the
+// point.
+//
+// The format guard above catches a renamed or dropped tag. It cannot catch this: adding a
+// field leaves the new file valid and says nothing about whether the OLD one still is.
+func TestArchiveReopensConfigWithoutEvictionFields(t *testing.T) {
+	dir := t.TempDir()
+	copyFixture(t, "archiveconfig_preevict.json", filepath.Join(dir, archiveConfigFile))
+
+	a, err := openArchiveTable(dir, ArchiveConfig{}, nil)
+	if err != nil {
+		t.Fatalf("reopen over a pre-eviction config: %v", err)
+	}
+	defer a.Close()
+
+	r := a.Retention()
+	// The bounds it did record survive...
+	if r.MaxSegments != 7 || r.MaxBytes != 1<<30 || r.MaxAge != 3600 {
+		t.Errorf("Retention = %+v, want the fixture's bounds", r)
+	}
+	// ...and the fields it predates read as unset, which is the positional behaviour such a
+	// deployment has today. Defaulting them to anything else would change what an existing
+	// archive evicts on, silently, at the first restart after an upgrade.
+	if r.EvictByAttr != "" || r.TargetBytes != 0 {
+		t.Errorf("EvictByAttr=%q TargetBytes=%d, want unset: an upgrade must not change the eviction axis by itself",
+			r.EvictByAttr, r.TargetBytes)
 	}
 }
