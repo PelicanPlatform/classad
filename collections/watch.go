@@ -50,6 +50,55 @@ const (
 	WatchResync
 )
 
+// WatchResetReason says why a WatchReset was issued.
+//
+// A Reset is one event kind with causes that call for completely different responses. "Your
+// cursor is older than what I still keep" is a retention or lag problem; "my epoch changed" is
+// a crash; "your cursor is ahead of my head" is a restored backup or a rollback, and is the
+// alarming one. Without this they are indistinguishable at the client, which can only discard
+// and rebuild and has nothing to tell an operator.
+//
+// Set on WatchReset events only; WatchResetNone on every other kind.
+type WatchResetReason uint8
+
+const (
+	// WatchResetNone is every event that is not a Reset.
+	WatchResetNone WatchResetReason = iota
+	// WatchResetInitial: no cursor was supplied. This is the first subscribe and the
+	// snapshot that follows is the whole point, not a loss -- nothing was missed.
+	WatchResetInitial
+	// WatchResetEpoch: the cursor names a different store generation. For a mutable
+	// collection that is any restart without a retention window; for an append-only one it
+	// means the last shutdown was unclean (see watchepoch.go).
+	WatchResetEpoch
+	// WatchResetRetention: the cursor is older than what the store still holds -- below the
+	// append floor, or past the delete horizon with no markers left to prove what went away.
+	// Records between the cursor and the replay's start are GONE, not merely re-sent.
+	WatchResetRetention
+	// WatchResetAhead: the cursor is ahead of this store's head, so its sequences may be
+	// reassigned to records it never saw. A store restored from a backup or rolled back
+	// reaches this; so does one copied while open. It is the reason worth paging on.
+	WatchResetAhead
+	// WatchResetCursorInvalid: the cursor did not decode, or names a different shard count.
+	WatchResetCursorInvalid
+)
+
+func (r WatchResetReason) String() string {
+	switch r {
+	case WatchResetInitial:
+		return "initial"
+	case WatchResetEpoch:
+		return "epoch"
+	case WatchResetRetention:
+		return "retention"
+	case WatchResetAhead:
+		return "ahead"
+	case WatchResetCursorInvalid:
+		return "cursor-invalid"
+	}
+	return "none"
+}
+
 // WatchEvent is one item in a Watch stream. Cursor, when non-nil, is an opaque token
 // the client persists after processing the event and passes back to Watch on resume.
 // Catch-up data events carry no cursor (persist at WatchSynced); live events do.
@@ -72,6 +121,8 @@ type WatchEvent struct {
 	// non-decreasing version takes a running maximum. WatchWatermark is the value that is
 	// closed across every shard.
 	Stamp uint64
+	// Reason says why a WatchReset was issued; WatchResetNone on every other kind.
+	Reason WatchResetReason
 }
 
 // --- opaque cursor: {epoch, perShardSeq[]} ---
@@ -615,7 +666,17 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 
 		// Decide incremental vs. full replay.
 		epoch, seqs, ok := decodeCursor(cursor)
-		full := !ok || epoch != c.hub.epoch || len(seqs) != len(c.shards)
+		// One decision, named. The order matters: epoch and seqs are meaningless when the
+		// cursor did not decode, so "invalid" is tested before anything read out of it.
+		reason := WatchResetNone
+		switch {
+		case len(cursor) == 0:
+			reason = WatchResetInitial
+		case !ok, len(seqs) != len(c.shards):
+			reason = WatchResetCursorInvalid
+		case epoch != c.hub.epoch:
+			reason = WatchResetEpoch
+		}
 
 		// Snapshot each shard's commit sequence: S_reg, the upper bound of catch-up. The
 		// watcher is already registered, so every commit past S_reg reaches it live.
@@ -661,7 +722,7 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 			watchSnapshotHook(c)
 		}
 
-		plan := c.planCatchup(seqs, sReg, full)
+		plan := c.planCatchup(seqs, sReg, reason)
 		if !c.runCatchup(&plan, seqs, sReg, yield, redact) {
 			return
 		}
@@ -762,7 +823,10 @@ func WatchFilter(seq iter.Seq[WatchEvent], match func(*classad.ClassAd) bool) it
 					}
 				} else if _, was := matched[k]; was {
 					delete(matched, k)
-					if !yield(WatchEvent{Kind: WatchDelete, Key: ev.Key, Cursor: ev.Cursor}) {
+					// The synthesized delete names the same change as the upsert that stopped
+					// matching, so it takes that change's stamp; inventing 0 here would hand a
+					// consumer a version that goes backwards.
+					if !yield(WatchEvent{Kind: WatchDelete, Key: ev.Key, Cursor: ev.Cursor, Stamp: ev.Stamp}) {
 						return
 					}
 				}
@@ -821,7 +885,7 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 		evs := make([]WatchEvent, 0, len(order))
 		for _, ks := range order {
 			raw := pending[ks]
-			ev := WatchEvent{Key: raw.key}
+			ev := WatchEvent{Key: raw.key, Stamp: raw.stamp}
 			if raw.deleted {
 				if c.watchHidden(raw.key) {
 					continue // structural delete: hidden
@@ -1063,9 +1127,17 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 // each retention check is made against exactly what catch-up then reads.
 type catchupPlan struct {
 	full bool
-	dels [][]delEntry  // per shard: journaled deletes in (cursor, S_reg]; incremental only
-	wins [][]segWindow // per shard, append-only: windows pinned at S_reg; nil = snapshot on read
+	// reason is why full was set, carried onto the Reset event so a client can tell a
+	// retention loss from a crash from a rolled-back store. Always set together with full,
+	// through resetTo, so the two cannot drift apart.
+	reason WatchResetReason
+	dels   [][]delEntry  // per shard: journaled deletes in (cursor, S_reg]; incremental only
+	wins   [][]segWindow // per shard, append-only: windows pinned at S_reg; nil = snapshot on read
 }
+
+// resetTo marks the plan a full replay for reason. full and reason are set together, here and
+// nowhere else, so a reset path added later cannot yield a Reset that reports no reason.
+func (p *catchupPlan) resetTo(r WatchResetReason) { p.full, p.reason = true, r }
 
 func (p *catchupPlan) release() {
 	for _, w := range p.wins {
@@ -1081,10 +1153,11 @@ func (p *catchupPlan) shardWins(i int) []segWindow {
 	return p.wins[i]
 }
 
-// planCatchup decides incremental vs. full replay for cursor seqs (full already set if
-// the cursor is unusable) and captures what catch-up will read.
-func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
-	p := catchupPlan{full: full}
+// planCatchup decides incremental vs. full replay for cursor seqs (reason already set, to
+// something other than WatchResetNone, if the cursor itself is unusable) and captures what
+// catch-up will read.
+func (c *Collection) planCatchup(seqs, sReg []uint64, reason WatchResetReason) catchupPlan {
+	p := catchupPlan{full: reason != WatchResetNone, reason: reason}
 	// Append-only gap: a cursor below the append floor -- records it may hold or never saw
 	// were rotated out or truncated -- cannot resume -> full replay from the current floor.
 	// Append logs keep no delete journal, so this is their reset trigger. The windows
@@ -1098,7 +1171,7 @@ func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
 			var floor uint64
 			p.wins[i], floor = sh.appendCatchupView(sReg[i])
 			if !p.full && seqs[i] < floor {
-				p.full = true
+				p.resetTo(WatchResetRetention)
 			}
 		}
 	}
@@ -1111,7 +1184,7 @@ func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
 		// an older copy of a persistent store reopened under the same epoch): its seqs may
 		// later be reassigned to records it never saw, so it cannot be resumed.
 		if seqs[i] > sReg[i] {
-			p.full = true
+			p.resetTo(WatchResetAhead)
 			break
 		}
 		// Retention: a cursor below the delete horizon may have missed a trimmed delete,
@@ -1124,7 +1197,7 @@ func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
 			// promises they are all present.
 			dels, ok := sh.deleteMarkersSince(seqs[i], sReg[i])
 			if !ok {
-				p.full = true
+				p.resetTo(WatchResetRetention)
 				break
 			}
 			p.dels[i] = dels
@@ -1142,7 +1215,7 @@ func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
 func (c *Collection) runCatchup(p *catchupPlan, seqs, sReg []uint64, yield func(WatchEvent) bool, redact bool) bool {
 	defer p.release()
 	if p.full {
-		if !yield(WatchEvent{Kind: WatchReset}) {
+		if !yield(WatchEvent{Kind: WatchReset, Reason: p.reason}) {
 			return false
 		}
 		for i := range c.shards {

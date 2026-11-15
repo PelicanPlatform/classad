@@ -651,6 +651,12 @@ func (a *Archive) WatchCursor() ([]byte, error) {
 	return a.c.WatchCursor()
 }
 
+// WatchWatermark is the archive's closed watch clock: every change at or below it has been
+// handed to every attached watcher. It is what a catch-up has caught up TO, and so the
+// version a consumer gives the records a replay delivered, which carry no stamp of their
+// own. See Collection.WatchWatermark.
+func (a *Archive) WatchWatermark() uint64 { return a.c.WatchWatermark() }
+
 // ExplainQuery reports how the archive would execute q -- which conjuncts are index-usable
 // and the resulting access path -- as Collection.ExplainQuery does for a mutable table.
 //

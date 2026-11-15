@@ -22,6 +22,22 @@ const (
 	KindGap    Kind = "gap"    // advisory: records were lost to source retention (see From/To).
 )
 
+// ResetReason says why a KindReset was issued. It is the text of db.WatchResetReason: a
+// Change crosses a process boundary, so a consumer matches on the spelling rather than on an
+// integer whose meaning depends on the version it was compiled against.
+//
+// The one that matters operationally is ResetRetention. Every other reason means the records
+// are still there and are merely being re-sent; retention means they are gone.
+type ResetReason string
+
+const (
+	ResetInitial       ResetReason = "initial"        // first subscribe: nothing was missed
+	ResetEpoch         ResetReason = "epoch"          // the source restarted (uncleanly, for an archive)
+	ResetRetention     ResetReason = "retention"      // the cursor is older than what the source still keeps
+	ResetAhead         ResetReason = "ahead"          // the cursor is ahead of the source's head
+	ResetCursorInvalid ResetReason = "cursor-invalid" // the cursor did not decode
+)
+
 // Change is one change as the sink sees it, in memory. Ad is set only on an upsert.
 type Change struct {
 	Kind   Kind
@@ -39,6 +55,11 @@ type Change struct {
 
 	// For KindGap only: the estimated lost time window (unix millis).
 	FromMillis, ToMillis int64
+
+	// Reason, on a KindReset, says why. Empty on every other kind. A consumer that treats
+	// every Reset alike cannot tell records it LOST from records it is merely being re-sent,
+	// and so cannot tell an operator which of the two happened.
+	Reason ResetReason
 }
 
 // ChangeFromWatch maps a db.WatchEvent to a Change, stamping src and a caller-assigned monotonic
@@ -52,6 +73,9 @@ func ChangeFromWatch(we db.WatchEvent, src string, ver uint64) (Change, bool) {
 		c.Kind = KindDelete
 	case db.WatchReset:
 		c.Kind = KindReset
+		// Through the reason's own String, so there is no second mapping table to drift
+		// out of step with the first.
+		c.Reason = ResetReason(we.Reason.String())
 	case db.WatchSynced:
 		c.Kind = KindSynced
 	default: // db.WatchResync: not a sink-visible change

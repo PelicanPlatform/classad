@@ -1229,7 +1229,7 @@ func (t *ArchiveTable) watchAs(ctx context.Context, cursor []byte, redact bool) 
 func archiveWatchEvents(seq iter.Seq[collections.WatchEvent]) iter.Seq[WatchEvent] {
 	return func(yield func(WatchEvent) bool) {
 		for ev := range seq {
-			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor}
+			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor, Stamp: ev.Stamp, Reason: ev.Reason}
 			switch ev.Kind {
 			case collections.WatchDelete:
 				we.Kind = WatchDelete
@@ -1251,6 +1251,11 @@ func archiveWatchEvents(seq iter.Seq[collections.WatchEvent]) iter.Seq[WatchEven
 // Watch(cursor) then streams only what is appended after it, which is how a client tails
 // an archive without first replaying everything rotation still retains.
 func (t *ArchiveTable) WatchCursor() ([]byte, error) { return t.a.WatchCursor() }
+
+// WatchWatermark is the archive's closed watch clock, as DB.WatchWatermark is a table's:
+// the version a catch-up has caught up to, for the replayed events that carry no stamp of
+// their own. 0 when the archive has no watch.
+func (t *ArchiveTable) WatchWatermark() uint64 { return t.a.WatchWatermark() }
 
 // Truncate drops every record, resetting the archive to empty in place (see
 // collections.Archive.Truncate). It is the destructive reset behind a from-scratch history

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,23 @@ type PullConfig struct {
 	Src        string   // label recorded with events (defaults to Subscriber); passed as ?src=
 	Constraint string   // optional server-side filter
 	Project    []string // optional attribute projection
+
+	// SinceMillis bounds a FULL REPLAY, in unix milliseconds: the source skips records older
+	// than this instead of shipping everything it still holds. It applies to a cursor that
+	// could not be resumed for any reason, and to a first subscribe asking to be backfilled
+	// only so far. It does NOT apply to a cursor that resumed cleanly -- those records are
+	// ones this sink has not seen and expects, and the cursor it then commits is past them.
+	//
+	// It is how a collector bounds its own exposure independently of how much a source
+	// happens to retain. A fleet upgrade that restarts hundreds of sources uncleanly has
+	// each of them decide, on its own, to replay its whole archive at one collector;
+	// without this the collector cannot refuse. Those restarts produce `epoch` resets rather
+	// than `retention` ones, which is why this is not gated on the reason.
+	//
+	// Append-only (archive) feeds only, and only where the source stamps a record
+	// timestamp (ServerOptions.AgeAttr); the source rejects the subscription otherwise
+	// rather than ignore the bound. Records the source cannot timestamp are not skipped.
+	SinceMillis int64
 
 	Token      string        // bearer token
 	AckEvery   time.Duration // ack + commit cadence; default 5s
@@ -160,6 +178,9 @@ func (cfg PullConfig) subscribe(ctx context.Context, cursor []byte) (*http.Respo
 	}
 	if len(cursor) > 0 {
 		q.Set("cursor", base64.StdEncoding.EncodeToString(cursor))
+	}
+	if cfg.SinceMillis > 0 {
+		q.Set("since", strconv.FormatInt(cfg.SinceMillis, 10))
 	}
 	u.RawQuery = q.Encode()
 

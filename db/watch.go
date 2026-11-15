@@ -31,6 +31,21 @@ const (
 	WatchResync
 )
 
+// WatchResetReason says why a WatchReset was issued. It mirrors
+// collections.WatchResetReason 1:1; see there for what each cause means and what an
+// operator should do about it.
+type WatchResetReason = collections.WatchResetReason
+
+// The reasons, re-exported so a db caller need not import collections.
+const (
+	WatchResetNone          = collections.WatchResetNone
+	WatchResetInitial       = collections.WatchResetInitial
+	WatchResetEpoch         = collections.WatchResetEpoch
+	WatchResetRetention     = collections.WatchResetRetention
+	WatchResetAhead         = collections.WatchResetAhead
+	WatchResetCursorInvalid = collections.WatchResetCursorInvalid
+)
+
 // WatchEvent is one change to the log. Cursor resumes a watch just after this event
 // (survives reconnect / restart, so no change is missed).
 type WatchEvent struct {
@@ -48,6 +63,10 @@ type WatchEvent struct {
 	// do not, and WatchSynced carries the watermark instead. See collections.WatchEvent for
 	// what it does and does not order.
 	Stamp uint64
+	// Reason says why a WatchReset was issued; WatchResetNone on every other kind. A
+	// consumer that treats every Reset alike cannot tell records it LOST (retention) from
+	// records it is merely being re-sent (a restart, or its first subscribe).
+	Reason WatchResetReason
 }
 
 // Watch streams changes committed after the given cursor (nil = from now). Cancel via
@@ -86,7 +105,7 @@ func (db *DB) watchAs(ctx context.Context, cursor []byte, redact bool) (iter.Seq
 	}
 	return func(yield func(WatchEvent) bool) {
 		for ev := range seq {
-			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor, Stamp: ev.Stamp}
+			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor, Stamp: ev.Stamp, Reason: ev.Reason}
 			switch ev.Kind {
 			case collections.WatchDelete:
 				we.Kind = WatchDelete
