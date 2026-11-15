@@ -152,7 +152,8 @@ type ArchiveOptions struct {
 	// automatically included.
 	ZoneAttrs []string
 	// ProfileBucketBytes is the quantile resolution of each sealed segment's retention
-	// profile (see Options.ProfileBucketBytes). 0 derives it from SegmentSize.
+	// profile (see Options.ProfileBucketBytes). 0 means 1 MiB, lowered to an eighth of
+	// SegmentSize when that is smaller.
 	ProfileBucketBytes int64
 	// Retention bounds what rotation keeps. Zero ⇒ keep everything.
 	Retention Retention

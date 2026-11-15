@@ -89,10 +89,10 @@ type Options struct {
 	// nil discards it.
 	OnHighMarkError func(error)
 	// ProfileBucketBytes is the quantile resolution of each sealed segment's retention
-	// profile, in stored bytes (see segprofile.go). 0 derives it from SegmentSize, which at
-	// the default 8 MiB segment gives 1 MiB buckets. Finer buys a tighter eviction cutoff
-	// and costs bytes in every sidecar; coarser than about an eighth of a segment leaves
-	// segments all-or-nothing, which means they can only be dropped whole, never trimmed.
+	// profile, in stored bytes (see segprofile.go). 0 means 1 MiB, lowered to an eighth of
+	// SegmentSize when that is smaller -- a bucket near or above the segment size leaves a
+	// segment all-or-nothing to the eviction cutoff, so it can be dropped whole but never
+	// trimmed. Finer buys a tighter cutoff and costs bytes in every sidecar.
 	ProfileBucketBytes int64
 	// SegmentSize is the arena segment size in bytes. Default 8 MiB.
 	SegmentSize int
