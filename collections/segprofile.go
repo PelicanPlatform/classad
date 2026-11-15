@@ -95,7 +95,7 @@ func (p *profileAcc) add(v float64, n int64, ok bool) {
 
 // finish sorts the accumulated pairs and lays out the equi-depth buckets. Returns nil when
 // nothing was walked at all, which every reader takes as "nothing known".
-func (p *profileAcc) finish(bucketBytes int64, recvMin, recvMax int64) *segProfile {
+func (p *profileAcc) finish(bucketBytes, recvMin, recvMax int64) *segProfile {
 	if p == nil || p.total == 0 {
 		return nil
 	}

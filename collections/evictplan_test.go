@@ -4,7 +4,7 @@ import "testing"
 
 // segWithValues builds a sealed segment whose profile says it holds `each` bytes at every
 // listed value. bucket is the profile's quantile resolution.
-func segWithValues(bucket int64, each int64, values ...float64) *segment {
+func segWithValues(bucket, each int64, values ...float64) *segment {
 	p := &profileAcc{attr: "T"}
 	for _, v := range values {
 		p.add(v, each, true)

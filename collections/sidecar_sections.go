@@ -100,7 +100,7 @@ func buildSidecar(sc sidecarSections) []byte {
 	unknown := append([]sidecarUnknownSection(nil), sc.unknown...)
 	sort.Slice(unknown, func(i, j int) bool { return unknown[i].id < unknown[j].id })
 	for _, u := range unknown {
-		ordered = append(ordered, section{u.id, u.body})
+		ordered = append(ordered, section(u))
 	}
 
 	body, n := 0, 0

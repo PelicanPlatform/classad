@@ -14,46 +14,6 @@ import (
 // to the head of a bucket chain, the arena segments the records live in, and a
 // monotonic commit sequence used for MVCC scan visibility. Each shard is locked
 // independently to reduce contention.
-// profileAttr is the attribute this collection's sealed segments are profiled over, or "" for
-// none. Every shard is given the same value (construction and SetRetention set them together),
-// so any one of them answers for the collection -- and a collection that HAS profiles is
-// append-only, which is a single shard by construction.
-func (c *Collection) profileAttr() string {
-	if len(c.shards) == 0 {
-		return ""
-	}
-	return c.shards[0].profileAttr()
-}
-
-// profileAttr is the attribute this shard's sealed segments are profiled over, or "" for none.
-func (sh *shard) profileAttr() string {
-	if p := sh.profAttr.Load(); p != nil {
-		return *p
-	}
-	return ""
-}
-
-// profileBucketBytes is the profile's quantile resolution: the configured value, or one
-// derived from the segment size so a segment always offers enough breakpoints for a cutoff
-// to be placed INSIDE it. Without that a segment is all-or-nothing and can only be dropped
-// whole, which is the one thing trimming exists to avoid.
-func (sh *shard) profileBucketBytes() int64 {
-	if sh.profBucket > 0 {
-		return sh.profBucket
-	}
-	if sh.segSize > 0 {
-		if b := int64(sh.segSize) / profileBucketsPerSegment; b > 0 {
-			return b
-		}
-	}
-	return defaultProfileBucketBytes
-}
-
-// setProfileAttr points this shard's future seals at attr ("" disables profiling).
-func (sh *shard) setProfileAttr(attr string) {
-	sh.profAttr.Store(&attr)
-}
-
 type shard struct {
 	mu   sync.RWMutex
 	dir  map[uint64]loc // key hash -> head of bucket chain (pointer-free value)
@@ -245,6 +205,46 @@ type shard struct {
 	// metrics accumulates this shard's operational timings (write-lock wait/hold,
 	// segment allocation, durability sync). See opstats.go.
 	metrics shardMetrics
+}
+
+// profileAttr is the attribute this collection's sealed segments are profiled over, or "" for
+// none. Every shard is given the same value (construction and SetRetention set them together),
+// so any one of them answers for the collection -- and a collection that HAS profiles is
+// append-only, which is a single shard by construction.
+func (c *Collection) profileAttr() string {
+	if len(c.shards) == 0 {
+		return ""
+	}
+	return c.shards[0].profileAttr()
+}
+
+// profileAttr is the attribute this shard's sealed segments are profiled over, or "" for none.
+func (sh *shard) profileAttr() string {
+	if p := sh.profAttr.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// profileBucketBytes is the profile's quantile resolution: the configured value, or one
+// derived from the segment size so a segment always offers enough breakpoints for a cutoff
+// to be placed INSIDE it. Without that a segment is all-or-nothing and can only be dropped
+// whole, which is the one thing trimming exists to avoid.
+func (sh *shard) profileBucketBytes() int64 {
+	if sh.profBucket > 0 {
+		return sh.profBucket
+	}
+	if sh.segSize > 0 {
+		if b := int64(sh.segSize) / profileBucketsPerSegment; b > 0 {
+			return b
+		}
+	}
+	return defaultProfileBucketBytes
+}
+
+// setProfileAttr points this shard's future seals at attr ("" disables profiling).
+func (sh *shard) setProfileAttr(attr string) {
+	sh.profAttr.Store(&attr)
 }
 
 // lockWrite acquires the shard write lock, returning the timestamps unlockWrite needs

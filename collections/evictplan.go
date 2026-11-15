@@ -36,8 +36,20 @@ type evictHeap []evictEntry
 func (h evictHeap) Len() int           { return len(h) }
 func (h evictHeap) Less(i, j int) bool { return h[i].value < h[j].value }
 func (h evictHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *evictHeap) Push(x any)        { *h = append(*h, x.(evictEntry)) }
 func (h *evictHeap) Pop() any          { old := *h; n := len(old); it := old[n-1]; *h = old[:n-1]; return it }
+
+// Push takes `any` because container/heap's interface does. The assertion is CHECKED and
+// panics on a foreign type rather than being discarded with `, _`: only this file pushes,
+// and only evictEntry values, so a mismatch is a programming error -- and the zero value a
+// failed unchecked assertion would yield is a real-looking entry (segment 0, breakpoint 0,
+// value 0) that the merge would credit to a plan that never examined that segment.
+func (h *evictHeap) Push(x any) {
+	e, ok := x.(evictEntry)
+	if !ok {
+		panic("evictHeap: pushed a value that is not an evictEntry")
+	}
+	*h = append(*h, e)
+}
 
 // evictPlan is what one size-driven pass decided.
 type evictPlan struct {
@@ -92,7 +104,12 @@ func planEviction(segs []*segment, active *segment, need int64, attr string) evi
 
 	last := math.Inf(-1)
 	for plan.freed < need && h.Len() > 0 {
-		e := heap.Pop(&h).(evictEntry)
+		// Checked for the same reason Push checks: a silently zeroed entry would credit
+		// segment 0's first bucket to a plan that never visited it.
+		e, ok := heap.Pop(&h).(evictEntry)
+		if !ok {
+			panic("evictHeap: popped a value that is not an evictEntry")
+		}
 		p := profs[e.segIdx]
 		// Credit the bucket this breakpoint CLOSES. Taking the breakpoint certifies that
 		// everything before it in that segment is at or below its value -- not that the

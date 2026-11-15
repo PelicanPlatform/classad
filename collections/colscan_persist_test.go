@@ -173,7 +173,7 @@ func TestSchemaScanReloadCorruptSection(t *testing.T) {
 			return nil
 		}
 		sc := parseSidecar(b)
-		if !sc.ok || len(sc.col) < colSectionHdr+1 {
+		if !sc.ok || len(sc.col) <= colSectionHdr {
 			return nil // no columnar section in this one
 		}
 		sc = sc.clone()

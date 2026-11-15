@@ -31,7 +31,7 @@ func countMatching(t *testing.T, a *Archive, constraint string) int {
 func appendEra(t *testing.T, a *Archive, base, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
-		ad, err := classad.Parse(fmt.Sprintf(`[ T=%d; Pad="%s" ]`, base+i, profPad(96)))
+		ad, err := classad.Parse(fmt.Sprintf(`[ T=%d; Pad=%q ]`, base+i, profPad(96)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -190,13 +190,13 @@ func TestRotateHoleRaisesTheWatchFloor(t *testing.T) {
 // what the ceiling exists to prevent. The seal-time pass has to hold the line with no
 // maintenance call at all.
 func TestHighMarkBoundsGrowthBetweenMaintenancePasses(t *testing.T) {
-	const cap = 400 << 10 // 400 KiB
+	const ceiling = 400 << 10 // 400 KiB
 
 	a, err := CreateArchive(ArchiveOptions{
 		Dir:         t.TempDir(),
 		SegmentSize: 1 << 14,
 		ZoneAttrs:   []string{"T"},
-		Retention:   Retention{EvictByAttr: "T", MaxBytes: cap, TargetBytes: cap * 3 / 4},
+		Retention:   Retention{EvictByAttr: "T", MaxBytes: ceiling, TargetBytes: ceiling * 3 / 4},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -206,10 +206,10 @@ func TestHighMarkBoundsGrowthBetweenMaintenancePasses(t *testing.T) {
 	// Far more than the cap, appended without a single Rotate.
 	appendEra(t, a, newEra, 6000)
 
-	if st := a.Stats(); st.UsedBytes > cap*2 {
-		t.Errorf("archive grew to %d bytes against a %d cap with no maintenance pass", st.UsedBytes, cap)
+	if st := a.Stats(); st.UsedBytes > ceiling*2 {
+		t.Errorf("archive grew to %d bytes against a %d cap with no maintenance pass", st.UsedBytes, ceiling)
 	} else {
-		t.Logf("held at %d bytes against a %d cap", st.UsedBytes, cap)
+		t.Logf("held at %d bytes against a %d cap", st.UsedBytes, ceiling)
 	}
 	// It must still be a working archive, not an empty one.
 	if n := countMatching(t, a, fmt.Sprintf("T >= %d", newEra)); n == 0 {
@@ -242,7 +242,7 @@ func TestHighMarkInertWithoutAByteCeiling(t *testing.T) {
 // the same churn MergeOptions.TriggerSegments/TargetSegments and the index budget's
 // high/low fractions both exist to avoid. The symptom is passes, not size.
 func TestTargetBytesCutsEvictionChurn(t *testing.T) {
-	const cap = 400 << 10
+	const ceiling = 400 << 10
 
 	run := func(target int64) int64 {
 		t.Helper()
@@ -250,7 +250,7 @@ func TestTargetBytesCutsEvictionChurn(t *testing.T) {
 			Dir:         t.TempDir(),
 			SegmentSize: 1 << 14,
 			ZoneAttrs:   []string{"T"},
-			Retention:   Retention{EvictByAttr: "T", MaxBytes: cap, TargetBytes: target},
+			Retention:   Retention{EvictByAttr: "T", MaxBytes: ceiling, TargetBytes: target},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -261,7 +261,7 @@ func TestTargetBytesCutsEvictionChurn(t *testing.T) {
 		return passes
 	}
 
-	withGap := run(cap / 2)
+	withGap := run(ceiling / 2)
 	withoutGap := run(0) // evict to just under the ceiling
 	t.Logf("eviction passes: with a low mark %d, without %d", withGap, withoutGap)
 
@@ -293,7 +293,7 @@ func TestRotateTrimsStraddlingSegments(t *testing.T) {
 		if i%2 == 0 {
 			base = oldEra
 		}
-		ad, perr := classad.Parse(fmt.Sprintf(`[ T=%d; Pad="%s" ]`, base+i, profPad(96)))
+		ad, perr := classad.Parse(fmt.Sprintf(`[ T=%d; Pad=%q ]`, base+i, profPad(96)))
 		if perr != nil {
 			t.Fatal(perr)
 		}
@@ -350,7 +350,7 @@ func TestTrimSegmentKeepsEverythingAboveTheCutoff(t *testing.T) {
 	defer a.Close()
 
 	for i := 0; i < 400; i++ {
-		ad, perr := classad.Parse(fmt.Sprintf(`[ T=%d; N=%d; Pad="%s" ]`, 1000+i, i, profPad(96)))
+		ad, perr := classad.Parse(fmt.Sprintf(`[ T=%d; N=%d; Pad=%q ]`, 1000+i, i, profPad(96)))
 		if perr != nil {
 			t.Fatal(perr)
 		}
@@ -426,13 +426,13 @@ func TestTrimKeepsRecordsItCannotBound(t *testing.T) {
 		var src string
 		switch i % 4 {
 		case 0:
-			src = fmt.Sprintf(`[ Kind="low"; T=%d; Pad="%s" ]`, 1000+i, profPad(96))
+			src = fmt.Sprintf(`[ Kind="low"; T=%d; Pad=%q ]`, 1000+i, profPad(96))
 		case 1:
-			src = fmt.Sprintf(`[ Kind="expr"; T = 1000 + %d; Pad="%s" ]`, i, profPad(96)) // unevaluated
+			src = fmt.Sprintf(`[ Kind="expr"; T = 1000 + %d; Pad=%q ]`, i, profPad(96)) // unevaluated
 		case 2:
-			src = fmt.Sprintf(`[ Kind="string"; T="not a number"; Pad="%s" ]`, profPad(96))
+			src = fmt.Sprintf(`[ Kind="string"; T="not a number"; Pad=%q ]`, profPad(96))
 		default:
-			src = fmt.Sprintf(`[ Kind="absent"; Pad="%s" ]`, profPad(96)) // no T at all
+			src = fmt.Sprintf(`[ Kind="absent"; Pad=%q ]`, profPad(96)) // no T at all
 		}
 		ad, perr := classad.Parse(src)
 		if perr != nil {
@@ -442,7 +442,9 @@ func TestTrimKeepsRecordsItCannotBound(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a.Flush() //nolint:errcheck
+	if err := a.Flush(); err != nil {
+		t.Fatal(err)
+	}
 
 	unboundedBefore := map[string]int{}
 	for _, k := range []string{"expr", "string", "absent"} {
