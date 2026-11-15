@@ -57,12 +57,11 @@ const (
 	// default segment, ~100 bytes of metadata. Finer buys a tighter cutoff and costs bytes in
 	// every sidecar; this is the agreed default rather than a tuned one.
 	defaultProfileBucketBytes = 1 << 20
-	// profileBucketsPerSegment is how many breakpoints a segment should offer. It is what
-	// makes a TRIM possible at all: a segment with one breakpoint is all-or-nothing to the
-	// cutoff search, so it can only ever be dropped whole, and a store whose records are
-	// interleaved (a hub tailing several spokes) has no other kind of segment. Deriving the
-	// default bucket from the segment keeps that resolution at any segment size -- and at the
-	// default 8 MiB segment it lands exactly on defaultProfileBucketBytes.
+	// profileBucketsPerSegment is the fewest breakpoints a segment should offer, and it only
+	// ever LOWERS the default (see shard.profileBucketBytes). It is what makes a TRIM possible
+	// at all: a segment with one breakpoint is all-or-nothing to the cutoff search, so it can
+	// only be dropped whole, and a store whose records are interleaved (a hub tailing several
+	// spokes) has no other kind of segment.
 	profileBucketsPerSegment = 8
 )
 

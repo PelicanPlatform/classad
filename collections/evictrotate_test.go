@@ -279,8 +279,12 @@ func TestRotateTrimsStraddlingSegments(t *testing.T) {
 	a, err := CreateArchive(ArchiveOptions{
 		Dir:         t.TempDir(),
 		SegmentSize: 1 << 15,
-		ZoneAttrs:   []string{"T"},
-		Retention:   Retention{EvictByAttr: "T"},
+		// Small segments need a bucket to match, or every segment is all-or-nothing to
+		// the cutoff search and the trim has nothing to work on. Stated here rather than
+		// left to the default, which is sized for a production segment.
+		ProfileBucketBytes: 4 << 10,
+		ZoneAttrs:          []string{"T"},
+		Retention:          Retention{EvictByAttr: "T"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -341,8 +345,12 @@ func TestTrimSegmentKeepsEverythingAboveTheCutoff(t *testing.T) {
 	a, err := CreateArchive(ArchiveOptions{
 		Dir:         t.TempDir(),
 		SegmentSize: 1 << 15,
-		ZoneAttrs:   []string{"T"},
-		Retention:   Retention{EvictByAttr: "T"},
+		// Small segments need a bucket to match, or every segment is all-or-nothing to
+		// the cutoff search and the trim has nothing to work on. Stated here rather than
+		// left to the default, which is sized for a production segment.
+		ProfileBucketBytes: 4 << 10,
+		ZoneAttrs:          []string{"T"},
+		Retention:          Retention{EvictByAttr: "T"},
 	})
 	if err != nil {
 		t.Fatal(err)

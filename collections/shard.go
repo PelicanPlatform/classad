@@ -226,20 +226,26 @@ func (sh *shard) profileAttr() string {
 	return ""
 }
 
-// profileBucketBytes is the profile's quantile resolution: the configured value, or one
-// derived from the segment size so a segment always offers enough breakpoints for a cutoff
-// to be placed INSIDE it. Without that a segment is all-or-nothing and can only be dropped
-// whole, which is the one thing trimming exists to avoid.
+// profileBucketBytes is the profile's quantile resolution: the configured value, else
+// defaultProfileBucketBytes, lowered only where that would leave a segment with no internal
+// resolution at all.
+//
+// A segment holding fewer than a couple of buckets offers the cutoff search nothing -- it is
+// all-or-nothing, droppable whole but never trimmable -- so a deployment running segments
+// near or below the default bucket size would silently lose the trim path. The cap is a
+// FLOOR-ward adjustment only: it never coarsens the default on a large segment, where finer
+// buckets cost a few sidecar bytes and buy a tighter cutoff.
 func (sh *shard) profileBucketBytes() int64 {
 	if sh.profBucket > 0 {
 		return sh.profBucket
 	}
+	b := int64(defaultProfileBucketBytes)
 	if sh.segSize > 0 {
-		if b := int64(sh.segSize) / profileBucketsPerSegment; b > 0 {
-			return b
+		if perSeg := int64(sh.segSize) / profileBucketsPerSegment; perSeg > 0 && perSeg < b {
+			b = perSeg
 		}
 	}
-	return defaultProfileBucketBytes
+	return b
 }
 
 // setProfileAttr points this shard's future seals at attr ("" disables profiling).

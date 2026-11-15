@@ -291,3 +291,52 @@ func TestSegProfileKeepsTheConfiguredBucketWhenItFits(t *testing.T) {
 		t.Errorf("breaks = %v, want 5", sp.breaks)
 	}
 }
+
+// The bucket default is 1 MiB, lowered only where that would leave a segment with no
+// internal resolution. It is never raised: a larger segment gets FINER buckets than its
+// eighth, because a tighter cutoff costs a few sidecar bytes and nothing else.
+func TestProfileBucketDefaultIsOneMiBUnlessTheSegmentIsSmaller(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		segSize  int
+		explicit int64
+		want     int64
+	}{
+		{"default segment", 8 << 20, 0, 1 << 20},
+		{"large segment keeps 1 MiB", 64 << 20, 0, 1 << 20},
+		{"small segment drops to an eighth", 1 << 15, 0, 1 << 12},
+		{"segment at the default bucket", 1 << 20, 0, 1 << 17},
+		{"unknown segment size", 0, 0, 1 << 20},
+		{"explicit wins over both", 1 << 15, 777, 777},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sh := &shard{segSize: tc.segSize, profBucket: tc.explicit}
+			if got := sh.profileBucketBytes(); got != tc.want {
+				t.Errorf("profileBucketBytes() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// Whatever the bucket is, a segment must end up with enough breakpoints for a cutoff to be
+// placed inside it -- that is the property the lowering exists for, and the one that makes a
+// straddling segment trimmable rather than only droppable.
+func TestSmallSegmentsStillGetInternalResolution(t *testing.T) {
+	sh := &shard{segSize: 1 << 15}
+	bucket := sh.profileBucketBytes()
+
+	p := &profileAcc{attr: "T"}
+	// A segment's worth of records, at the segment size the shard reports.
+	for i := 0; i < 64; i++ {
+		p.add(float64(1000+i), int64(sh.segSize)/64, true)
+	}
+	sp := p.finish(bucket, 0, 0)
+	if sp == nil {
+		t.Fatal("no profile")
+	}
+	if len(sp.breaks) < profileBucketsPerSegment-1 {
+		t.Errorf("a full segment closed %d buckets at a %d-byte bucket; too few for a cutoff "+
+			"to fall inside the segment, so it could only ever be dropped whole",
+			len(sp.breaks), bucket)
+	}
+}
