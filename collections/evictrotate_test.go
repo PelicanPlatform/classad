@@ -1,8 +1,10 @@
 package collections
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -477,5 +479,63 @@ func TestTrimKeepsRecordsItCannotBound(t *testing.T) {
 			t.Errorf("%q records %d -> %d: the trim removed records whose value it could not bound",
 				k, unboundedBefore[k], after)
 		}
+	}
+}
+
+// Value-ordered eviction composes with the Reset reasons: a cursor stranded by a HOLE must
+// be told "retention", the reason whose contract is that the records between the cursor and
+// the replay are gone rather than merely re-sent. That is exactly true of a hole and of a
+// trim, and it is not something either change established on its own -- the floor is raised
+// here, the reason is chosen in the watch, and nothing connects them but this.
+func TestEvictionHoleResetsForRetention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	a, err := CreateArchive(ArchiveOptions{
+		Dir:         t.TempDir(),
+		SegmentSize: 1 << 14,
+		ZoneAttrs:   []string{"T"},
+		Retention:   Retention{EvictByAttr: "T"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	// Recent history first, so it occupies the OLDEST segments...
+	appendEra(t, a, newEra, 500)
+	_, _, cursor := drainCatchup(t, mustWatch(t, a.c, ctx, nil))
+	if cursor == nil {
+		t.Fatal("no cursor from the initial sync")
+	}
+	// ...then a backfill of older data, which lands in the NEWEST segments. Everything the
+	// cursor has not seen is in those.
+	appendEra(t, a, oldEra, 1500)
+
+	st := a.Stats()
+	a.SetRetention(Retention{EvictByAttr: "T", MaxBytes: st.UsedBytes / 2})
+	dropped, err := a.Rotate(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped == 0 {
+		t.Fatal("nothing evicted, so the cursor is still resumable and this proves nothing")
+	}
+
+	// The hole is above the surviving recent-era segments, so the oldest surviving record --
+	// the prefix rule's whole answer -- is still below the cursor. Only the hole's own bound
+	// strands it.
+	sh := a.c.shards[0]
+	sh.mu.RLock()
+	oldest := sh.oldestRecordSeqLocked()
+	floor := sh.appendFloor
+	sh.mu.RUnlock()
+	if floor <= oldest {
+		t.Fatalf("append floor %d is at or below the oldest surviving record %d: "+
+			"the drop was a prefix, not a hole, and this is the other test", floor, oldest)
+	}
+
+	if got := drainReason(t, mustWatch(t, a.c, ctx, cursor)); got != WatchResetRetention {
+		t.Errorf("cursor stranded by an eviction hole: reason = %v, want retention", got)
 	}
 }
