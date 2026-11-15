@@ -37,6 +37,35 @@ func deleteMarkerKeys(t *testing.T, c *Collection) map[uint64]string {
 	return out
 }
 
+// deleteMarkerSegs is deleteMarkerKeys plus the segment each marker currently lives in.
+// Compaction carries a marker forward by writing it into a NEW segment, so the identity of
+// that segment is what says whether this fixture exercised the carry path at all.
+func deleteMarkerSegs(t *testing.T, c *Collection) map[uint64]*segment {
+	t.Helper()
+	out := map[uint64]*segment{}
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg == nil || seg.used == 0 {
+				continue
+			}
+			for off := 0; off < seg.used; {
+				o := uint32(off)
+				total := recTotalLen(seg.data, o)
+				if total == 0 {
+					break
+				}
+				if _, ok := recDeleteMarkerKey(seg.data, o); ok {
+					out[recSeq(seg.data, o)] = seg
+				}
+				off += int(total)
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return out
+}
+
 // TestCompactionKeepsDeleteMarkerKeys pins the one fact a restart-surviving watch resume
 // needs from storage: the key a delete marker names must still be there after the segment
 // holding it has been rewritten. Compaction carries markers above the retain floor forward,
@@ -87,10 +116,22 @@ func TestCompactionKeepsDeleteMarkerKeys(t *testing.T) {
 			put(i, i+100*round)
 		}
 	}
-	segsBefore := liveSegmentCount(c)
+	// Where the marker lives now. The guard below is that THIS segment was replaced, which
+	// is what "the marker was carried forward" means. A segment COUNT is only a proxy for
+	// that, and a proxy that coincides: a rewrite that happens to produce as many segments
+	// as it consumed reads as "nothing happened". That is not hypothetical -- the count here
+	// is one larger on a slower machine, where the millisecond checkpoint interval lays the
+	// arena out differently, and the proxy then reported a rewrite that plainly did occur as
+	// a fixture failure.
+	segBefore := deleteMarkerSegs(t, c)
+	if len(segBefore) != 1 {
+		t.Fatalf("before compaction, %d delete-marker segments, want 1", len(segBefore))
+	}
+	markerSeq := firstKey(before)
 	c.compactShard(c.shards[0], c.currentCodec())
-	if segsBefore == liveSegmentCount(c) {
-		t.Fatalf("compactShard rewrote nothing (%d segments before and after); the fixture is not exercising the carry path", segsBefore)
+	segAfter := deleteMarkerSegs(t, c)
+	if seg, ok := segAfter[markerSeq]; ok && seg == segBefore[markerSeq] {
+		t.Fatalf("compactShard left the marker in its original segment; the fixture is not exercising the carry path")
 	}
 
 	after := deleteMarkerKeys(t, c)
@@ -108,22 +149,6 @@ func TestCompactionKeepsDeleteMarkerKeys(t *testing.T) {
 func padAd(t *testing.T, i int) *classad.ClassAd {
 	t.Helper()
 	return mkAd(t, fmt.Sprintf("[N = %d; Pad = \"%0200d\"]", i, i))
-}
-
-// liveSegmentCount is how many segments the shard holds, so a test can tell a rewrite
-// that ran from one that silently did nothing.
-func liveSegmentCount(c *Collection) int {
-	n := 0
-	for _, sh := range c.shards {
-		sh.mu.RLock()
-		for _, seg := range sh.segs {
-			if seg != nil && seg.used > 0 {
-				n++
-			}
-		}
-		sh.mu.RUnlock()
-	}
-	return n
 }
 
 func firstKey(m map[uint64]string) uint64 {
