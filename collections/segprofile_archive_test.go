@@ -2,6 +2,7 @@ package collections
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -287,4 +288,51 @@ func TestMergeRecomputesProfileForUnprofiledSource(t *testing.T) {
 	if got, _ := p.bytesBelow(cutoff); got > below {
 		t.Errorf("bytesBelow(%v) = %d, but only %d bytes of records are below it", cutoff, got, below)
 	}
+}
+
+// Configuring the eviction axis is enough: the attribute is zone-mapped for you, because the
+// profile is read off the same per-segment walk as the zone map. Without that, an archive
+// configured with EvictByAttr and no matching ZoneAttr built no profiles at all and evicted
+// by position -- the behaviour the setting exists to replace -- and said nothing.
+func TestEvictAttrIsZoneMappedWithoutBeingListed(t *testing.T) {
+	a, err := CreateArchive(ArchiveOptions{
+		Dir:         t.TempDir(),
+		SegmentSize: 1 << 14,
+		Retention:   Retention{EvictByAttr: "T"}, // deliberately no ZoneAttrs
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	for i := 0; i < 1200; i++ {
+		ad, perr := classad.Parse(fmt.Sprintf(`[ T=%d; Pad=%q ]`, 1_700_000_000+i, profPad(96)))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	profiled, sealed := a.ProfiledSegments()
+	if sealed < 2 {
+		t.Fatalf("want several sealed segments, got %d", sealed)
+	}
+	if profiled != sealed {
+		t.Errorf("%d/%d sealed segments profiled: the axis was not zone-mapped, so eviction "+
+			"silently falls back to dropping the oldest segment by position", profiled, sealed)
+	}
+	if !containsFoldStr(a.ZoneAttrs(), "T") {
+		t.Errorf("ZoneAttrs = %v, want the eviction axis among them", a.ZoneAttrs())
+	}
+}
+
+func containsFoldStr(xs []string, want string) bool {
+	for _, x := range xs {
+		if strings.EqualFold(x, want) {
+			return true
+		}
+	}
+	return false
 }

@@ -259,6 +259,7 @@ func (c *Collection) trimStraddlers(sh *shard, trim []*segment, attr string, cut
 func (c *Collection) SetRetention(r Retention) {
 	c.maintMu.Lock()
 	c.ret = r
+	c.maxBytesHint.Store(r.MaxBytes)
 	c.maintMu.Unlock()
 	// Future seals profile the new axis. Segments already sealed keep the profile they were
 	// sealed with; one built over a different attribute is rejected on read rather than

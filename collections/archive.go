@@ -391,8 +391,10 @@ func (a *Archive) afterAppend() {
 // on the appending goroutine rather than a goroutine of its own, as the eager intern and
 // reindex above it do.
 func (a *Archive) enforceHighMark() {
-	r := a.c.Retention()
-	if r.MaxBytes <= 0 {
+	// The hint, not Retention(): this runs on the appending goroutine, and Retention() takes
+	// maintMu, which a retrain or a merge holds for minutes. An archive with no byte ceiling
+	// -- the common case -- must not touch that lock at every seal.
+	if a.c.maxBytesHint.Load() <= 0 {
 		return
 	}
 	if _, err := a.c.EvictOverHighMark(); err != nil && a.c.onHighMarkErr != nil {

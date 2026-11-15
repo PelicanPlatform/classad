@@ -639,6 +639,11 @@ type Collection struct {
 	// onHighMarkErr reports a failed reclaim from the seal-time size eviction (see
 	// Options.OnHighMarkError). nil discards it.
 	onHighMarkErr func(error)
+	// maxBytesHint mirrors Retention.MaxBytes for the seal-time check, which runs on the
+	// APPENDING goroutine. Reading it through Retention() takes maintMu, which a retrain or
+	// a merge holds for minutes -- so every seal would stall behind a maintenance pass just
+	// to read a bound that is usually not set at all. Written under maintMu beside ret.
+	maxBytesHint atomic.Int64
 	// highMarkPasses/highMarkDropped count the seal-time size evictions that dropped
 	// something, and the segments they dropped. Diagnostic: the ratio of passes to seals is
 	// how you see an archive pinned to its ceiling.
@@ -991,13 +996,16 @@ func New(opts Options) *Collection {
 	baseSpec.setComponentAttrs(c.intern, opts.CategoricalComponentAttrs, opts.ValueComponentAttrs)
 	c.compRefused = baseSpec.setComposites(c.intern, opts.CompositeAttrs, false)
 	c.spec.Store(baseSpec)
-	// Zone maps (append-only only): cover the explicit ZoneAttrs plus every value-indexed
-	// attribute (a range query on an indexed attr should prune whole segments too), matching
-	// the archive. Each attribute carries both its folded name and its interned id so the
+	// Zone maps (append-only only): cover the explicit ZoneAttrs, every value-indexed
+	// attribute (a range query on an indexed attr should prune whole segments too), and the
+	// retention eviction axis -- a segment's profile is read off the same per-segment walk as
+	// its zone map, so an axis that is not zone-mapped yields no profile and eviction falls
+	// back to dropping the oldest segment by position, silently. Adding it here is the same
+	// rule the value-indexed attributes already get. Each attribute carries both its folded name and its interned id so the
 	// per-segment scan can read the value whether records are inline- or id-encoded; the
 	// zone map is keyed by id, which zonePrune/age-retention resolve names to via c.intern.
 	// zoneInline is finalized in Open (a persistent collection stores inline names).
-	if len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0 {
+	if len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0 || opts.Retention.evictAttr() != "" {
 		var zattrs []zoneAttr
 		seen := map[uint32]struct{}{}
 		addZone := func(name string) {
@@ -1013,6 +1021,9 @@ func New(opts Options) *Collection {
 		}
 		for _, n := range topLevelNames(opts.ValueAttrs) { // value-indexed attrs are zoned automatically
 			addZone(n)
+		}
+		if a := opts.Retention.evictAttr(); a != "" && splitAttrPath(a) == nil {
+			addZone(a) // the eviction axis, or the profile it needs is never built
 		}
 		c.hasZones.Store(len(zattrs) > 0)
 		for _, sh := range shards {
@@ -1115,6 +1126,7 @@ func New(opts Options) *Collection {
 	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.
 	c.internAtSeal = opts.InternAtSeal && opts.AppendOnly && opts.Dir != ""
 	c.onHighMarkErr = opts.OnHighMarkError
+	c.maxBytesHint.Store(opts.Retention.MaxBytes)
 	// Reads are only worth verifying against a persistent segment: an in-memory
 	// arena cannot have been corrupted on disk, and its records carry the same CRC
 	// only incidentally.
