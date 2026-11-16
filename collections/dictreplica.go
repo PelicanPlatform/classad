@@ -104,6 +104,12 @@ type carrier struct {
 	used  int
 	// rank orders carriers within a shard, newest first.
 	rank uint64
+	// carries is what this segment's trailer already holds, snapshotted under the shard
+	// lock with everything else. The pass reads THIS rather than the segment, because the
+	// segment's own list is appended to under that lock and a concurrent census -- a
+	// caller's EnsureDictReplicas against a maintenance pass -- would otherwise read it
+	// while the other writes.
+	carries map[uint32]bool
 }
 
 // dictCensus is one pass's view: which dictionaries live segments name, where the copies
@@ -146,8 +152,13 @@ func (c *Collection) takeDictCensus() dictCensus {
 			if seg == sh.act || !seg.persistent || seg.path == "" || seg.used == 0 {
 				continue
 			}
+			carries := make(map[uint32]bool, len(seg.carriedDicts))
+			for _, id := range seg.carriedDicts {
+				carries[id] = true
+			}
 			cen.carriers = append(cen.carriers, carrier{
 				shard: i, seg: seg, path: seg.path, used: seg.used, rank: seg.maxSeq,
+				carries: carries,
 			})
 		}
 		sh.mu.RUnlock()
@@ -161,6 +172,10 @@ func (c *Collection) takeDictCensus() dictCensus {
 }
 
 func (c *Collection) ensureDictReplicas() []DictReplicaState {
+	// One census at a time. Overlapping passes would each find the level unmet and each
+	// top it up, leaving the store over the target by the number that raced.
+	c.dictReplicaMu.Lock()
+	defer c.dictReplicaMu.Unlock()
 	cen := c.takeDictCensus()
 	ids := make([]uint32, 0, len(cen.needed))
 	for id := range cen.needed {
@@ -208,7 +223,7 @@ func (c *Collection) topUpDictReplica(id uint32, cen *dictCensus, st *DictReplic
 			if round == 0 && placed != nil && placed[cand.shard] {
 				continue
 			}
-			if segCarries(cand.seg, id) {
+			if cand.carries[id] {
 				continue
 			}
 			if werr := addDictReplica(cand.path, cand.used, id, dict); werr != nil {
@@ -218,6 +233,7 @@ func (c *Collection) topUpDictReplica(id uint32, cen *dictCensus, st *DictReplic
 				continue
 			}
 			noteCarried(c.shards[cand.shard], cand.seg, id)
+			cand.carries[id] = true
 			if placed == nil {
 				placed = map[int]bool{}
 				cen.byShard[id] = placed
@@ -235,8 +251,9 @@ func (c *Collection) topUpDictReplica(id uint32, cen *dictCensus, st *DictReplic
 	}
 }
 
-// segCarries reports whether a segment's trailer already holds a copy of id.
-func segCarries(seg *segment, id uint32) bool {
+// segCarriesLocked reports whether a segment's trailer already holds a copy of id. The
+// caller must hold the shard lock: the list is appended to under it.
+func segCarriesLocked(seg *segment, id uint32) bool {
 	for _, got := range seg.carriedDicts {
 		if got == id {
 			return true
@@ -249,7 +266,7 @@ func segCarries(seg *segment, id uint32) bool {
 // mutable state.
 func noteCarried(sh *shard, seg *segment, id uint32) {
 	sh.mu.Lock()
-	if !segCarries(seg, id) {
+	if !segCarriesLocked(seg, id) {
 		seg.carriedDicts = append(seg.carriedDicts, id)
 		sort.Slice(seg.carriedDicts, func(a, b int) bool {
 			return seg.carriedDicts[a] < seg.carriedDicts[b]

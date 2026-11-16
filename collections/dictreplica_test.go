@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -391,5 +392,36 @@ func TestEnsureDictReplicasReportsAStoreWithNowhereToPutACopy(t *testing.T) {
 	}
 	if !strings.Contains(st.Err.Error(), "carry dictionary 1") {
 		t.Errorf("the report does not say what is unmet: %v", st.Err)
+	}
+}
+
+// TestEnsureDictReplicasConcurrent: the census runs from maintenance on its own schedule
+// AND from any caller that asks, so two can overlap. Each carrier's trailer contents are
+// snapshotted under the shard lock for exactly that reason -- reading a segment's list
+// while another pass appends to it is a data race, which only shows up under -race and
+// only when two passes actually overlap.
+func TestEnsureDictReplicasConcurrent(t *testing.T) {
+	dir := buildCarrierStore(t)
+	c := openCarrier(t, dir, 1)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 3; j++ {
+				c.EnsureDictReplicas()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Whatever the interleaving, the level is met and no segment ends up with the same
+	// dictionary twice.
+	if st := stateFor(t, c.EnsureDictReplicas(), 1); st.Copies != dictReplicaTarget {
+		t.Errorf("copies = %d (%v); want %d", st.Copies, st.Err, dictReplicaTarget)
+	}
+	if n := len(trailerCarriers(t, dir, 1, 1)); n != dictReplicaTarget {
+		t.Errorf("%d segments carry dictionary 1; want %d", n, dictReplicaTarget)
 	}
 }

@@ -658,6 +658,11 @@ type Collection struct {
 	lastDictVerify atomic.Int64
 	// lastDictReplica is when the dictionary replica census last ran, paced the same way.
 	lastDictReplica atomic.Int64
+	// dictReplicaMu serializes the replica census. Two passes that overlap each take
+	// their own count, each sees the level unmet, and each writes -- so the store ends up
+	// over the target by however many passes raced. The census is infrequent and off any
+	// latency path, so a lock is the whole answer.
+	dictReplicaMu sync.Mutex
 	// maxBytesHint mirrors Retention.MaxBytes for the seal-time check, which runs on the
 	// APPENDING goroutine. Reading it through Retention() takes maintMu, which a retrain or
 	// a merge holds for minutes -- so every seal would stall behind a maintenance pass just
