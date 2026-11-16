@@ -166,10 +166,25 @@ func retireDictFile(dir string, id uint32) {
 		// there, which is the safe outcome. Never fall back to removing it.
 		return
 	}
+	// Make the rename durable in both directories before returning. Until the unlink from
+	// dicts/ and the link into dicts/attic/ are both on disk, a crash can leave the
+	// dictionary in neither -- destroying it outright, which is the one outcome retiring
+	// to the attic exists to prevent. Best-effort: the rename has already landed in the
+	// page cache, so a sync that cannot run leaves the attic correct for this process.
+	syncDir(attic) //nolint:errcheck // best-effort: the rename has landed, so a failed sync costs durability, not correctness
+	syncDir(dir)   //nolint:errcheck // ditto
 }
 
-// writeDictFile writes a dictionary's bytes to path and fsyncs it (so a codec that
-// segments already reference cannot be lost across a crash).
+// writeDictFile writes a dictionary's bytes to path and fsyncs both the file and the
+// directory holding it, so a codec that segments already reference cannot be lost across
+// a crash.
+//
+// The directory fsync is not optional here. register persists the bytes BEFORE committing
+// the codec, so that a segment can never name a dictionary whose file is missing -- but a
+// file whose contents are synced and whose NAME is not yet durable gives exactly that
+// outcome after a power loss: the bytes survive with nothing pointing at them, and every
+// segment written under the dictionary becomes undecodable. A failed sync fails the write,
+// which fails the retrain, which leaves the previous codec in use -- the safe direction.
 func writeDictFile(path string, dict []byte) error {
 	if writeFaultHook != nil {
 		if err := writeFaultHook(path); err != nil {
@@ -194,7 +209,10 @@ func writeDictFile(path string, dict []byte) error {
 		f.Close()
 		return err
 	}
-	return f.Close()
+	// Both errors, not the first: a close that failed and a directory that did not sync are
+	// separate reasons this dictionary may not be on disk, and the caller wants to see
+	// whichever happened. Join reports nil only when both succeeded.
+	return errors.Join(f.Close(), syncDir(filepath.Dir(path)))
 }
 
 // loadDicts loads every <dir>/dicts/<id>.zst into the registry (rebuilding each
