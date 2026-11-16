@@ -177,6 +177,18 @@ type AggRow struct {
 	// trip over dbrpc as well and a caller never finds a list standing in as a string.
 	GroupValues []classad.Value
 
+	// TypedValues is Values as VALUES, one per aggregate, or nil when the producer did not
+	// supply them -- which is every producer that read them off the wire, because dbrpc's
+	// aggregate cells are rendered text (opAggregateTyped types the group cells only).
+	//
+	// GroupValues exists so a caller need not parse a GROUP back; this is the other half,
+	// and the halves are not symmetric. A group's text is a faithful ClassAd literal that
+	// ParseGroupValue inverts exactly, so GroupValues is a convenience. An aggregate's text
+	// is a RENDERING with no inverse -- ValueText drops a string's quotes -- so for an
+	// in-process consumer that has to write the answer back into a ClassAd, this is not a
+	// convenience but the only correct source. See aggAcc.resultValue.
+	TypedValues []classad.Value
+
 	// Elided is, per aggregate, how many of this group's values a BOUNDED aggregate left
 	// out of its answer. It is nil when nothing was left out, which is every row a
 	// producer without a bounded aggregate returns and most rows of one that has them.
@@ -487,9 +499,13 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 	// A group-less aggregate over an empty match still yields one row.
 	if nGroup == 0 && len(order) == 0 {
 		gs := newGroupState(nil, nil, aggs, userAggs)
-		row := AggRow{Values: make([]string, len(aggs))}
+		row := AggRow{
+			Values:      make([]string, len(aggs)),
+			TypedValues: make([]classad.Value, len(aggs)),
+		}
 		for i, a := range aggs {
 			row.Values[i] = gs.accs[i].result(a)
+			row.TypedValues[i] = gs.accs[i].resultValue(a)
 		}
 		return []AggRow{row}, nil
 	}
@@ -497,9 +513,14 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 	out := make([]AggRow, 0, len(order))
 	for _, key := range order {
 		gs := groups[key]
-		row := AggRow{Group: gs.gvals, GroupValues: gs.gvalues, Values: make([]string, len(aggs))}
+		row := AggRow{
+			Group: gs.gvals, GroupValues: gs.gvalues,
+			Values:      make([]string, len(aggs)),
+			TypedValues: make([]classad.Value, len(aggs)),
+		}
 		for i, a := range aggs {
 			row.Values[i] = gs.accs[i].result(a)
+			row.TypedValues[i] = gs.accs[i].resultValue(a)
 			// Allocated only for a row that actually lost something, so the field
 			// stays nil for every aggregate that cannot elide and for every group
 			// of a list-valued one that fitted.
@@ -668,6 +689,64 @@ func (a *aggAcc) result(spec AggSpec) string {
 		return GroupValueText(classad.NewListValue(a.vals))
 	}
 	return "undefined"
+}
+
+// resultValue is result as a VALUE: the same answer before it is rendered.
+//
+// Every aggregate already computes a value and renders it on the way out -- classad.Sum,
+// Avg, Min and Max each return one, and a count is a number by construction -- so this
+// reaches one step back rather than computing anything new. It exists because a consumer
+// INSIDE the process (INSERT ... SELECT writing an aggregate's output into a table) would
+// otherwise have to read the text back and guess, which cannot tell the string "4" from
+// the number 4.
+//
+// The guess is narrow but it is not empty, and it is worth being exact about which
+// aggregates can fall into it. COUNT, SUM and AVG yield a number; MIN and MAX yield a
+// number, undefined or error, because classad.Min/Max do not order strings -- a string
+// column gives error, not the string. So the only aggregates whose answer can BE a string
+// are a user-defined one and the elements of a list, and those are exactly where reading
+// the text back goes wrong: ValueText drops a string's quotes, as the AggList case below
+// already notes. Taking the value instead of the text removes the question rather than
+// narrowing it, and costs nothing, which is why this is not gated on the aggregate kind.
+//
+// It is NOT sent over dbrpc. The wire's aggregate cells are rendered text and stay that
+// way (opAggregateTyped types the GROUP cells only), so AggRow.TypedValues is filled by
+// this in-process producer and left nil by the client. A caller that has it should use
+// it; one that does not must keep reading the text, which is why result stays.
+//
+// THE TWO MUST AGREE. result is the authority for what the answer IS -- it is what every
+// existing reader sees -- and this returns the same answer unrendered.
+// TestAggResultValueMatchesResultText pins that for every aggregate.
+func (a *aggAcc) resultValue(spec AggSpec) classad.Value {
+	switch spec.Func {
+	case AggCount:
+		if spec.Arg == "*" {
+			return classad.NewIntValue(int64(a.rows))
+		}
+		return classad.NewIntValue(int64(a.defN))
+	case AggCountDistinct:
+		return classad.NewIntValue(int64(len(a.seen)))
+	case AggApproxCountDistinct:
+		if a.approx == nil {
+			return classad.NewIntValue(0)
+		}
+		return classad.NewIntValue(int64(a.approx.estimate()))
+	case AggSum:
+		return classad.Sum(a.vals)
+	case AggAvg:
+		return classad.Avg(a.vals)
+	case AggMin:
+		return classad.Min(a.vals)
+	case AggMax:
+		return classad.Max(a.vals)
+	case AggUser:
+		return a.user.Result()
+	case AggList:
+		// The list itself, not its rendering. result borrows the group renderer to make
+		// the text invertible; a caller holding the value needs no inversion.
+		return classad.NewListValue(a.vals)
+	}
+	return classad.NewUndefinedValue()
 }
 
 // --- small value helpers (server-side, string-rendering) ---

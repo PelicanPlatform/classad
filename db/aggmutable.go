@@ -3,6 +3,7 @@ package db
 import (
 	"strconv"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 )
 
@@ -86,7 +87,7 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact b
 			if !req.isPlainCount() || !IsMatchAll(req.Constraint) || db.Chained() {
 				return nil, false, nil
 			}
-			return []AggRow{{Values: []string{strconv.Itoa(db.Len())}}}, true, nil
+			return []AggRow{{Values: []string{strconv.Itoa(db.Len())}, TypedValues: []classad.Value{classad.NewIntValue(int64(db.Len()))}}}, true, nil
 		}},
 		aggRung{"count-constraint", func(req AggRequest) ([]AggRow, bool, error) {
 			// A constrained COUNT(*) WHERE <numeric comparison on one int schema field> runs as
@@ -106,7 +107,7 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact b
 			if !ok {
 				return nil, false, nil
 			}
-			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, true, nil
+			return []AggRow{{Values: []string{strconv.Itoa(n)}, TypedValues: []classad.Value{classad.NewIntValue(int64(n))}}}, true, nil
 		}},
 		aggRung{"columnar-aggregate", func(req AggRequest) ([]AggRow, bool, error) {
 			// A single MIN/MAX/COUNT(attr) over a numeric column, read from the columnar blocks

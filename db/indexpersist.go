@@ -65,6 +65,16 @@ type persistedIndexConfig struct {
 	// which is exactly the kind of loss nothing surfaces: the attribute just stops being a
 	// column, and queries get slower with no sign of why.
 	SchemaRequire []string `json:"schemaRequire,omitempty"`
+	// PrimaryKey names the attributes whose values derive a row's storage key; empty means
+	// none is declared. See db/primarykey.go for what it governs.
+	//
+	// It is the second field (after Hot) that deriveIndexConfig cannot read back from the
+	// collection, and for a different reason than Hot's: the storage layer does not know
+	// this declaration exists. It is carried through the derive from the held config, which
+	// is the ONLY thing keeping it: a save that rebuilt the struct without it would drop a
+	// table's key on the next index change, and the table would silently go back to
+	// refusing every INSERT ... SELECT with "no primary key is declared".
+	PrimaryKey []string `json:"primaryKey,omitempty"`
 	// Time-travel (point-in-time / AS OF) settings, a runtime-toggled per-table policy
 	// persisted like Encrypted. TimeTravel off (default) leaves the others inert.
 	TimeTravel                bool `json:"timeTravel,omitempty"`
@@ -113,7 +123,7 @@ func readPersistedTimeTravel(dir string) *collections.TimeTravelOptions {
 // split by another saver. Every other caller passes none.
 func (db *DB) saveIndexConfig(pinHot ...string) {
 	_ = db.cfg.update(func(cfg *persistedIndexConfig) { //nolint:errcheck // best-effort: the change stays live for this run, unpersisted
-		*cfg = db.deriveIndexConfig(mergeNames(cfg.Hot, pinHot))
+		*cfg = db.deriveIndexConfig(mergeNames(cfg.Hot, pinHot), cfg.PrimaryKey)
 	})
 }
 
@@ -123,15 +133,22 @@ func (db *DB) saveIndexConfig(pinHot ...string) {
 //
 // humanHot is the human tier carried over from the held config, because the collection does
 // not track hot provenance -- it knows only the live set. Everything live and not in that
-// tier is what a refresh added. This is the one field the derive cannot take wholly from
-// the collection, which is why it is threaded through rather than read here.
-func (db *DB) deriveIndexConfig(humanHot []string) persistedIndexConfig {
+// tier is what a refresh added.
+//
+// primaryKey is carried over for a stronger reason: the collection has no notion of it at
+// all, so there is nothing to read back and a derive that omitted it would erase the
+// declaration on the next save. Both are threaded through rather than read here because
+// this function's contract is that everything it does NOT take from the collection arrives
+// as an argument -- which is what makes a new field's omission a compile error rather than
+// a silent loss on the next index change.
+func (db *DB) deriveIndexConfig(humanHot, primaryKey []string) persistedIndexConfig {
 	cat, val := db.c.IndexedAttrs()
 	cfg := persistedIndexConfig{
 		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(),
 		AutoComposites: db.c.AutoCompositeNames(),
 		Hot:            humanHot, AutoHot: autoHotNames(humanHot, db.c.HotAttrNames()),
 		Encrypted: db.c.EncryptedAttrNames(), SchemaRequire: db.c.SchemaRequireRuntimeAttrs(),
+		PrimaryKey: primaryKey,
 	}
 	if o, on := db.c.TimeTravelConfig(); on {
 		cfg.TimeTravel = true

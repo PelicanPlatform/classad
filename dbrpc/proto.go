@@ -590,6 +590,32 @@ const (
 	//
 	// [opJoinBand body without the stats byte] -> [json db.JoinExplain]
 	opJoinBandExplain op = 83
+
+	// A table's PRIMARY KEY: the attributes whose values derive a row's storage key.
+	//
+	// The store has always had a storage key per ad; what it never had was a statement of
+	// how a row's CONTENTS determine one. A writer that knows each row's identity supplies
+	// the key itself and needs none of this. A writer DERIVING rows from a query -- which
+	// is what opInsertSelect is -- has no such knowledge, and the convention it would
+	// otherwise borrow (an attribute named "Key") is a client-side setting this server is
+	// never told. So the rule is declared on the table and read from it here.
+	opPrimaryKey    op = 84 // [table] -> [nCols i32]{[col]}
+	opSetPrimaryKey op = 85 // [table][nCols i32]{[col]} -> status; mutating
+
+	// opInsertSelect reduces one table and writes the result into another, server-side.
+	//
+	// The reply is a COUNT and nothing else, which is the whole reason it exists: the
+	// reduction already happens on the server, so a client composing a SELECT with a batch
+	// of writes moves the entire result out and back for no purpose. Each written row's key
+	// comes from the TARGET's declared primary key, so re-running a roll-up replaces its own
+	// previous rows instead of accumulating copies.
+	//
+	// The request body is the NAMED aggregate frame (so readAggSpecs parses it unchanged),
+	// bracketed by the two table names and followed by the target attribute names -- one per
+	// group column then one per aggregate. The names are carried because a SQL column header
+	// is not an attribute name: COUNT(*) is a legal header and cannot be an attribute.
+	// [target][source][constraint][nGroup i32]{[attr][width u64]}[nAgg i32]{[func u8][arg][filter][name]}[nNames i32]{[name]} -> [count u64]; mutating
+	opInsertSelect op = 86
 )
 
 // joinLayout names a join request body: which spelling it uses, and whether it carries
@@ -753,6 +779,12 @@ func (o op) String() string {
 		return "JoinExplain"
 	case opJoinChainExplain:
 		return "JoinChainExplain"
+	case opPrimaryKey:
+		return "PrimaryKey"
+	case opSetPrimaryKey:
+		return "SetPrimaryKey"
+	case opInsertSelect:
+		return "InsertSelect"
 	case opAdmin:
 		return "Admin"
 	case opCreateTable:

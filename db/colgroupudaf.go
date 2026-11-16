@@ -1,9 +1,9 @@
 package db
 
 import (
-	"strconv"
 	"strings"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 )
 
@@ -198,19 +198,21 @@ func GroupedUserFromColumns(src GroupValuesSource, constraint string, groupCols 
 		for n, g := range merged {
 			sink := g.Sink.(*udafGroupSink) //nolint:errcheck // every sink here came from newSink above
 			values := make([]string, len(aggs))
+			typed := make([]classad.Value, len(aggs))
 			for i := range aggs {
 				switch {
 				case cslot[i] >= 0:
 					// COUNT(*) FILTER: the records of the group that passed the filter. A
 					// group none of them passed still appears, with zero.
-					values[i] = strconv.Itoa(g.CountOf[cslot[i]])
+					typed[i] = classad.NewIntValue(int64(g.CountOf[cslot[i]]))
 				case slot[i] < 0:
-					values[i] = strconv.Itoa(g.Count)
+					typed[i] = classad.NewIntValue(int64(g.Count))
 				default:
-					values[i] = ValueText(sink.accs[slot[i]].Result())
+					typed[i] = sink.accs[slot[i]].Result()
 				}
+				values[i] = ValueText(typed[i])
 			}
-			out = append(out, AggRow{Group: labels[n], Values: values})
+			out = append(out, AggRow{Group: labels[n], Values: values, TypedValues: typed})
 		}
 		rows, served = out, true
 		return nil
