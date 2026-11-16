@@ -1,8 +1,6 @@
 package db
 
 import (
-	"strconv"
-
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -130,7 +128,8 @@ func ColumnarAggregate(stats func(attr string) (NumStats, bool), groupCols []Gro
 	if minMaxDeclinesNaN(a.Func, ns) {
 		return nil, false
 	}
-	return []AggRow{{Values: []string{numAggValue(a.Func, ns)}}}, true
+	v := numAggTypedValue(a.Func, ns)
+	return []AggRow{{Values: []string{ValueText(v)}, TypedValues: []classad.Value{v}}}, true
 }
 
 // minMaxDeclinesNaN reports whether this aggregate must fall back to the record scan because the
@@ -162,38 +161,47 @@ func minMaxDeclinesNaN(fn AggFunc, ns NumStats) bool {
 //
 // The int64 accumulation matters past 2^53, where rendering from the float sum would disagree
 // with the scan on large values.
+// numAggValue renders numAggTypedValue, which is where the answer is actually decided.
+// The split exists so an in-process consumer can have the VALUE (see AggRow.TypedValues)
+// without this path having to compute the same answer a second way -- two renderings of
+// one decision rather than two decisions.
 func numAggValue(fn AggFunc, ns NumStats) string {
+	return ValueText(numAggTypedValue(fn, ns))
+}
+
+// numAggTypedValue reduces a column's numeric summary to the aggregate's value.
+func numAggTypedValue(fn AggFunc, ns NumStats) classad.Value {
 	switch fn {
 	case AggCount:
-		return strconv.Itoa(ns.N)
+		return classad.NewIntValue(int64(ns.N))
 	case AggSum:
 		if ns.N == 0 {
-			return ValueText(classad.NewIntValue(0)) // reference: sum of nothing is int 0
+			return classad.NewIntValue(0) // reference: sum of nothing is int 0
 		}
 		if ns.AnyReal {
-			return ValueText(classad.NewRealValue(ns.Sum))
+			return classad.NewRealValue(ns.Sum)
 		}
-		return ValueText(classad.NewIntValue(ns.IntSum))
+		return classad.NewIntValue(ns.IntSum)
 	case AggAvg:
 		if ns.N == 0 {
-			return ValueText(classad.NewIntValue(0)) // reference: avg of nothing is int 0
+			return classad.NewIntValue(0) // reference: avg of nothing is int 0
 		}
-		return ValueText(classad.NewRealValue(ns.Sum / float64(ns.N)))
+		return classad.NewRealValue(ns.Sum / float64(ns.N))
 	}
 	if ns.N == 0 {
-		return ValueText(classad.NewUndefinedValue())
+		return classad.NewUndefinedValue()
 	}
 	if ns.AnyReal {
 		v := ns.Min
 		if fn == AggMax {
 			v = ns.Max
 		}
-		return ValueText(classad.NewRealValue(v))
+		return classad.NewRealValue(v)
 	}
-	// All integers: render the exact int64 extreme, not the float64 one, which cannot tell
+	// All integers: the exact int64 extreme, not the float64 one, which cannot tell
 	// integers past 2^53 apart.
 	if fn == AggMax {
-		return ValueText(classad.NewIntValue(ns.IntMax))
+		return classad.NewIntValue(ns.IntMax)
 	}
-	return ValueText(classad.NewIntValue(ns.IntMin))
+	return classad.NewIntValue(ns.IntMin)
 }

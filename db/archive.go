@@ -732,7 +732,7 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats, redact bool) []Ag
 				return nil, false, nil
 			}
 			stats.SetTier(collections.TierColumnar)
-			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, true, nil
+			return []AggRow{{Values: []string{strconv.Itoa(n)}, TypedValues: []classad.Value{classad.NewIntValue(int64(n))}}}, true, nil
 		}},
 		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
 			// A COUNT(*) GROUPED BY one or more schema columns: a histogram of them, computed
@@ -943,7 +943,7 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 			return nil, false
 		}
 		// The retained record count, which the archive tracks in O(1).
-		return []AggRow{{Values: []string{strconv.Itoa(t.a.Count())}}}, true
+		return []AggRow{{Values: []string{strconv.Itoa(t.a.Count())}, TypedValues: []classad.Value{classad.NewIntValue(int64(t.a.Count()))}}}, true
 
 	case 1:
 		if groupCols[0].BucketWidth != 0 {
@@ -973,6 +973,7 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 				Group:       []string{categoricalGroup(v)},
 				GroupValues: []classad.Value{categoricalGroupValue(v)},
 				Values:      []string{strconv.FormatInt(counts[v], 10)},
+				TypedValues: []classad.Value{classad.NewIntValue(counts[v])},
 			})
 		}
 		return rows, true
@@ -1023,6 +1024,7 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 					Group:       group,
 					GroupValues: gvalues,
 					Values:      []string{strconv.FormatInt(counts[v], 10)},
+					TypedValues: []classad.Value{classad.NewIntValue(counts[v])},
 				})
 			}
 		}

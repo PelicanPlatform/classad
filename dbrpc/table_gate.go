@@ -48,6 +48,17 @@ func (sc *serverConn) tableWriteTarget(o op, body *reader) (table, what string, 
 			return "", "", false
 		}
 		return st.table, o.String(), true
+	case opSetPrimaryKey:
+		// The declaration decides how every later derived key is formed, so changing it on
+		// a table owned by another writer is a write to that table.
+		table = r.str()
+		return table, o.String(), r.err == nil
+	case opInsertSelect:
+		// Gated on the TARGET, which is the table this writes. The source is read, and a
+		// read is authorized as a read -- so the first string is the one that matters and
+		// the second is deliberately not consulted here.
+		table = r.str()
+		return table, o.String(), r.err == nil
 	case opDeleteWhere, opArchiveAppend, opArchiveRotate,
 		opCreateTable, opCreateTableMem, opDropTable, opArchiveCreate,
 		opCreateView, opDropView:

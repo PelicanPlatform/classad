@@ -1,6 +1,7 @@
 package db
 
 import (
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 )
 
@@ -138,7 +139,8 @@ func ColumnarUserAggregate(values NumValueScan, groupCols []GroupCol, aggs []Agg
 		if !values(a.Arg, newSink, merge) {
 			return nil // ok stays false below
 		}
-		row = []AggRow{{Values: []string{ValueText(accs[0].Result())}}}
+		uv := accs[0].Result()
+		row = []AggRow{{Values: []string{ValueText(uv)}, TypedValues: []classad.Value{uv}}}
 		return nil
 	}()
 	if err != nil {

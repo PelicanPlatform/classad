@@ -350,7 +350,8 @@ func (o op) isMutating() bool {
 	case opNewAd, opNewAdBatch, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
 		opCreateTableMem, opTableToMemory, opCreateView, opDropView,
 		opCreateExporter, opDropExporter, opPutExporterState,
-		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem:
+		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem,
+		opSetPrimaryKey, opInsertSelect:
 		return true
 	}
 	return false
@@ -882,6 +883,12 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.streamArchiveAggregateNamed(reqID, body)
 	case opArchiveAggregateTyped:
 		sc.streamArchiveAggregateTyped(reqID, body)
+	case opPrimaryKey:
+		sc.s.servePrimaryKey(reqID, body, sc.write)
+	case opSetPrimaryKey:
+		sc.s.serveSetPrimaryKey(reqID, body, sc.write)
+	case opInsertSelect:
+		sc.s.serveInsertSelect(sc.ctx, reqID, body, priv, sc.write)
 	case opQueryKeys:
 		sc.s.streamQueryKeys(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTxnQuery:

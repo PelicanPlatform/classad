@@ -177,6 +177,18 @@ type AggRow struct {
 	// trip over dbrpc as well and a caller never finds a list standing in as a string.
 	GroupValues []classad.Value
 
+	// TypedValues is Values as VALUES, one per aggregate, or nil when the producer did not
+	// supply them -- which is every producer that read them off the wire, because dbrpc's
+	// aggregate cells are rendered text (opAggregateTyped types the group cells only).
+	//
+	// GroupValues exists so a caller need not parse a GROUP back; this is the other half,
+	// and the halves are not symmetric. A group's text is a faithful ClassAd literal that
+	// ParseGroupValue inverts exactly, so GroupValues is a convenience. An aggregate's text
+	// is a RENDERING with no inverse -- ValueText drops a string's quotes -- so for an
+	// in-process consumer that has to write the answer back into a ClassAd, this is not a
+	// convenience but the only correct source. See aggAcc.resultValue.
+	TypedValues []classad.Value
+
 	// Elided is, per aggregate, how many of this group's values a BOUNDED aggregate left
 	// out of its answer. It is nil when nothing was left out, which is every row a
 	// producer without a bounded aggregate returns and most rows of one that has them.
@@ -487,9 +499,16 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 	// A group-less aggregate over an empty match still yields one row.
 	if nGroup == 0 && len(order) == 0 {
 		gs := newGroupState(nil, nil, aggs, userAggs)
-		row := AggRow{Values: make([]string, len(aggs))}
+		row := AggRow{
+			Values:      make([]string, len(aggs)),
+			TypedValues: make([]classad.Value, len(aggs)),
+		}
 		for i, a := range aggs {
-			row.Values[i] = gs.accs[i].result(a)
+			// Reduced ONCE and then rendered. SUM/AVG/MIN/MAX fold the group's whole value
+			// slice, so asking for the text and the value separately would fold it twice.
+			v := gs.accs[i].resultValue(a)
+			row.TypedValues[i] = v
+			row.Values[i] = renderAggValue(a, v)
 		}
 		return []AggRow{row}, nil
 	}
@@ -497,9 +516,16 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 	out := make([]AggRow, 0, len(order))
 	for _, key := range order {
 		gs := groups[key]
-		row := AggRow{Group: gs.gvals, GroupValues: gs.gvalues, Values: make([]string, len(aggs))}
+		row := AggRow{
+			Group: gs.gvals, GroupValues: gs.gvalues,
+			Values:      make([]string, len(aggs)),
+			TypedValues: make([]classad.Value, len(aggs)),
+		}
 		for i, a := range aggs {
-			row.Values[i] = gs.accs[i].result(a)
+			// Reduced ONCE and then rendered; see the group-less branch above.
+			v := gs.accs[i].resultValue(a)
+			row.TypedValues[i] = v
+			row.Values[i] = renderAggValue(a, v)
 			// Allocated only for a row that actually lost something, so the field
 			// stays nil for every aggregate that cannot elide and for every group
 			// of a list-valued one that fitted.
@@ -626,48 +652,85 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value, maxList int) {
 	}
 }
 
-func (a *aggAcc) result(spec AggSpec) string {
+// renderAggValue spells an aggregate's answer the way its own output cell is spelled.
+//
+// A LIST goes through the GROUP renderer, not ValueText, because this cell has to be read
+// back as a value and ValueText's output cannot be: it drops a string's quotes, so a list
+// of owners would come back as a list of bare identifiers that evaluate to undefined, and
+// it would send a list through the unparser, which keeps a literal's unevaluated source.
+// GroupValueText is already the renderer whose text is a literal every kind inverts through
+// ParseGroupValue, so a list aggregate is read back exactly.
+//
+// The cost of borrowing it, stated because it surprises: a string element arrives QUOTED
+// and an integral real reads as the integer it equals, which is the group renderer's
+// canonicalisation and not this aggregate's choice.
+//
+// Every other aggregate renders through ValueText, which is the spelling its cell has
+// always had. TestAggResultValueMatchesResultText pins that, per aggregate.
+func renderAggValue(spec AggSpec, v classad.Value) string {
+	if spec.Func == AggList {
+		return GroupValueText(v)
+	}
+	return ValueText(v)
+}
+
+// resultValue is result as a VALUE: the same answer before it is rendered.
+//
+// Every aggregate already computes a value and renders it on the way out -- classad.Sum,
+// Avg, Min and Max each return one, and a count is a number by construction -- so this
+// reaches one step back rather than computing anything new. It exists because a consumer
+// INSIDE the process (INSERT ... SELECT writing an aggregate's output into a table) would
+// otherwise have to read the text back and guess, which cannot tell the string "4" from
+// the number 4.
+//
+// The guess is narrow but it is not empty, and it is worth being exact about which
+// aggregates can fall into it. COUNT, SUM and AVG yield a number; MIN and MAX yield a
+// number, undefined or error, because classad.Min/Max do not order strings -- a string
+// column gives error, not the string. So the only aggregates whose answer can BE a string
+// are a user-defined one and the elements of a list, and those are exactly where reading
+// the text back goes wrong: ValueText drops a string's quotes, as the AggList case below
+// already notes. Taking the value instead of the text removes the question rather than
+// narrowing it, and costs nothing, which is why this is not gated on the aggregate kind.
+//
+// It is NOT sent over dbrpc. The wire's aggregate cells are rendered text and stay that
+// way (opAggregateTyped types the GROUP cells only), so AggRow.TypedValues is filled by
+// this in-process producer and left nil by the client. A caller that has it should use
+// it; one that does not must keep reading the text, which is why result stays.
+//
+// This is now the ONLY place an aggregate's answer is decided. The output cell is
+// renderAggValue of what this returns, so the text and the value cannot disagree and the
+// group's values are folded once rather than once per form.
+// TestAggResultValueMatchesResultText pins the rendering, per aggregate.
+func (a *aggAcc) resultValue(spec AggSpec) classad.Value {
 	switch spec.Func {
 	case AggCount:
-		// COUNT(*) counts every row; COUNT(col) counts rows where col is defined.
 		if spec.Arg == "*" {
-			return strconv.Itoa(a.rows)
+			return classad.NewIntValue(int64(a.rows))
 		}
-		return strconv.Itoa(a.defN)
+		return classad.NewIntValue(int64(a.defN))
 	case AggCountDistinct:
-		return strconv.Itoa(len(a.seen))
+		return classad.NewIntValue(int64(len(a.seen)))
 	case AggApproxCountDistinct:
-		// A group that saw no defined value renders 0 without a sketch ever existing, which
-		// is the same answer the exact form gives and is exact there too.
 		if a.approx == nil {
-			return "0"
+			return classad.NewIntValue(0)
 		}
-		return strconv.FormatUint(a.approx.estimate(), 10)
+		return classad.NewIntValue(int64(a.approx.estimate()))
 	case AggSum:
-		return ValueText(classad.Sum(a.vals))
+		return classad.Sum(a.vals)
 	case AggAvg:
-		return ValueText(classad.Avg(a.vals))
+		return classad.Avg(a.vals)
 	case AggMin:
-		return ValueText(classad.Min(a.vals))
+		return classad.Min(a.vals)
 	case AggMax:
-		return ValueText(classad.Max(a.vals))
+		return classad.Max(a.vals)
 	case AggUser:
-		return ValueText(a.user.Result())
+		return a.user.Result()
 	case AggList:
-		// Rendered as a ClassAd LIST LITERAL by the group renderer, not by ValueText,
-		// because this cell has to be read back as a value and ValueText's output
-		// cannot be: it drops a string's quotes, so a list of owners would come back
-		// as a list of bare identifiers that evaluate to undefined, and it would send
-		// a list through the unparser, which keeps a literal's unevaluated source.
-		// GroupValueText is already the renderer whose text is a literal every kind
-		// inverts through ParseGroupValue, so a list aggregate is read back exactly.
-		//
-		// The cost of borrowing it, stated because it surprises: a string element
-		// arrives QUOTED and an integral real reads as the integer it equals, which is
-		// the group renderer's canonicalisation and not this aggregate's choice.
-		return GroupValueText(classad.NewListValue(a.vals))
+		// The list itself, not its rendering. result borrows the group renderer to make
+		// the text invertible; a caller holding the value needs no inversion.
+		return classad.NewListValue(a.vals)
 	}
-	return "undefined"
+	return classad.NewUndefinedValue()
 }
 
 // --- small value helpers (server-side, string-rendering) ---

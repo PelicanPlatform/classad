@@ -1,7 +1,6 @@
 package db
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -237,20 +236,22 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 	}
 	for n, g := range merged {
 		values := make([]string, len(aggs))
+		typed := make([]classad.Value, len(aggs))
 		for i, a := range aggs {
 			switch {
 			case cslot[i] >= 0:
 				// COUNT(*) FILTER: the records of the group that passed the filter. A group
 				// none of them passed still appears, with zero -- a filter narrows the
 				// aggregate and never the group.
-				values[i] = strconv.Itoa(g.CountOf[cslot[i]])
+				typed[i] = classad.NewIntValue(int64(g.CountOf[cslot[i]]))
 			case slot[i] < 0:
-				values[i] = strconv.Itoa(g.Count)
+				typed[i] = classad.NewIntValue(int64(g.Count))
 			default:
-				values[i] = numAggValue(a.Func, g.Stats[slot[i]])
+				typed[i] = numAggTypedValue(a.Func, g.Stats[slot[i]])
 			}
+			values[i] = ValueText(typed[i])
 		}
-		rows = append(rows, AggRow{Group: labels[n], GroupValues: labelValues[n], Values: values})
+		rows = append(rows, AggRow{Group: labels[n], GroupValues: labelValues[n], Values: values, TypedValues: typed})
 	}
 	return rows, true
 }
