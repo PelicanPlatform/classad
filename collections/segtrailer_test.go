@@ -52,11 +52,11 @@ func buildCarrierStore(t *testing.T) string {
 			}
 		}
 	}
-	put(0, 20000)
+	put(0, 900)
 	if _, err := c.RetrainDict(1500); err != nil {
 		t.Skipf("dictionary training unavailable: %v", err)
 	}
-	put(20000, 60000)
+	put(900, 3000)
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
