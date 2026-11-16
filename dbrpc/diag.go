@@ -70,10 +70,38 @@ type Diagnostics struct {
 	// that attribute until the maintenance backfill or an index.reindex reaches them.
 	BackfillPendingSegments int   `json:"backfillPendingSegments,omitempty"`
 	BackfillPendingBytes    int64 `json:"backfillPendingBytes,omitempty"`
+
+	// Detail reports whether this is a FULL read. The fields a BASIC read leaves unmeasured --
+	// Suggestions, DropSuggestions, IndexSizes, and the MPH/bloom halves of SidecarSizes -- are
+	// zero in one, which is not the same as measured-and-zero. Anything printing them must check
+	// this first, or it reports "no index suggestions" to an operator who was never asked.
+	//
+	// They are separated because between them they cost more than the whole of the rest of the
+	// report: the suggestions decode a sample of records, and the sidecar breakdown reads
+	// scattered header words out of every sealed sidecar, which on a large archive with a cold
+	// page cache is tens of thousands of random faults. A stats report prints neither.
+	//
+	// A client sets this from the read it ASKED for, not from the wire: a server predating the
+	// option ignores the request and answers in full, and its reply carries no flag to read.
+	Detail bool `json:"detail,omitempty"`
 }
 
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
 const diagSampleMax = 2000
+
+// diagFlagDetail asks for a FULL diagnostics read -- the sampled suggestions, the per-attribute
+// index sizes and the sidecar structural breakdown, which a basic read leaves unmeasured (see
+// Diagnostics.Detail). diagFlagsKnown is the set this server understands; a request carrying
+// anything else is refused rather than served without it, matching attrFlagsKnown.
+//
+// The flags word postdates the op and the DEFAULT when it is absent is detail, not basic: a
+// client that predates this asks the only way it knows how and expects the whole report. The
+// cost saved is the new client's to claim.
+const (
+	diagFlagDetail uint32 = 1 << 0
+
+	diagFlagsKnown = diagFlagDetail
+)
 
 // defaultSchemaHotTopN is the hot-column count schema.rebuild uses when the server carries no
 // configured HotTopN, matching the size a default maintenance pass would choose.
@@ -107,11 +135,15 @@ type diagTable interface {
 	GroupSchemaChanges() []db.GroupSchemaChange
 	GroupSchemaLastAgreement() (db.GroupSchemaLastAgreement, bool)
 	SidecarSizes() db.SidecarSizes
+	SidecarBytes() (segments int, mappedBytes int64)
 	StaleIndexSegments() (stale, sealed int)
 }
 
 // diagCommon fills every field both table kinds answer. The caller adds its own.
-func diagCommon(t diagTable) Diagnostics {
+//
+// With detail false it skips the measurements nothing in a stats report prints and that cost
+// more than everything else here put together -- see Diagnostics.Detail.
+func diagCommon(t diagTable, detail bool) Diagnostics {
 	cat, val := t.IndexedAttrs()
 	d := Diagnostics{
 		Stats:              t.Stats(),
@@ -119,15 +151,21 @@ func diagCommon(t diagTable) Diagnostics {
 		Hot:                t.HotAttrs(),
 		CategoricalIndexes: cat,
 		ValueIndexes:       val,
-		IndexSizes:         t.IndexSizes(),
 		Codec:              t.CodecStats(diagSampleMax),
-		Suggestions:        t.SuggestIndexes(diagSampleMax),
 		EncryptionEnabled:  t.EncryptionEnabled(),
 		EncryptedAttrs:     t.EncryptedAttrNames(),
 		SchemaScan:         t.SchemaScanInfo(),
 		GroupDrift:         t.GroupSchemaDrift(),
 		GroupChanges:       t.GroupSchemaChanges(),
-		SidecarSizes:       t.SidecarSizes(),
+		Detail:             detail,
+	}
+	if detail {
+		d.IndexSizes = t.IndexSizes()
+		d.Suggestions = t.SuggestIndexes(diagSampleMax)
+		d.SidecarSizes = t.SidecarSizes()
+	} else {
+		segs, mapped := t.SidecarBytes()
+		d.SidecarSizes = db.SidecarSizes{Segments: segs, MappedBytes: mapped}
 	}
 	if ag, ok := t.GroupSchemaLastAgreement(); ok {
 		d.GroupAgreement = &ag
@@ -139,9 +177,11 @@ func diagCommon(t diagTable) Diagnostics {
 // diagJSON gathers a mutable table's diagnostics into JSON: the shared surface plus the drop
 // suggestions, which only a mutable table offers (see ArchiveTable.SuggestIndexes for why an
 // archive is not told which index to remove).
-func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
-	d := diagCommon(t)
-	d.DropSuggestions = t.SuggestDrops(diagSampleMax)
+func (s *Server) diagJSON(t *db.DB, detail bool) ([]byte, error) {
+	d := diagCommon(t, detail)
+	if detail {
+		d.DropSuggestions = t.SuggestDrops(diagSampleMax)
+	}
 	return json.Marshal(d)
 }
 
@@ -149,8 +189,8 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 // so `.stats history` reads like `.stats <table>`, storage bytes, segments, codec and op
 // timings rather than a row count -- plus the three things only an archive has, its retention
 // bounds, its zone maps and the index backfill still owed to its older segments.
-func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
-	d := diagCommon(a)
+func (s *Server) archiveDiagJSON(a *db.ArchiveTable, detail bool) ([]byte, error) {
+	d := diagCommon(a, detail)
 	ret := a.Retention()
 	d.Archive = true
 	d.Retention = &ret
@@ -620,9 +660,35 @@ func (c *Client) Diagnostics(ctx context.Context) (*Diagnostics, error) {
 	return c.DiagnosticsTable(ctx, DefaultTable)
 }
 
-// DiagnosticsTable fetches the named table's diagnostics.
+// DiagnosticsTable fetches the named table's full diagnostics.
 func (c *Client) DiagnosticsTable(ctx context.Context, table string) (*Diagnostics, error) {
-	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return putStr(req(id, opDiag), table) })
+	return c.diagnostics(ctx, table, true)
+}
+
+// DiagnosticsBasic fetches the default table's basic diagnostics (see DiagnosticsBasicTable).
+func (c *Client) DiagnosticsBasic(ctx context.Context) (*Diagnostics, error) {
+	return c.DiagnosticsBasicTable(ctx, DefaultTable)
+}
+
+// DiagnosticsBasicTable fetches the named table's diagnostics WITHOUT the index suggestions,
+// per-attribute index sizes and sidecar structural breakdown -- everything a storage stats
+// report prints, and none of what costs it. On a large archive with a cold page cache that is
+// the difference between a report that returns and one an operator gives up waiting on.
+//
+// Diagnostics.Detail is false on the result, including when the peer predates the option and
+// answered in full anyway: the fields are there to be trusted only when they were asked for.
+func (c *Client) DiagnosticsBasicTable(ctx context.Context, table string) (*Diagnostics, error) {
+	return c.diagnostics(ctx, table, false)
+}
+
+func (c *Client) diagnostics(ctx context.Context, table string, detail bool) (*Diagnostics, error) {
+	flags := uint32(0)
+	if detail {
+		flags = diagFlagDetail
+	}
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
+		return putI32(putStr(req(id, opDiag), table), int32(flags)) //nolint:gosec // a flags word, read back as it was written
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -633,6 +699,10 @@ func (c *Client) DiagnosticsTable(ctx context.Context, table string) (*Diagnosti
 	if err := json.Unmarshal([]byte(body.str()), &d); err != nil {
 		return nil, err
 	}
+	// What was asked for, not what the reply claims. A server predating the flags word ignores
+	// it and answers in full, with no flag in its reply; reading the wire would make every such
+	// reply look basic and suppress the fields it did measure.
+	d.Detail = detail
 	return &d, nil
 }
 

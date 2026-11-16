@@ -88,13 +88,33 @@ type SidecarSizes struct {
 // active, still-in-RAM segments' postings). Together the two give the operator the full
 // picture: heap postings on the hot active segment plus off-heap sidecar bytes on the sealed
 // tail. It reads each segment's already-mapped bytes under the shard read lock -- no
-// re-mapping -- so it is cheap enough for periodic sampling.
+// re-mapping.
+//
+// The MPH/bloom breakdown costs more than the total does: it reads scattered header words out
+// of every sealed sidecar, and on a cold page cache each of those is a fault that nothing else
+// in a stats report needs. Ask SidecarBytes for the total alone.
 func (c *Collection) SidecarSizes() SidecarSizes {
 	var out SidecarSizes
 	for _, sh := range c.shards {
-		sh.sidecarSizes(&out)
+		sh.sidecarSizes(&out, true)
 	}
 	return out
+}
+
+// SidecarBytes reports how many sealed segments carry a sidecar and how many bytes they map,
+// without the MPH/bloom breakdown. That is the whole of the difference in cost: the totals are
+// a length per segment off a pointer already in RAM, while the breakdown walks each sidecar's
+// directory and reads two header words per categorical attribute. Those reads are scattered
+// over a mapping that is only demand-paged, so on a large archive with a cold page cache they
+// dominate -- roughly fifteen random faults per sealed segment, thousands of segments deep.
+//
+// A caller that only prints "how much index is on disk" wants this one.
+func (c *Collection) SidecarBytes() (segments int, mappedBytes int64) {
+	var out SidecarSizes
+	for _, sh := range c.shards {
+		sh.sidecarSizes(&out, false)
+	}
+	return out.Segments, out.MappedBytes
 }
 
 // HasSealedSidecar reports whether any segment has flipped to a mapped sidecar index, which
@@ -129,10 +149,11 @@ func (sh *shard) hasSealedSidecar() bool {
 	return false
 }
 
-// sidecarSizes adds one shard's sidecar sizes to out under its read lock. The release is deferred:
-// the breakdown parses mapped sidecar bytes, and a diagnostics read that panics there is failed alone
-// by a server that recovers it, which must not leave the shard locked.
-func (sh *shard) sidecarSizes(out *SidecarSizes) {
+// sidecarSizes adds one shard's sidecar sizes to out under its read lock, with the MPH/bloom
+// breakdown only if breakdown is set. The release is deferred: the breakdown reads mapped sidecar
+// bytes, and a diagnostics read that panics there is failed alone by a server that recovers it,
+// which must not leave the shard locked.
+func (sh *shard) sidecarSizes(out *SidecarSizes, breakdown bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	if lockedReadHook != nil {
@@ -148,20 +169,24 @@ func (sh *shard) sidecarSizes(out *SidecarSizes) {
 		}
 		out.Segments++
 		out.MappedBytes += int64(len(mm.data))
-		mph, bloom := sidecarSketchBreakdown(mm.data)
+		if !breakdown {
+			continue
+		}
+		mph, bloom := sidecarSketchBreakdown(mm)
 		out.MPHBytes += mph
 		out.BloomBytes += bloom
 	}
 }
 
 // sidecarSketchBreakdown sums the MPH and bloom block bytes across a v6 sidecar's
-// categorical attributes. Returns (0,0) for a sidecar that does not parse (e.g. an older
-// version), since only a current sidecar carries these blocks.
-func sidecarSketchBreakdown(data []byte) (mph, bloom int64) {
-	si, err := parseMmapSidecar(data)
-	if err != nil {
-		return 0, 0
-	}
+// categorical attributes.
+//
+// It takes the segment's live mmapSegIndex rather than the raw bytes: that index IS this
+// sidecar, parsed once when the segment was mapped. Re-parsing the bytes to recover a catDir
+// already in hand allocated four maps and re-read a per-attribute stats block at a scattered
+// offset for every indexed attribute of every sealed segment -- on each call, for two numbers.
+func sidecarSketchBreakdown(si *mmapSegIndex) (mph, bloom int64) {
+	data := si.data
 	for _, attrOff := range si.catDir {
 		bloomOff := si.catBloomOff(attrOff)
 		bloomM := le32(data, bloomOff+4)

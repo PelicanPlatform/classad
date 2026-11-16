@@ -817,6 +817,10 @@ func (a *Archive) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool, k
 // evictable page cache), broken out by structure. An operator diagnostic.
 func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
 
+// SidecarBytes reports the archive's sidecar count and mapped bytes without the structural
+// breakdown, which is the expensive half on a cold page cache. See Collection.SidecarBytes.
+func (a *Archive) SidecarBytes() (segments int, mappedBytes int64) { return a.c.SidecarBytes() }
+
 // HasSealedSidecar reports whether any segment carries a mapped sidecar index. See
 // Collection.HasSealedSidecar for why this is not SidecarSizes().Segments > 0.
 func (a *Archive) HasSealedSidecar() bool { return a.c.HasSealedSidecar() }
