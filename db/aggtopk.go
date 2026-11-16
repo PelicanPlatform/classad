@@ -90,20 +90,15 @@ func (a *topKThresholdAcc) AddNum(v NumValue) {
 
 // Add folds one row's argument value, for the record scan. Non-numbers are skipped, as AddNum
 // never sees them -- which is what keeps the two paths answering alike.
+//
+// It goes through numValueOf rather than converting here, because that is the function that
+// renders a value as the COLUMN pass would have yielded it. Converting separately dropped
+// booleans, which the column pass offers as NumBool: a boolean order column would then have
+// ranked differently depending on which rung served the query, and both answers would have
+// looked right.
 func (a *topKThresholdAcc) Add(v classad.Value) {
-	switch {
-	case v.IsInteger():
-		i, err := v.IntValue()
-		if err != nil {
-			return
-		}
-		a.AddNum(NumValue{F: float64(i), I: i, Kind: NumInt})
-	case v.IsNumber():
-		f, err := v.NumberValue()
-		if err != nil {
-			return
-		}
-		a.AddNum(NumValue{F: f, Kind: NumReal})
+	if nv, ok := numValueOf(v); ok {
+		a.AddNum(nv)
 	}
 }
 
