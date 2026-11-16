@@ -437,9 +437,46 @@ Engineering points earned in practice:
     generation in `upgrade.json` so they are not re-measured. `Rewrite` remains the
     explicit "re-encode everything now" escape hatch.
 - **Automatic upkeep.** `StartAutoRetrain` retrains periodically (15 minutes by
-  default) and refreshes the hot set at the same time. Dictionaries no segment
-  references any longer are moved to `dicts/attic/` rather than deleted, and idle
-  encoders are released. `CodecStats` reports per-codec usage.
+  default) and refreshes the hot set at the same time. Dictionaries nothing references
+  any longer are moved to `dicts/attic/` rather than deleted, and idle encoders are
+  released. `CodecStats` reports per-codec usage. "Nothing references it" is asked of the
+  segment *files*, not only of the segments this process mapped: a file recovery declined,
+  or one a rewrite left staged, still names a dictionary it needs, and the file name is
+  the only place that name exists.
+
+### `dicts/` is the store's single point of failure
+
+Every other on-disk structure is either derived or replicated. The key index, the
+directory snapshot, the zone maps and the columnar payloads all rebuild from the records.
+The records themselves are spread over many segments, so damage to one costs one segment.
+A dictionary is neither: it exists once, in `dicts/<id>.zst`, and it is the only thing
+that can decode every segment named `.d<id>.dat`. Lose it and those records are
+unreadable — not corrupted, not partially recoverable, simply undecodable.
+
+Three consequences worth stating plainly, because each has been learned the hard way:
+
+- **Nothing else holds a copy.** The segments carry the id, not the dictionary. The
+  sidecars carry neither. `Snapshot` stores logical ads, so it *needs* the dictionaries to
+  run and cannot preserve them — a backup taken after the loss cannot rescue what the loss
+  took. `dicts/attic/` is the only redundancy there is, and it lives *inside* `dicts/`, so
+  it shares that directory's fate.
+- **Open refuses rather than degrades.** Every dictionary id a segment file names must be
+  registered before anything is mapped; otherwise `Open` fails with
+  `MissingDictionaryError`, naming every missing id and an example segment for each. This
+  is deliberate. The records are intact and restoring the dictionary brings all of them
+  back, which stops being true as soon as something writes to the store believing those
+  segments are gone.
+- **Recovery is `QuarantineDictless`, and restoring beats it.** The pass moves undecodable
+  segments to `quarantine/<shard>/` and drops the directory snapshots describing them, so
+  the store opens again. It deletes nothing, and it *refuses* while a missing dictionary is
+  sitting in `dicts/attic/` — moving that one file back keeps records the quarantine would
+  set aside.
+
+`Fsck` reports the state without opening anything: which dictionaries are present, which
+are missing, which are recoverable from the attic, which files are present but will not
+load, and how many records are undecodable for want of one. `DictsDirRecreated()` counts
+the times persisting a dictionary found `dicts/` gone and recreated it; nothing in the
+engine removes that directory, so a non-zero count means something outside the process did.
 
 Columnar row groups do **not** use the trained dictionary. Their regions are compressed
 with a dictionary-less *region codec*, because a column of like values already has the
