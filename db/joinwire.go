@@ -241,7 +241,21 @@ func (cat *Catalog) JoinWire(spec JoinSpec, want JoinLimits, redact bool, stats 
 		return nil, err
 	}
 	if redact {
-		for _, sd := range sides {
+		for i, sd := range sides {
+			// A SIDE THAT CONTRIBUTES NO MEMBER HAS NOTHING TO WITHHOLD. A semi or anti
+			// join tests its side and carries none of it into the row, so there are no
+			// private names to reach -- and the projection this would insist on is one
+			// the spec may not carry at all: refuseSemiSideRefs rejects a Project on such
+			// a side, because a caller asking for its attributes is asking for something
+			// no row can hold.
+			//
+			// Requiring it anyway made the two rules contradict each other, and every
+			// redacted semi join fell back to the text reply: the render path, which is
+			// the one this op exists to avoid. A connection is redacted unless it is
+			// privileged, so that was the ordinary case rather than a corner.
+			if i > 0 && !steps[i-1].Kind.carriesSide() {
+				continue
+			}
 			if sd.Project == nil {
 				return nil, ErrJoinWireRedactNeedsProjection
 			}

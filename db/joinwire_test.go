@@ -402,3 +402,88 @@ func TestRedactedWholeAdJoinRefuses(t *testing.T) {
 		t.Fatalf("an unredacted whole-ad join should be served: %v", err)
 	}
 }
+
+// TestRedactedSemiJoinServesWireRows pins the case the refusal above must NOT cover.
+//
+// The two rules contradicted each other. A semi or anti join's tested side carries nothing
+// into the row, so refuseSemiSideRefs rejects a spec that gives it a Project at all -- and
+// the redaction check demanded one from every side. Together they meant no redacted semi
+// join could ever be served in wire form, so every one fell back to the text row stream:
+// the render-and-reparse path this op exists to avoid. A connection is redacted unless it is
+// privileged, so that was the ordinary case rather than a corner.
+//
+// A side contributing no member has nothing to withhold, which is why skipping it is sound
+// rather than merely convenient. What still has to hold is everything else: the LEFT side is
+// redacted as before, and the row carries no member for the side that was only tested.
+func TestRedactedSemiJoinServesWireRows(t *testing.T) {
+	cat := privateJoinFixture(t)
+	for _, tc := range []struct {
+		name  string
+		kind  JoinKind
+		right string // a filter on the tested side, so each kind matches something
+	}{
+		{"semi", JoinSemi, ""},
+		// Every job has a hist row, so an unfiltered anti join matches nothing and would
+		// prove nothing about redaction. Narrowing the tested side leaves three jobs with
+		// no match.
+		{"anti", JoinAnti, "ClusterId == 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := privateJoinSpec()
+			spec.Kind = tc.kind
+			spec.Right.Constraint = tc.right
+			// The tested side contributes no member, so it may not name a projection.
+			spec.Right.Project = nil
+
+			var st JoinStats
+			seq, err := cat.JoinWire(spec, JoinLimits{}, true, &st)
+			if err != nil {
+				t.Fatalf("a redacted %s join was refused: %v -- a side carrying no member "+
+					"has nothing to withhold", tc.name, err)
+			}
+			rows := 0
+			for row := range seq {
+				ad, derr := wire.DecodeInline(row)
+				if derr != nil {
+					t.Fatalf("redacted row did not decode: %v", derr)
+				}
+				text := classad.FromAST(ad).String()
+				// The left side is still redacted.
+				for _, secret := range []string{"ClaimId", "secret-left"} {
+					if strings.Contains(text, secret) {
+						t.Fatalf("a redacted %s join carries %q: %s", tc.name, secret, text)
+					}
+				}
+				if !strings.Contains(text, "Owner") {
+					t.Fatalf("redaction took the public attributes too: %s", text)
+				}
+				// And the tested side contributes nothing at all, redacted or not.
+				if strings.Contains(text, "h =") || strings.Contains(text, "ExitCode") ||
+					strings.Contains(text, "TransferKey") {
+					t.Fatalf("a %s join's row carries the side it only tested: %s", tc.name, text)
+				}
+				rows++
+			}
+			if st.Err != nil {
+				t.Fatal(st.Err)
+			}
+			// The oracle is the same spec through the ad-building path: this op may
+			// change how a row is carried, never which rows there are.
+			var ast JoinStats
+			adSeq, aerr := cat.Join(spec, JoinLimits{}, &ast)
+			if aerr != nil {
+				t.Fatal(aerr)
+			}
+			want := 0
+			for range adSeq {
+				want++
+			}
+			if rows != want {
+				t.Fatalf("the wire reply gave %d rows and the ad reply %d", rows, want)
+			}
+			if want == 0 {
+				t.Fatalf("the %s join matched nothing, so the redaction proves nothing", tc.name)
+			}
+		})
+	}
+}
