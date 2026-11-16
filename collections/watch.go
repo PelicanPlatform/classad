@@ -101,7 +101,11 @@ func (r WatchResetReason) String() string {
 
 // WatchEvent is one item in a Watch stream. Cursor, when non-nil, is an opaque token
 // the client persists after processing the event and passes back to Watch on resume.
-// Catch-up data events carry no cursor (persist at WatchSynced); live events do.
+// Live events carry one, and so do catch-up upserts -- a long catch-up is resumable
+// partway, so a consumer that reconnects re-reads only what it had not committed. The
+// exception is the full replay a WatchReset opens on a mutable collection, whose events
+// carry none: there the consumer rebuilds from empty and has nothing to resume to until
+// WatchSynced. Deletes and WatchReset itself never carry one.
 type WatchEvent struct {
 	Kind   WatchKind
 	Key    []byte
@@ -1214,36 +1218,76 @@ func (c *Collection) planCatchup(seqs, sReg []uint64, reason WatchResetReason) c
 // consumer stopped. Releases the plan's pins either way.
 func (c *Collection) runCatchup(p *catchupPlan, seqs, sReg []uint64, yield func(WatchEvent) bool, redact bool) bool {
 	defer p.release()
+	// Every upsert carries the cursor just past it: the vector with this shard at this
+	// record's seq and the others where catch-up has left them. Without one a catch-up hands
+	// back no resume point until Synced, so a consumer whose session ends first -- a dropped
+	// connection, a restart, a replay that simply outlasts the session -- commits nothing and
+	// re-reads the same backlog on every reconnect, making no progress however long it runs.
+	//
+	// The vector names exactly what has been delivered: shards are walked in turn, and within
+	// a shard the walk ascends in seq (segments in order, records in order within a segment),
+	// so a resume from it re-reads the remainder of this shard and all of the shards after it.
+	// A delete is covered too: a shard's deletes are all emitted before its upserts, and a
+	// resume reselects the window above the cursor, so one at or below it was already
+	// delivered and one above it is delivered again (deletes are idempotent).
+	vec := make([]uint64, len(c.shards))
 	if p.full {
 		if !yield(WatchEvent{Kind: WatchReset, Reason: p.reason}) {
 			return false
 		}
+		// Not for a mutable collection: a Reset tells the consumer to discard what it holds
+		// and rebuild from the replay, and a cursor committed partway would let it resume
+		// incrementally over a half-built state whose reconcile never runs. An append-only
+		// collection discards nothing on a Reset -- there is nothing to sweep, and a record
+		// redelivered is a record deduplicated -- so its replay does carry them, which is the
+		// case that needs them most, being the longest.
+		mark := c.appendOnly()
 		for i := range c.shards {
-			if !c.catchupUpserts(i, 0, sReg[i], p.shardWins(i), yield, redact) {
+			if !c.catchupUpserts(i, 0, sReg[i], p.shardWins(i), yield, redact, c.catchupCursor(i, vec, mark)) {
 				return false
 			}
+			vec[i] = sReg[i]
 		}
 		return true
 	}
+	copy(vec, seqs)
 	for i := range c.shards {
 		// Deletes before upserts: a key deleted then re-added since the cursor must end
 		// present (Delete then Upsert), not absent.
 		if !c.catchupDeletes(p.dels[i], yield) {
 			return false
 		}
-		if !c.catchupUpserts(i, seqs[i], sReg[i], p.shardWins(i), yield, redact) {
+		if !c.catchupUpserts(i, seqs[i], sReg[i], p.shardWins(i), yield, redact, c.catchupCursor(i, vec, true)) {
 			return false
 		}
+		vec[i] = sReg[i]
 	}
 	return true
+}
+
+// catchupCursor returns what catchupUpserts stamps each event with: shard i's entry in vec is
+// advanced to the record's seq and the vector encoded. It returns nil when this catch-up must
+// hand back no resume point (see runCatchup), and catchupUpserts then emits no cursor.
+func (c *Collection) catchupCursor(i int, vec []uint64, on bool) func(uint64) []byte {
+	if !on {
+		return nil
+	}
+	return func(seq uint64) []byte {
+		vec[i] = seq
+		// encodeCursor allocates, and has to: a consumer keeps the cursor of the last event
+		// it applied and commits it later, so a buffer reused across events would be
+		// rewritten under the one it is holding.
+		return encodeCursor(c.hub.epoch, vec)
+	}
 }
 
 // catchupUpserts emits an Upsert for every record visible at sReg whose seq is in
 // (cursor, sReg] -- the keys whose current version changed since the cursor. wins, if
 // non-nil, are windows already pinned at sReg (the caller releases them); otherwise
 // they are taken here. redact is the watcher's entitlement (see WatchRedacted),
-// threaded because this decodes ads itself.
-func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow, yield func(WatchEvent) bool, redact bool) bool {
+// threaded because this decodes ads itself. cur, when non-nil, stamps each event with the
+// resume cursor just past its record (see runCatchup).
+func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow, yield func(WatchEvent) bool, redact bool, cur func(uint64) []byte) bool {
 	if wins == nil {
 		// Windows at sReg, not at the current head: a segment whose records were all
 		// superseded after sReg still holds versions catch-up must emit.
@@ -1276,7 +1320,11 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow
 				// Through the segment's dictionary: an interned record decoded without it fails, and
 				// catch-up then dropped every record of an interned segment.
 				if ad, ok := c.watchAdDictAs(key, adBytes, adCodec, wn.dict(), redact); ok {
-					if !yield(WatchEvent{Kind: WatchUpsert, Key: append([]byte(nil), key...), Ad: ad}) {
+					ev := WatchEvent{Kind: WatchUpsert, Key: append([]byte(nil), key...), Ad: ad}
+					if cur != nil {
+						ev.Cursor = cur(seq)
+					}
+					if !yield(ev) {
 						return false
 					}
 				}
@@ -1288,6 +1336,12 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow
 }
 
 // catchupDeletes emits a Delete for each journaled delete in dels.
+//
+// These carry no resume cursor, and must not: a shard's deletes are all emitted before its
+// upserts, so a cursor at a delete's seq would sit above upserts of the same shard that have not
+// been delivered yet, and a resume from it would skip them. The first upsert cursor that follows
+// covers these deletes instead -- a resume reselects the delete window above it, which
+// redelivers any at a higher seq, and a redelivered delete is idempotent.
 func (c *Collection) catchupDeletes(dels []delEntry, yield func(WatchEvent) bool) bool {
 	for _, e := range dels {
 		if c.watchHidden(e.key) {
