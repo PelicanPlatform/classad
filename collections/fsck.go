@@ -23,6 +23,7 @@ package collections
 //     files.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -31,6 +32,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // FsckDamage is one unreadable region of a segment.
@@ -54,12 +57,19 @@ type FsckDamage struct {
 
 // FsckSegment is one segment data file's census.
 type FsckSegment struct {
-	Path    string
-	Size    int
-	DictID  uint32 // the dictionary named in the file name
-	Records int    // records that verified
-	Bytes   int    // bytes those records occupy
-	Damage  []FsckDamage
+	Path   string
+	Size   int
+	DictID uint32 // the dictionary named in the file name
+	// DictUnusable is set when DictID names a compression dictionary this store cannot
+	// supply -- no file in dicts/, or a file that does not load. The segment's framing and
+	// checksums are still checked and Records still counts what verified, because that is
+	// what a restored dictionary would recover. Nothing in the segment can be DECODED
+	// while it holds, though, so those records are reported separately from the readable
+	// ones (see Totals and Undecodable) rather than counted among them.
+	DictUnusable bool
+	Records      int // records that verified
+	Bytes        int // bytes those records occupy
+	Damage       []FsckDamage
 	// Sidecar reports the state of this segment's .idx: "absent", "ok", or a
 	// rejection reason. A sidecar is derived state, so a bad one costs only the
 	// rebuild -- it is never data loss.
@@ -148,6 +158,14 @@ type FsckStray struct {
 	Why  string
 }
 
+// FsckDictFile is a dictionary file that is present but unusable. Why says what is wrong
+// with it, in the terms an operator can act on.
+type FsckDictFile struct {
+	ID   uint32
+	Path string
+	Why  string
+}
+
 // FsckReport is the whole collection's census.
 type FsckReport struct {
 	Dir      string
@@ -159,8 +177,16 @@ type FsckReport struct {
 	DictsPresent []uint32
 	DictsMissing []uint32
 	// DictsInAttic are missing dictionaries whose file is sitting in dicts/attic/,
-	// retired by pruning. Those segments ARE recoverable: move the file back.
+	// retired by pruning. Those segments ARE recoverable: move the file back. A file
+	// there that does not itself load is reported in DictsDamaged instead, since
+	// telling an operator to restore a dictionary that will not open is worse than
+	// saying nothing.
 	DictsInAttic []uint32
+	// DictsDamaged are dictionary files that exist but cannot be used -- empty, truncated,
+	// or not a zstd dictionary at all. They are NOT in DictsPresent: a file that does not
+	// load is not a dictionary the store has, and Open fails on it exactly as it does on
+	// one that is absent.
+	DictsDamaged []FsckDictFile
 	// Supersede lists records whose supersededBySeq is impossible. Each one is a key
 	// that may silently not be returned.
 	Supersede []FsckSupersede
@@ -176,11 +202,21 @@ type FsckReport struct {
 	CommitSeqKnown bool
 }
 
-// Totals sums the per-segment counts.
+// Totals sums the per-segment counts. records counts only records that can actually be
+// READ: a record in a segment whose compression dictionary is unusable is not among them,
+// however well it verifies, because nothing can decode it. Those are reported by
+// Undecodable instead.
+//
+// The distinction is the whole point. Record framing and checksums say nothing about
+// whether the bytes can be decompressed, so counting a dictionary-less segment's records
+// as readable made the headline contradict the MISSING dictionary line in the same report
+// -- and the headline is what an operator reads first.
 func (r *FsckReport) Totals() (records, damagedRuns, damagedRecords int) {
 	for i := range r.Segments {
 		s := &r.Segments[i]
-		records += s.Records
+		if !s.DictUnusable {
+			records += s.Records
+		}
 		for _, d := range s.Damage {
 			if d.Trailing {
 				continue // a torn tail is not loss; it was never committed
@@ -192,12 +228,31 @@ func (r *FsckReport) Totals() (records, damagedRuns, damagedRecords int) {
 	return
 }
 
+// Undecodable reports the segments whose compression dictionary is unusable and the
+// records in them. Those records verified -- they are intact on disk and a restored
+// dictionary brings every one of them back -- but nothing can read them as the store
+// stands, and Open refuses the collection rather than serve it.
+func (r *FsckReport) Undecodable() (segments, records int) {
+	for i := range r.Segments {
+		if r.Segments[i].DictUnusable {
+			segments++
+			records += r.Segments[i].Records
+		}
+	}
+	return
+}
+
 // String renders the report the way an operator wants to read it.
 func (r *FsckReport) String() string {
 	var b strings.Builder
 	rec, runs, lost := r.Totals()
+	undecSegs, undecRecs := r.Undecodable()
 	fmt.Fprintf(&b, "fsck %s\n", r.Dir)
 	fmt.Fprintf(&b, "  %d segment(s), %d record(s) readable\n", len(r.Segments), rec)
+	if undecSegs > 0 {
+		fmt.Fprintf(&b, "  %d segment(s), %d record(s) UNDECODABLE: their compression "+
+			"dictionary is missing or does not load\n", undecSegs, undecRecs)
+	}
 	mismatched, dictDamaged := 0, 0
 	for i := range r.Segments {
 		if r.Segments[i].ColumnarMismatch != "" {
@@ -307,6 +362,9 @@ func (r *FsckReport) String() string {
 	for _, id := range r.DictsInAttic {
 		attic[id] = true
 	}
+	for _, d := range r.DictsDamaged {
+		fmt.Fprintf(&b, "  DAMAGED dictionary %d: %s -- %s\n", d.ID, d.Path, d.Why)
+	}
 	for _, id := range r.DictsMissing {
 		if attic[id] {
 			fmt.Fprintf(&b, "  RECOVERABLE dictionary %d: in dicts/attic/%d.zst -- "+
@@ -324,11 +382,12 @@ func (r *FsckReport) String() string {
 func Fsck(dir string) (*FsckReport, error) {
 	r := &FsckReport{Dir: dir}
 
-	present, err := fsckDicts(filepath.Join(dir, "dicts"))
+	present, badDicts, err := fsckDicts(filepath.Join(dir, "dicts"))
 	if err != nil {
 		return nil, err
 	}
 	r.DictsPresent = present
+	r.DictsDamaged = badDicts
 	have := make(map[uint32]bool, len(present))
 	for _, id := range present {
 		have[id] = true
@@ -377,14 +436,18 @@ func Fsck(dir string) (*FsckReport, error) {
 			}
 			if !have[dictID] {
 				missing[dictID] = true
+				seg.DictUnusable = true
 			}
 			r.Segments = append(r.Segments, *seg)
 		}
 	}
-	inAttic, err := fsckDicts(filepath.Join(dir, "dicts", "attic"))
+	// A dictionary in the attic counts as recoverable only if it LOADS; one that does not
+	// is reported as damaged, in its attic path, rather than offered as a restore.
+	inAttic, badAttic, err := fsckDicts(filepath.Join(dir, "dicts", "attic"))
 	if err != nil {
 		return nil, err
 	}
+	r.DictsDamaged = append(r.DictsDamaged, badAttic...)
 	retired := make(map[uint32]bool, len(inAttic))
 	for _, id := range inAttic {
 		retired[id] = true
@@ -442,23 +505,64 @@ func Fsck(dir string) (*FsckReport, error) {
 }
 
 // fsckDicts lists the dictionary ids that have a file on disk.
-func fsckDicts(dictsDir string) ([]uint32, error) {
+// fsckDicts lists the dictionaries in dictsDir, separating the ones that LOAD from the
+// ones that merely exist. A dictionary is the only thing that can decode the segments
+// naming it, and nothing else in the store carries a copy, so "the file is there" is not
+// the question an operator needs answered -- "will Open accept it" is.
+//
+// Checking the name alone let fsck report a truncated or empty dictionary as present and
+// pronounce the store healthy, after which Open failed with "rebuild codec for dict N".
+func fsckDicts(dictsDir string) ([]uint32, []FsckDictFile, error) {
 	entries, err := os.ReadDir(dictsDir)
 	if os.IsNotExist(err) {
-		return nil, nil // an identity-codec collection has no dicts directory
+		return nil, nil, nil // an identity-codec collection has no dicts directory
 	}
 	if err != nil {
-		return nil, fmt.Errorf("fsck: reading %s: %w", dictsDir, err)
+		return nil, nil, fmt.Errorf("fsck: reading %s: %w", dictsDir, err)
 	}
 	var ids []uint32
+	var bad []FsckDictFile
 	for _, e := range entries {
 		var id uint32
-		if _, err := fmt.Sscanf(e.Name(), "%d.zst", &id); err == nil {
-			ids = append(ids, id)
+		if _, serr := fmt.Sscanf(e.Name(), "%d.zst", &id); serr != nil {
+			continue
 		}
+		path := filepath.Join(dictsDir, e.Name())
+		if why := fsckDictFile(path); why != "" {
+			bad = append(bad, FsckDictFile{ID: id, Path: path, Why: why})
+			continue
+		}
+		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	return ids, nil
+	sort.Slice(bad, func(i, j int) bool { return bad[i].ID < bad[j].ID })
+	return ids, bad, nil
+}
+
+// zstdDictMagic prefixes every dictionary klauspost's BuildDict produces, little-endian
+// 0xEC30A437. A file without it is not one of ours, whatever its name says.
+var zstdDictMagic = []byte{0x37, 0xA4, 0x30, 0xEC}
+
+// fsckDictFile reports why a dictionary file cannot be used, or "" if it can. The final
+// check is the one Open makes -- building a decoder from the bytes -- so fsck's verdict and
+// Open's cannot disagree.
+func fsckDictFile(path string) string {
+	dict, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("unreadable: %v", err)
+	}
+	switch {
+	case len(dict) == 0:
+		return "empty file"
+	case !bytes.HasPrefix(dict, zstdDictMagic):
+		return fmt.Sprintf("not a zstd dictionary (%d bytes, wrong magic)", len(dict))
+	}
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(dict), zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		return fmt.Sprintf("does not load: %v", err)
+	}
+	dec.Close()
+	return ""
 }
 
 // fsckSegment walks one segment file, resyncing past damage instead of stopping at
