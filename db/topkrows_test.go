@@ -153,7 +153,7 @@ func TestTopKRowsIsExactOnTies(t *testing.T) {
 		ad.InsertAttr("Cpus", int64(i))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
@@ -192,7 +192,7 @@ func TestTopKRowsSkipsUnrankableRows(t *testing.T) {
 		}
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
@@ -281,7 +281,7 @@ func TestTopKRowsRanksBooleansLikeTheColumnPass(t *testing.T) {
 		ad.InsertAttr("Cpus", int64(i))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
@@ -333,7 +333,7 @@ func TestTopKRowsSkipsNaN(t *testing.T) {
 		}
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
