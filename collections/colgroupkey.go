@@ -481,6 +481,30 @@ func (a *groupAccum) bucketed(i int) bool {
 // internStr returns s's query-local id, assigning one if this is the first time the query has seen
 // these EXACT BYTES. Two strings that differ only in case are two ids, which is what the scan does
 // with them; see the fold warning at the top of this file.
+// internBytes is internStr over bytes that have not been made into a string.
+//
+// The lookup is `a.strID[string(b)]`, which the compiler serves without allocating: the
+// conversion is only used to hash and compare, never retained. So a repeat value -- which is
+// every record after the first of its group -- costs nothing at all, and only a value seen for
+// the first time in this query allocates, in the clone below. That is the whole point: a grouped
+// scan over a million records with a hundred owners should allocate a hundred strings, not a
+// million.
+func (a *groupAccum) internBytes(b []byte) int64 {
+	if id, ok := a.strID[string(b)]; ok {
+		return id
+	}
+	// Same contract as internStr: b aliases a block's decompressed region and the table outlives
+	// the block, so an INSERT copies.
+	cs := string(b)
+	id := int64(len(a.strVal))
+	a.strVal = append(a.strVal, cs)
+	if a.strID == nil {
+		a.strID = make(map[string]int64, 16)
+	}
+	a.strID[cs] = id
+	return id
+}
+
 func (a *groupAccum) internStr(s string) int64 {
 	if id, ok := a.strID[s]; ok {
 		return id

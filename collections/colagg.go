@@ -439,9 +439,13 @@ func numValueFromAd(d *segDictHandle, ad wire.Ad, lookup fieldLookup, fn func(co
 // isExprNode reports whether a wire node is a value only evaluation can give -- an expression rather
 // than a literal. The numeric column paths read literals; meeting one of these, they decline. A
 // negative number stored as unary minus over a literal is not one (see scalarValue).
+// isExprNode reports whether node is an EXPRESSION rather than a scalar literal.
+//
+// It asks the tag, not the value: this runs once per record per looked-up field, and decoding a
+// string node to discard it was an allocation per record. See wire.IsLiteralNode, which answers
+// the same question on the same inputs.
 func isExprNode(node []byte) bool {
-	_, lit := scalarValue(node)
-	return !lit
+	return !wire.IsLiteralNode(node)
 }
 
 func nodeColVal(node []byte) (colVal, bool) {

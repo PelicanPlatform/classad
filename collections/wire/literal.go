@@ -78,6 +78,60 @@ func AppendStringNode(dst []byte, s string) []byte {
 // one, or (_, false) if it is a list, record, or computed expression (which must
 // be decoded via DecodeNode and evaluated). It is allocation-free except for the
 // string case, which copies the string bytes.
+// IsLiteralNode reports whether node is a scalar literal, WITHOUT decoding its value.
+//
+// It answers exactly what `_, ok := LiteralValue(node)` answers -- same tags, same payload
+// validity checks -- and for a STRING that is the whole difference: LiteralValue copies the
+// string out of the node to return it, so asking "is this a literal?" through LiteralValue
+// allocated the string and threw it away. On a grouped scan that is one allocation per record
+// for a question whose answer is in the first byte.
+//
+// Any tag it does not recognise falls through to NumberValue, which is the other half of what
+// the scan calls a scalar (a parenthesised or signed number), so the two agree on every input.
+func IsLiteralNode(node []byte) bool {
+	if len(node) == 0 {
+		return false
+	}
+	switch node[0] {
+	case nUndefined, nError, nBoolFalse, nBoolTrue:
+		return true
+	case nInt:
+		_, n := binary.Varint(node[1:])
+		return n > 0
+	case nReal:
+		return len(node) >= 9
+	case nString:
+		l, n := binary.Uvarint(node[1:])
+		return n > 0 && uint64(len(node)-1-n) >= l
+	}
+	_, ok := NumberValue(node)
+	return ok
+}
+
+// StringNodeBytes returns a STRING node's bytes WITHOUT converting them to a Go string, so a
+// caller that only needs to compare or hash them pays no allocation.
+//
+// It exists because LiteralValue cannot do this: its Literal carries a string, and building one
+// from the node copies. On a grouped scan that copy is per RECORD -- the group key is then
+// interned, which keeps one copy per distinct value, so the per-record copy was thrown away
+// immediately. A map lookup keyed `m[string(b)]` does not allocate (the compiler elides it), so
+// a caller can go straight from these bytes to its own table.
+//
+// THE SLICE ALIASES node, which for a scan aliases a block's decompressed region. It is valid
+// only until that region is reused, so a caller that RETAINS the value must copy it -- which is
+// exactly what interning does on insert, and only on insert.
+func StringNodeBytes(node []byte) ([]byte, bool) {
+	if len(node) == 0 || node[0] != nString {
+		return nil, false
+	}
+	l, n := binary.Uvarint(node[1:])
+	if n <= 0 || uint64(len(node)-1-n) < l {
+		return nil, false
+	}
+	start := 1 + n
+	return node[start : start+int(l)], true
+}
+
 func LiteralValue(node []byte) (Literal, bool) {
 	if len(node) == 0 {
 		return Literal{}, false
