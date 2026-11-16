@@ -22,9 +22,17 @@ const (
 	// OpenMapSegments is the readdir + mmap pass over a shard's segment files.
 	OpenMapSegments OpenPhase = "map_segments"
 	// OpenLoadSidecars is the per-sealed-segment sidecar load. It is the phase that dominates
-	// a large archive's open: a segment whose sidecar cannot be adopted has its index rebuilt
-	// by decoding every record it holds, measured at ~95% of reopen time.
+	// a large archive's open when sidecars cannot be adopted: such a segment has its index
+	// rebuilt by decoding every record it holds, measured at ~95% of reopen time. When they
+	// adopt -- the healthy case -- this phase is cheap and the other two are the cost.
 	OpenLoadSidecars OpenPhase = "load_sidecars"
+	// OpenRebuildDir is the record replay that reconstructs a shard's directory and commit
+	// sequence when no directory snapshot could be restored (an unclean previous close, or a
+	// shape that forces the full scan). It walks every record of every segment, so it is
+	// reported per segment like the others. Measured at ~53% of the CPU of a hub reopen whose
+	// sidecars all adopted, which is to say it is not a phase an operator can be left
+	// guessing about.
+	OpenRebuildDir OpenPhase = "rebuild_dir"
 )
 
 // OpenProgress is one progress report from a persistent Open.
