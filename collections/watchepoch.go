@@ -148,6 +148,12 @@ func consumeWatchEpoch(dir string) (m watchEpochMark, ok bool, err error) {
 	return m, ok, nil
 }
 
+// dirSyncHook is a test seam recording each directory whose entries were made durable.
+// It is how a test can assert that a rename or a create was followed by the fsync that
+// makes its NAME survive a crash, which nothing else about the store observes. Production
+// leaves it nil.
+var dirSyncHook func(dir string)
+
 // syncDir fsyncs a directory so entries created, renamed, or removed in it are durable.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
@@ -155,7 +161,13 @@ func syncDir(dir string) error {
 		return err
 	}
 	defer d.Close()
-	return d.Sync()
+	// Notify only on success: the hook exists so a test can assert a rename or a create was
+	// made durable, and a sync that failed did not make anything durable.
+	err = d.Sync()
+	if err == nil && dirSyncHook != nil {
+		dirSyncHook(dir)
+	}
+	return err
 }
 
 // claimWatchEpoch is Open's half of the protocol for a persistent append-only collection with
