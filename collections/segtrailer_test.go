@@ -475,3 +475,79 @@ func TestSegTrailerToleratesUnaddressedBodyBytes(t *testing.T) {
 		t.Error("a directory reaching past the bodies was accepted")
 	}
 }
+
+// TestSegTrailerRefusesNonsense covers the guards rather than the happy path. Every one
+// of these is a caller handing over something that is not a trailer, or a file that is
+// not there, and each must come back as "no trailer" rather than as a slice out of range
+// or a half-built result -- a segment with no trailer is the overwhelmingly common case
+// and shares every one of these paths with a damaged one.
+func TestSegTrailerRefusesNonsense(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "not-a-segment.dat")
+
+	// parseSegTrailer wants EXACTLY the trailer region. A longer slice is a caller
+	// mistake, not a trailer that happens to start late.
+	good := buildSegTrailer([]segTrailerSection{{id: 1, body: []byte("body")}})
+	if _, ok := parseSegTrailer(append([]byte("leading junk"), good...)); ok {
+		t.Error("parsed a slice longer than the trailer it describes")
+	}
+
+	// The file-level readers answer "no trailer" for anything they cannot read.
+	if _, ok := readSegTrailerFile(absent); ok {
+		t.Error("read a trailer out of a file that does not exist")
+	}
+	short := filepath.Join(t.TempDir(), "short.dat")
+	if err := os.WriteFile(short, []byte("tiny"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readSegTrailerFile(short); ok {
+		t.Error("read a trailer out of a file smaller than one")
+	}
+	// A foot whose claimed length is longer than the file is refused before the read it
+	// would otherwise size.
+	absurd := append([]byte(nil), good...)
+	binary.LittleEndian.PutUint64(absurd[len(absurd)-segTrailerFootLen:], 1<<40)
+	huge := filepath.Join(t.TempDir(), "huge.dat")
+	if err := os.WriteFile(huge, absurd, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readSegTrailerFile(huge); ok {
+		t.Error("accepted a foot claiming a trailer larger than the file")
+	}
+
+	// The writers report rather than create: a path that is not a segment must not become
+	// a file consisting only of a trailer.
+	if _, err := segArenaEnd(absent); err == nil {
+		t.Error("segArenaEnd invented an arena for a file that does not exist")
+	}
+	if err := writeSegTrailer(absent, 0, nil); err == nil {
+		t.Error("writeSegTrailer created a file that was not a segment")
+	}
+	if err := addDictReplica(absent, 0, 1, []byte("dictionary")); err == nil {
+		t.Error("addDictReplica created a file that was not a segment")
+	}
+	if _, err := os.Stat(absent); err == nil {
+		t.Error("a refused write left a file behind")
+	}
+
+	// And the replica accessors, which read bodies a newer or damaged writer may have
+	// left in any shape.
+	if _, _, ok := decodeDictReplica([]byte{1, 2, 3}); ok {
+		t.Error("decoded a replica body too short to hold an id and a dictionary")
+	}
+	tr, ok := parseSegTrailer(buildSegTrailer([]segTrailerSection{
+		{id: segSecDictReplica, body: encodeDictReplica(4, []byte("four"))},
+		{id: segSecDictReplica, body: []byte{1, 2}}, // malformed: skipped, not fatal
+	}))
+	if !ok {
+		t.Fatal("a trailer holding a malformed replica section did not parse")
+	}
+	if _, has := tr.dictReplica(9); has {
+		t.Error("found a copy of a dictionary nothing carries")
+	}
+	if got, has := tr.dictReplica(4); !has || string(got) != "four" {
+		t.Errorf("dictReplica(4) = (%q, %v); want (\"four\", true)", got, has)
+	}
+	if ids := tr.dictReplicaIDs(); len(ids) != 1 || ids[0] != 4 {
+		t.Errorf("dictReplicaIDs = %v; want [4] (the malformed section ignored)", ids)
+	}
+}
