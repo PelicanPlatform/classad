@@ -244,7 +244,7 @@ func TestInsertSelectFromArchiveSource(t *testing.T) {
 	want := map[string]int{"alice": 5, "bob": 3}
 	for owner, n := range want {
 		for i := 0; i < n; i++ {
-			ad, perr := classad.Parse(fmt.Sprintf(`[ Owner = "%s"; JobStatus = 4 ]`, owner))
+			ad, perr := classad.Parse(fmt.Sprintf(`[ Owner = %q; JobStatus = 4 ]`, owner))
 			if perr != nil {
 				t.Fatal(perr)
 			}
