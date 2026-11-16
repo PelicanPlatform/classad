@@ -298,3 +298,134 @@ func TestCloseReleasesDictionaryDescriptors(t *testing.T) {
 		t.Errorf("%d dictionary descriptor(s) still held after Close", n)
 	}
 }
+
+// TestDictFaultMessagesAreUsable: the callback is the loud half of the check, and what it
+// hands over has to say which file, what happened to it, and what it costs -- without a
+// second investigation. An operator reading a log line is the whole audience.
+func TestDictFaultMessagesAreUsable(t *testing.T) {
+	cause := errors.New("read-only file system")
+	for _, tc := range []struct {
+		name string
+		f    DictFault
+		want []string
+	}{
+		{"restored", DictFault{ID: 3, Path: "/d/3.zst", Kind: DictFaultMissing, Repaired: true},
+			[]string{"/d/3.zst", "rewritten", "deleting"}},
+		{"not restored", DictFault{ID: 3, Path: "/d/3.zst", Kind: DictFaultMissing, Err: cause},
+			[]string{"/d/3.zst", "read-only file system", "unreadable"}},
+		{"replaced", DictFault{ID: 4, Path: "/d/4.zst", Kind: DictFaultReplaced},
+			[]string{"/d/4.zst", "replaced"}},
+		{"changed", DictFault{ID: 5, Path: "/d/5.zst", Kind: DictFaultChanged},
+			[]string{"/d/5.zst", "changed"}},
+		{"check failed", DictFault{ID: 6, Path: "/d/6.zst", Kind: DictFaultChanged, Err: cause},
+			[]string{"/d/6.zst", "changed", "read-only file system"}},
+	} {
+		msg := tc.f.Error()
+		for _, want := range tc.want {
+			if !strings.Contains(msg, want) {
+				t.Errorf("%s: message does not mention %q: %s", tc.name, want, msg)
+			}
+		}
+	}
+	// Unwrap is what lets a caller reach the cause behind a fault.
+	f := &DictFault{Kind: DictFaultMissing, Err: cause}
+	if !errors.Is(f, cause) {
+		t.Error("the cause is not reachable through the fault")
+	}
+	if (&DictFault{Kind: DictFaultChanged}).Unwrap() != nil {
+		t.Error("a fault with no cause unwrapped to something")
+	}
+	for kind, want := range map[DictFaultKind]string{
+		DictFaultMissing: "missing", DictFaultReplaced: "replaced", DictFaultChanged: "changed",
+	} {
+		if got := kind.String(); got != want {
+			t.Errorf("DictFaultKind(%d).String() = %q; want %q", int(kind), got, want)
+		}
+	}
+	if got := DictFaultKind(99).String(); !strings.Contains(got, "99") {
+		t.Errorf("an unknown kind renders as %q", got)
+	}
+}
+
+// TestTruncatedDictionaryFileIsReported: the same inode, fewer bytes. Caught on size
+// before anything is read, which is the cheap half of the content check.
+func TestTruncatedDictionaryFileIsReported(t *testing.T) {
+	c, path, want, _ := openPinned(t)
+	changedBefore := DictFilesChanged()
+	if err := os.Truncate(path, int64(len(want)/2)); err != nil {
+		t.Fatal(err)
+	}
+
+	fault := onlyFault(t, c.VerifyDictFiles())
+	if fault.Kind != DictFaultChanged || fault.Repaired {
+		t.Fatalf("kind=%v repaired=%v; want changed, untouched", fault.Kind, fault.Repaired)
+	}
+	if DictFilesChanged() <= changedBefore {
+		t.Error("DictFilesChanged did not move")
+	}
+}
+
+// TestReplacedDictionaryIsCounted pins the counter to its own kind: three counters that
+// all moved together would say nothing an operator could act on.
+func TestReplacedDictionaryIsCounted(t *testing.T) {
+	c, path, want, _ := openPinned(t)
+	replacedBefore, missingBefore := DictFilesReplaced(), DictFilesMissing()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(want, 'x'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c.VerifyDictFiles()
+	if DictFilesReplaced() != replacedBefore+1 {
+		t.Errorf("DictFilesReplaced %d -> %d; want +1", replacedBefore, DictFilesReplaced())
+	}
+	if DictFilesMissing() != missingBefore {
+		t.Errorf("a replacement was also counted as missing (%d -> %d)", missingBefore, DictFilesMissing())
+	}
+}
+
+// TestUnrestorableDictionaryFileIsReportedAnyway: holding the bytes is not the same as
+// being able to write them back -- a full or read-only filesystem is exactly when this
+// fires. The fault must still be reported, and must say the repair did not happen, since
+// that is the difference between "handled" and "you have until the next restart".
+func TestUnrestorableDictionaryFileIsReportedAnyway(t *testing.T) {
+	c, path, _, recorded := openPinned(t)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	writeFaultHook = func(p string) error {
+		if p == path {
+			return errors.New("injected: no space left on device")
+		}
+		return nil
+	}
+	defer func() { writeFaultHook = nil }()
+
+	fault := onlyFault(t, c.VerifyDictFiles())
+	if fault.Kind != DictFaultMissing {
+		t.Fatalf("Kind = %v; want %v", fault.Kind, DictFaultMissing)
+	}
+	if fault.Repaired {
+		t.Fatal("reported a repair that was refused")
+	}
+	if fault.Err == nil || !strings.Contains(fault.Err.Error(), "no space left") {
+		t.Errorf("the fault does not carry why the repair failed: %v", fault.Err)
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("the file came back despite the injected failure")
+	}
+	if len(*recorded) != 1 || !strings.Contains((*recorded)[0].Error(), "unreadable") {
+		t.Errorf("the reported error does not say what it costs: %v", *recorded)
+	}
+}
+
+// TestPinDictFileRefusesAMissingFile is the control for everything above: a pin is only
+// ever taken on a file that is there, so the registry never holds one that vouches for
+// nothing.
+func TestPinDictFileRefusesAMissingFile(t *testing.T) {
+	if _, _, err := pinDictFile(filepath.Join(t.TempDir(), "absent.zst")); err == nil {
+		t.Error("pinned a file that does not exist")
+	}
+}
