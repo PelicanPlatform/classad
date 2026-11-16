@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,7 +34,7 @@ func TestRegisterRecreatesMissingDir(t *testing.T) {
 	r.dir = dictsDir
 	// dicts/ absent -> register must recreate it and persist the file.
 	c := &countingCodec{}
-	id, err := r.register(c, []byte("d"))
+	id, _, err := r.register(testDictHeader("d"), func([]byte) (Codec, error) { return c, nil })
 	if err != nil {
 		t.Fatalf("register should self-heal the missing dir: %v", err)
 	}
@@ -54,12 +55,23 @@ func TestRegisterRecreatesMissingDir(t *testing.T) {
 	r2 := newDictReg(identityCodec{})
 	r2.dir = blocker // MkdirAll(blocker) fails: it is a file
 	c2 := &countingCodec{}
-	if _, err := r2.register(c2, []byte("d")); err == nil {
+	if _, _, err := r2.register(testDictHeader("d"), func([]byte) (Codec, error) { return c2, nil }); err == nil {
 		t.Fatal("register must fail when the dict file cannot be written")
 	}
 	if _, ok := r2.idFor(c2); ok {
 		t.Error("a codec whose dict write failed must not be registered (recovery hazard)")
 	}
+}
+
+// testDictHeader returns bytes that are a well-formed ZSTD dictionary as far as the
+// registry is concerned: the magic, a Dictionary_ID, then an arbitrary payload. Registry
+// tests are about ids, files and lifetimes rather than about compression, so they neither
+// need a trained dictionary nor should pay to train one.
+func testDictHeader(payload string) []byte {
+	b := make([]byte, 8, 8+len(payload))
+	binary.LittleEndian.PutUint32(b, dictMagic)
+	binary.LittleEndian.PutUint32(b[4:], legacyDictID)
+	return append(b, payload...)
 }
 
 // countingCodec is a distinct Codec value for registry tests (identity behavior).

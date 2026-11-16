@@ -387,14 +387,13 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	codec, err := NewZSTDCodec(dict)
-	if err != nil {
-		return 0, err
-	}
 	// Register the dictionary so segments can be tagged with its id and, for a
 	// persistent collection, its bytes are written durably before any segment
-	// references it (recovery reconstructs the codec from them).
-	if _, err := c.dicts.register(codec, dict); err != nil {
+	// references it (recovery reconstructs the codec from them). The codec comes back
+	// from register because it has to be built from the bytes register stamped the id
+	// into, not from the bytes TrainDict returned.
+	_, codec, err := c.dicts.register(dict, NewZSTDCodec)
+	if err != nil {
 		return 0, err
 	}
 	c.codec.Store(&codecHolder{codec}) // new writes use the new codec

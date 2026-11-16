@@ -261,7 +261,11 @@ func TrainDictSize(samples [][]byte, dictSize int) (dict []byte, err error) {
 		return nil, fmt.Errorf("insufficient distinct sample data (%d bytes)", len(content))
 	}
 	return zstd.BuildDict(zstd.BuildDictOptions{
-		ID:       1, // a non-zero dictionary id
+		// A placeholder. dictReg.register stamps the id it assigns over this one before
+		// the codec is built, so the dictionary and every frame compressed under it name
+		// the slot the dictionary is stored in. BuildDict needs a non-zero id here; see
+		// legacyDictID.
+		ID:       legacyDictID,
 		Contents: samples,
 		History:  content,
 		// Standard zstd default recent-offset repcodes; {0,0,0} yields an invalid

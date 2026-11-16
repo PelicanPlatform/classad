@@ -62,10 +62,16 @@ func (r *dictReg) codecFor(id uint32) (Codec, bool) {
 	return c, ok
 }
 
-// register assigns the next id to codec, whose compression dictionary is dict, and
-// (for a persistent collection) writes the dictionary bytes durably to
-// <dir>/dicts/<id>.zst so recovery can reconstruct the codec. Returns the id.
-func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
+// register assigns the next id to the compression dictionary dict, stamps that id into
+// the dictionary, builds the codec from the stamped bytes, and (for a persistent
+// collection) writes them durably to <dir>/dicts/<id>.zst so recovery can reconstruct the
+// codec. Returns the id and the codec.
+//
+// The codec is built HERE rather than by the caller because it must be built from the
+// stamped bytes: the encoder copies the dictionary's own id into every frame it writes,
+// which is what lets a decoder say "this is not my dictionary" instead of handing back a
+// checksum failure that reads as an ordinary bad record. See dictid.go.
+func (r *dictReg) register(dict []byte, build func(dict []byte) (Codec, error)) (uint32, Codec, error) {
 	// Reserve the id under the lock (so concurrent registers never collide), but do
 	// NOT register the codec in byID/idOf yet: for a persistent collection we must
 	// persist the dictionary bytes FIRST, so a failed write never leaves a codec
@@ -77,16 +83,24 @@ func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
 	r.next++
 	dir := r.dir
 	r.mu.Unlock()
+	stamped, err := stampDictID(dict, id)
+	if err != nil {
+		return 0, nil, err
+	}
+	codec, err := build(stamped)
+	if err != nil {
+		return 0, nil, err
+	}
 	if dir != "" {
-		if err := writeDictFile(filepath.Join(dir, fmt.Sprintf("%d.zst", id)), dict); err != nil {
-			return 0, err
+		if err := writeDictFile(filepath.Join(dir, fmt.Sprintf("%d.zst", id)), stamped); err != nil {
+			return 0, nil, err
 		}
 	}
 	r.mu.Lock()
 	r.byID[id] = codec
 	r.idOf[codec] = id
 	r.mu.Unlock()
-	return id, nil
+	return id, codec, nil
 }
 
 // prune removes every registered dictionary except id 0 (the base codec) and those
@@ -415,9 +429,22 @@ func (c *Collection) loadDicts(dictsDir string) (latest uint32, err error) {
 		if _, err := fmt.Sscanf(e.Name(), "%d.zst", &id); err != nil || id == 0 {
 			continue
 		}
-		dict, err := os.ReadFile(filepath.Join(dictsDir, e.Name()))
+		path := filepath.Join(dictsDir, e.Name())
+		dict, err := os.ReadFile(path)
 		if err != nil {
 			return 0, err
+		}
+		// A dictionary stamped by this build names its own slot, so a file that is not the
+		// one its name claims is caught here rather than by every segment that needed it
+		// silently decoding to nothing. A dictionary still carrying legacyDictID says
+		// nothing about where it belongs and is accepted; one that is not a dictionary at
+		// all falls through to NewZSTDCodec, which reports it properly.
+		switch fileID, ok := dictIDOf(dict); {
+		case !ok:
+		case fileID == legacyDictID:
+			dictsUnverifiable.Add(1)
+		case fileID != id:
+			return 0, &DictIDMismatchError{Slot: id, Found: fileID, Path: path}
 		}
 		codec, err := NewZSTDCodec(dict)
 		if err != nil {
