@@ -371,11 +371,38 @@ const (
 // surface as index suggestions.
 func (c *Collection) RecordDemand(probes []vm.Probe) { c.demand.record(probes) }
 
+// hasUnindexedDemand reports whether any attribute has been queried with an operator an index
+// could answer and is not already indexed -- the precondition for SuggestIndexes returning
+// anything at all. It reads the demand map and the index spec only; no record is decoded.
+func (c *Collection) hasUnindexedDemand() bool {
+	found := false
+	c.demand.m.Range(func(k, v any) bool {
+		d := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
+		if d.eq.Load() == 0 && d.rng.Load() == 0 {
+			return true // read-only demand drives the hot set, never an index suggestion
+		}
+		if c.alreadyIndexedName(k.(string)) { //nolint:errcheck // demand keys are already folded
+			return true
+		}
+		found = true
+		return false
+	})
+	return found
+}
+
 // SuggestIndexes recommends value/categorical indexes from observed query demand
 // and a sample of up to sampleMax live ads. It is advisory: apply the returned
 // CategoricalAttrs/ValueAttrs via New (or a future dynamic Reindex). Attributes
 // already indexed are not re-suggested. Results are ordered by demand, most first.
 func (c *Collection) SuggestIndexes(sampleMax int) []IndexSuggestion {
+	// Nothing below can suggest an attribute that is not both demanded and unindexed, so when
+	// there is no such attribute the answer is empty whatever the sample says -- and the sample
+	// is the expensive half, decoding up to sampleMax records to profile their attributes. That
+	// was paid unconditionally, including by a daemon that had just come up with an empty demand
+	// map and could only ever have returned nil.
+	if !c.hasUnindexedDemand() {
+		return nil
+	}
 	profiles := c.profileAttrs(sampleMax)
 	var out []IndexSuggestion
 	c.demand.m.Range(func(k, v any) bool {

@@ -1709,9 +1709,20 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 
 	case opDiag:
 		table := r.str()
+		// The flags word postdates this op, so a client that predates it sends none and the
+		// reader reports the shortfall. That client asks the only way it can and expects the
+		// whole report, so its absence means detail -- the saving is opt-in, not opt-out.
+		flags := diagFlagDetail
+		if f, ok := r.optI32(); ok {
+			flags = uint32(f) //nolint:gosec // a flags word, read back as it was written
+		}
 		if r.err != nil {
 			return respBad(reqID)
 		}
+		if flags&^diagFlagsKnown != 0 {
+			return respErr(reqID, "unknown diagnostics flags")
+		}
+		detail := flags&diagFlagDetail != 0
 		// An archive's diagnostics mirror the mutable stat surface plus retention. A VIEW is
 		// not answered here, though its backing is an ordinary *db.DB that diagJSON could
 		// read: that has always reported "no such table" and no reason is recorded, so it
@@ -1720,9 +1731,9 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		var err error
 		switch ref := s.resolveTable(table); ref.kind {
 		case kindTable:
-			data, err = s.diagJSON(ref.db)
+			data, err = s.diagJSON(ref.db, detail)
 		case kindArchive:
-			data, err = s.archiveDiagJSON(ref.arch)
+			data, err = s.archiveDiagJSON(ref.arch, detail)
 		default:
 			return respErr(reqID, "no such table: "+table)
 		}

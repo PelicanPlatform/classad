@@ -98,8 +98,8 @@ func TestDiagnosticsFieldsPopulatedForBothKinds(t *testing.T) {
 	demandQueries(t, "mutable", func(c string) (iter.Seq[*classad.ClassAd], error) { return d.Query(c) })
 	demandQueries(t, "archive", func(c string) (iter.Seq[*classad.ClassAd], error) { return arch.Query(c) })
 
-	mutable := mustDiag(t, func() ([]byte, error) { return s.diagJSON(d) })
-	archive := mustDiag(t, func() ([]byte, error) { return s.archiveDiagJSON(arch) })
+	mutable := mustDiag(t, func() ([]byte, error) { return s.diagJSON(d, true) })
+	archive := mustDiag(t, func() ([]byte, error) { return s.archiveDiagJSON(arch, true) })
 	if !archive.Archive {
 		t.Fatal("the archive diagnostics do not identify themselves as an archive")
 	}
@@ -184,7 +184,7 @@ func TestArchiveReportsEncryptionAtRest(t *testing.T) {
 		if err := arch.AppendOld(parityAd(1)); err != nil {
 			t.Fatal(err)
 		}
-		got := mustDiag(t, func() ([]byte, error) { return s.archiveDiagJSON(arch) })
+		got := mustDiag(t, func() ([]byte, error) { return s.archiveDiagJSON(arch, true) })
 		if got.EncryptionEnabled != keyed {
 			t.Errorf("pool keys %v: archive reports encryption at rest %v", keyed, got.EncryptionEnabled)
 		}

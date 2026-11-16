@@ -948,6 +948,11 @@ func (db *DB) HotAttrs() []string { return db.c.HotAttrNames() }
 // so its .stats could not report the on-disk footprint an archive's could.
 func (db *DB) SidecarSizes() SidecarSizes { return db.c.SidecarSizes() }
 
+// SidecarBytes reports the sidecar count and mapped bytes without the MPH/bloom breakdown, for a
+// caller that prints only the on-disk total. See collections.Collection.SidecarBytes for the cost
+// difference, which is large on an archive with thousands of sealed segments.
+func (db *DB) SidecarBytes() (segments int, mappedBytes int64) { return db.c.SidecarBytes() }
+
 // StaleIndexSegments reports how many sealed segments still carry an index built under an older
 // configuration, and how many are sealed in total, matching ArchiveTable.StaleIndexSegments.
 func (db *DB) StaleIndexSegments() (stale, sealed int) { return db.c.StaleIndexSegments() }

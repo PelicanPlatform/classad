@@ -42,7 +42,7 @@ const (
 	opAggregate op = 15
 
 	// Diagnostics and index/hot-set management. Each carries a leading [table].
-	opDiag    op = 16 // [table] -> [json Diagnostics] (storage stats, hot attrs, indexes, suggestions)
+	opDiag    op = 16 // [table][flags? u32] -> [json Diagnostics] (storage stats, hot attrs, indexes, suggestions)
 	opExplain op = 17 // [table][constraint] -> [json db.QueryExplain] (query access path)
 	opAdmin   op = 18 // [table][action][nArgs i32]{[arg]} -> [message]; mutating (refused read-only)
 
