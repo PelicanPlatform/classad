@@ -2,6 +2,8 @@ package collections
 
 import (
 	"bytes"
+	"cmp"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -244,6 +246,16 @@ func (w *txnWrite) hdrFlags() uint32 {
 // series. See Txn.Commit.
 func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 	acq, held := sh.lockWrite()
+	changed, seq = sh.applyTxnLocked(ws)
+	sh.unlockWrite(acq, held)
+	return changed, seq
+}
+
+// applyTxnLocked is applyTxn's body with the shard write lock ALREADY HELD. The lock
+// acquisition was factored out so an all-or-nothing commit (Txn.SetAtomic) can hold several
+// shards' locks at once across its check and apply passes; nothing else about the default
+// path changed, and it still takes and drops exactly one lock for exactly this body.
+func (sh *shard) applyTxnLocked(ws []*txnWrite) (changed bool, seq uint64) {
 	seq = sh.commitSeq + 1
 	// Single-writer fast path: all of a shard's buffered writes share one snapshot
 	// (ws[0].base). If no one has committed to this shard since -- commitSeq is still
@@ -260,32 +272,82 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 			}
 		}
 		w.ok = true
-		if w.del {
-			if removed, _ := sh.del(w.hash, w.key, seq, w.codec); removed {
-				changed = true
-			}
-			continue
+		if sh.applyOneLocked(w, seq) {
+			changed = true
 		}
-		sh.put(w.hash, w.key, w.ad, seq, w.codec, w.hdrFlags(), w.ct)
-		changed = true
 	}
 	if changed {
-		sh.commitSeq = seq
-		// Journal the deletes under the same lock that advances commitSeq: a watcher that
-		// snapshots a commitSeq covering them must find them in the journal (see watchAs).
-		// They are journaled here rather than at publish, which runs after unlock and sync.
-		if sh.delLog != nil {
-			for _, w := range ws {
-				if w.ok && w.del {
-					sh.journalDeleteLocked(w.key, seq)
-				}
+		sh.finishApplyLocked(ws, seq)
+	}
+	return changed, seq
+}
+
+// conflictPassLocked is the CHECK half of an all-or-nothing commit: it tests every write
+// against its snapshot and returns the ones that lost a write-write race, applying nothing.
+// The caller holds the shard write lock and keeps holding it through the matching apply pass,
+// so no committer can slip between the two.
+//
+// The single-writer fast path short-circuits exactly as it does in applyTxnLocked, and for the
+// same reason: commitSeq still being the writes' snapshot proves no key in this shard can have
+// changed, so there is nothing to check. An atomic commit on an uncontended shard therefore
+// pays no per-key conflict check either.
+func (sh *shard) conflictPassLocked(ws []*txnWrite) []*txnWrite {
+	if len(ws) == 0 || sh.commitSeq == ws[0].base {
+		return nil
+	}
+	var bad []*txnWrite
+	for _, w := range ws {
+		conflictCheckCount.Add(1)
+		if sh.conflictSince(w.hash, w.key, w.base) {
+			bad = append(bad, w)
+		}
+	}
+	return bad
+}
+
+// applyCheckedLocked is the APPLY half: it applies writes conflictPassLocked already cleared,
+// under the same uninterrupted hold of the write lock. It performs no conflict check of its
+// own -- the check pass is the only thing that decides -- so every write is marked ok.
+func (sh *shard) applyCheckedLocked(ws []*txnWrite) (changed bool, seq uint64) {
+	seq = sh.commitSeq + 1
+	for _, w := range ws {
+		w.ok = true
+		if sh.applyOneLocked(w, seq) {
+			changed = true
+		}
+	}
+	if changed {
+		sh.finishApplyLocked(ws, seq)
+	}
+	return changed, seq
+}
+
+// applyOneLocked writes one cleared write and reports whether the shard changed.
+func (sh *shard) applyOneLocked(w *txnWrite, seq uint64) bool {
+	if w.del {
+		removed, _ := sh.del(w.hash, w.key, seq, w.codec)
+		return removed
+	}
+	sh.put(w.hash, w.key, w.ad, seq, w.codec, w.hdrFlags(), w.ct)
+	return true
+}
+
+// finishApplyLocked advances the commit sequence and does the bookkeeping that must happen
+// under the same lock as the mutations themselves.
+func (sh *shard) finishApplyLocked(ws []*txnWrite, seq uint64) {
+	sh.commitSeq = seq
+	// Journal the deletes under the same lock that advances commitSeq: a watcher that
+	// snapshots a commitSeq covering them must find them in the journal (see watchAs).
+	// They are journaled here rather than at publish, which runs after unlock and sync.
+	if sh.delLog != nil {
+		for _, w := range ws {
+			if w.ok && w.del {
+				sh.journalDeleteLocked(w.key, seq)
 			}
 		}
-		sh.trackPublishLocked(seq)
-		sh.maybeCheckpoint(seq)
 	}
-	sh.unlockWrite(acq, held)
-	return changed, seq
+	sh.trackPublishLocked(seq)
+	sh.maybeCheckpoint(seq)
 }
 
 // publishTxn notifies the watch hub of a committed batch. It must run only after the batch
@@ -335,6 +397,9 @@ type Txn struct {
 	snap    map[int]uint64     // shard index -> snapshot seq, captured lazily on first touch
 	writes  map[string]*txnBuf // buffered writes by key (last write wins within the txn)
 	durable bool               // Commit runs the durability sync (default true)
+	// allOrNothing makes Commit atomic across every key it touches (Txn.SetAtomic).
+	// Off by default: the default commit applies each key independently.
+	allOrNothing bool
 	// redact is this transaction's entitlement to sealed values: a redacted transaction reads with no
 	// key, so a sealed attribute comes back undefined (see Collection.QueryRedacted). Set once at Begin
 	// and never changed, so every read through the transaction inherits it -- a per-read flag would let
@@ -409,6 +474,10 @@ func (b *txnBuf) materialize() (*classad.ClassAd, bool) {
 // write lost a write-write race and were not applied; the caller may re-read and
 // retry just those. The other buffered writes committed.
 //
+// Under Txn.SetAtomic(true) the batch is all-or-nothing instead: Committed is either the
+// whole batch or 0, and on an abort Conflicts names every key that conflicted (nothing was
+// applied, so there is nothing else to report).
+//
 // Unapplied is the OTHER kind of not-applied, and the distinction is the point: those writes
 // could not be composed at all, and re-applying the identical write cannot change that. A patch
 // whose stored base is unreadable is one case -- the key is present but the record behind it will
@@ -470,6 +539,67 @@ func (c *Collection) BeginRedacted() *Txn {
 // CommitNondurableTransaction batching. No effect on an in-memory collection, whose
 // sync is already a no-op.
 func (tx *Txn) SetDurable(d bool) { tx.durable = d }
+
+// SetAtomic makes this transaction commit all-or-nothing (default false).
+//
+// OFF (the default, and what every existing caller gets) Commit applies each buffered write
+// independently: the writes whose keys are unchanged since the snapshot commit, and the ones
+// that lost a write-write race are reported in CommitResult.Conflicts and simply not applied.
+// Callers depend on that -- a mirror's retry loop re-reads just the conflicting keys, and a
+// bulk loader wants the progress -- so it is deliberately unchanged.
+//
+// ON Commit is atomic over every key it touches, across shards: either every buffered write is
+// applied or none is. It acquires the write locks of all touched shards in ascending shard order
+// (which is what keeps two concurrent atomic commits from deadlocking against each other),
+// checks every key for a write-write conflict while holding them all, and only then applies --
+// so no committer can interleave between the check and the apply. On an abort nothing is
+// written: no record, no delete, no watch event, no ordered-index change, and the shards'
+// commit sequences do not move.
+//
+// An aborted commit reports Committed == 0 and names in Conflicts EVERY key that conflicted,
+// not just the first one found -- the check pass runs to the end across all shards so a caller
+// can refresh its whole working set in one go rather than rediscovering the conflicts one
+// commit at a time. (A shard on the single-writer fast path hides nothing: its commit sequence
+// still being the transaction's snapshot is proof that none of its keys changed.)
+//
+// An UNAPPLIED write -- one that can never succeed, such as a patch whose stored base is
+// unreadable or a value too deeply nested to store -- also aborts an atomic commit, and is
+// reported in Unapplied, never in Conflicts. Applying the rest of the batch while quietly
+// dropping that one write is precisely the partial application atomic mode exists to prevent,
+// so the whole commit is refused. Keeping it out of Conflicts matters just as much: a caller
+// that retries conflicts would otherwise loop on a write that cannot ever be applied. With an
+// empty Conflicts and a populated Unapplied, a retry loop can tell "try again" from "this will
+// never work" and make progress.
+//
+// Durability is unchanged: the sync runs after the apply, exactly as it does for a default
+// commit, so a crash part-way through the apply phase needs no new recovery story -- unsynced
+// records are the case existing recovery already handles (see horizon.go).
+//
+// Which also bounds the guarantee. It is atomicity of APPLICATION: nothing is applied until
+// every key has been checked, and the touched shards' commit sequences move together while
+// this commit holds all their locks, so no watcher or ordered index ever sees part of a batch
+// and a reader within ONE shard cannot see one either -- a shard's snapshot is a single
+// sequence. A reader spanning two shards is a separate matter: Txn captures its snapshot
+// lazily, per shard, on first touch (snapOf), so such a reader takes its snapshots at two
+// different instants and can straddle any commit at all. That predates this mode and is not
+// something an atomic commit can fix from the write side; nothing here makes cross-shard reads
+// consistent.
+//
+// It is also NOT crash atomicity across keys. A commit that has not yet synced is recovered per
+// key -- horizon.go says so in as many words -- and even once the sync starts, a
+// multi-shard commit syncs its shards in parallel, so a crash during that phase can leave one
+// shard's half durable and another's not. Only a commit whose Commit has RETURNED is durable
+// as a whole. Anyone who needs all-or-nothing across a crash needs a different mechanism than
+// this one; what this gives is all-or-nothing against concurrent writers.
+//
+// The cost is that the commit holds several shard write locks at once for the length of the
+// check and apply passes, which blocks writers to those shards for longer than the default
+// path's one-lock-at-a-time. That is the price of the guarantee; leave it off when you do not
+// need it.
+func (tx *Txn) SetAtomic(a bool) { tx.allOrNothing = a }
+
+// Atomic reports whether this transaction commits all-or-nothing.
+func (tx *Txn) Atomic() bool { return tx.allOrNothing }
 
 // snapOf returns the transaction's snapshot sequence for the shard holding a key,
 // capturing it (the shard's current commit sequence) on first touch.
@@ -695,11 +825,76 @@ func (tx *Txn) refusedSealedWrite(h uint64) {
 	}
 }
 
+// shardCommit is one shard's slice of a transaction: the writes bound for it and, once
+// applied, the sequence they committed at and whether the shard actually changed.
+type shardCommit struct {
+	idx     int
+	ws      []*txnWrite
+	seq     uint64
+	changed bool
+}
+
+// applyAtomic is the all-or-nothing phase 1 (Txn.SetAtomic). commits MUST already be sorted by
+// ascending shard index: that is the lock order, and it is the only thing standing between two
+// concurrent atomic commits over the same pair of shards and a deadlock.
+//
+// It takes every touched shard's write lock, runs the conflict check across ALL of them, and
+// then either applies every write or none. Holding all the locks across both passes is the
+// whole point -- with the locks taken one at a time, as the default path takes them, a
+// committer could land between this commit's check of shard 3 and its apply of shard 7.
+//
+// It returns the conflicting keys (every one of them, across every shard), or nil when the
+// commit applied. On a conflict no write is marked ok, so nothing downstream -- publish,
+// ordered index, delete journal -- sees the batch at all.
+func (tx *Txn) applyAtomic(commits []shardCommit) [][]byte {
+	type heldLock struct{ acq, held time.Time }
+	locks := make([]heldLock, len(commits))
+	for i := range commits {
+		acq, held := tx.c.shards[commits[i].idx].lockWrite()
+		locks[i] = heldLock{acq, held}
+	}
+	// Unlock in reverse acquisition order. Release order does not affect correctness here --
+	// no deadlock can form while releasing -- but it keeps the nesting obvious.
+	defer func() {
+		for i := len(commits) - 1; i >= 0; i-- {
+			tx.c.shards[commits[i].idx].unlockWrite(locks[i].acq, locks[i].held)
+		}
+	}()
+
+	// Check pass. It runs to the end even after the first conflict, so Conflicts names the
+	// caller's whole conflicting working set rather than one key per attempt.
+	var conflicts [][]byte
+	for i := range commits {
+		for _, w := range tx.c.shards[commits[i].idx].conflictPassLocked(commits[i].ws) {
+			conflicts = append(conflicts, w.key)
+		}
+	}
+	if len(conflicts) > 0 {
+		// Mark everything not-ok explicitly rather than relying on the zero value, so a write
+		// is never left ambiguous for a reader of this slice.
+		for i := range commits {
+			for _, w := range commits[i].ws {
+				w.ok = false
+			}
+		}
+		return conflicts
+	}
+
+	// Apply pass, same uninterrupted hold of the same locks.
+	for i := range commits {
+		commits[i].changed, commits[i].seq = tx.c.shards[commits[i].idx].applyCheckedLocked(commits[i].ws)
+	}
+	return nil
+}
+
 // Commit applies the buffered writes, each independently: a write whose key is
 // unchanged since the transaction's snapshot commits; one whose key was modified by
 // another committer is reported in CommitResult.Conflicts and not applied (the
 // successful writes are not rolled back). The transaction must not be used after
 // Commit.
+//
+// Txn.SetAtomic(true) makes the batch all-or-nothing instead -- every buffered write or none,
+// across every shard it touches. See SetAtomic for the guarantee and what it reports.
 func (tx *Txn) Commit() CommitResult {
 	// Collapsing sealed delta chains happens on the way OUT of a commit: the seal that
 	// triggers it occurs under a shard write lock deep inside this call, and collapsing means
@@ -781,16 +976,33 @@ func (tx *Txn) Commit() CommitResult {
 		byShard[idx] = append(byShard[idx], w)
 	}
 	// Phase 1: apply each touched shard's writes under its own lock (fast; disjoint locks).
-	type shardCommit struct {
-		idx     int
-		ws      []*txnWrite
-		seq     uint64
-		changed bool
-	}
 	commits := make([]shardCommit, 0, len(byShard))
-	for idx, ws := range byShard {
-		changed, seq := tx.c.shards[idx].applyTxn(ws)
-		commits = append(commits, shardCommit{idx, ws, seq, changed})
+	// aborted/atomicConflicts are set only by the all-or-nothing path; see SetAtomic.
+	var aborted bool
+	var atomicConflicts [][]byte
+	if !tx.allOrNothing {
+		for idx, ws := range byShard {
+			changed, seq := tx.c.shards[idx].applyTxn(ws)
+			commits = append(commits, shardCommit{idx, ws, seq, changed})
+		}
+	} else {
+		for idx, ws := range byShard {
+			commits = append(commits, shardCommit{idx: idx, ws: ws})
+		}
+		// Ascending shard index, always. Two concurrent atomic commits that both need shards
+		// 3 and 7 therefore queue behind each other on 3 rather than each holding one and
+		// waiting on the other; the order has to be total and the same for everyone, and the
+		// shard index is the only such order available here.
+		slices.SortFunc(commits, func(a, b shardCommit) int { return cmp.Compare(a.idx, b.idx) })
+		if len(unreadable) > 0 {
+			// A write that can never be applied aborts the whole batch: see SetAtomic. Nothing
+			// is locked and nothing is written. The buffered writes other than the unapplied
+			// ones are not reported -- Committed is 0 and they simply did not happen.
+			aborted = true
+		} else {
+			atomicConflicts = tx.applyAtomic(commits)
+			aborted = len(atomicConflicts) > 0
+		}
 	}
 
 	// Phase 2: sync the changed shards CONCURRENTLY. The durability msync is a commit's
@@ -836,6 +1048,14 @@ func (tx *Txn) Commit() CommitResult {
 	res.Unapplied = append(res.Unapplied, unreadable...)
 	res.UnappliedReasons = append(res.UnappliedReasons, unreadableWhy...)
 	res.UnappliedErrs = append(res.UnappliedErrs, unreadableErr...)
+	if aborted {
+		// Nothing was applied, so there is nothing to publish and no ordered index to
+		// maintain -- both are driven off the per-write ok flag and the per-shard changed
+		// flag, and neither is set. Conflicts names only the keys that actually conflicted,
+		// not every key the aborted batch happened to buffer.
+		res.Conflicts = append(res.Conflicts, atomicConflicts...)
+		return res
+	}
 	for _, c := range commits {
 		if c.changed {
 			tx.c.shards[c.idx].publishTxn(tx.c, c.ws, c.seq)
