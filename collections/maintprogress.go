@@ -117,6 +117,10 @@ func (c *Collection) beginMaint(phase MaintPhase, total int) *maintPass {
 	// them. The check is rate-limited (dictVerifyInterval), so hooking the frequent
 	// passes costs no more than hooking the rare ones.
 	c.maybeVerifyDictFiles()
+	// After the file check, not before: a dictionary whose file had vanished is rewritten
+	// first, so the census copies a dictionary that is on disk rather than one that is
+	// about to be found missing.
+	c.maybeEnsureDictReplicas()
 	now := time.Now()
 	m := &maintPass{
 		c:     c,

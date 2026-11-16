@@ -1249,3 +1249,7 @@ func (a *Archive) ScanColumnsRedacted(q *vm.Query, attrs []string, fn func(*Batc
 // loaded, rewrites any whose directory entry has gone, and reports what it found. An empty
 // result is the healthy answer. See Collection.VerifyDictFiles.
 func (a *Archive) VerifyDictFiles() []DictFault { return a.c.VerifyDictFiles() }
+
+// EnsureDictReplicas brings every compression dictionary's copy count in segment trailers
+// up to the target and reports where each one stands. See Collection.EnsureDictReplicas.
+func (a *Archive) EnsureDictReplicas() []DictReplicaState { return a.c.EnsureDictReplicas() }

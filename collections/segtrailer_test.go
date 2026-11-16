@@ -36,12 +36,17 @@ func standInDict(id byte) []byte {
 // sealed segment of that size needs enough records to fill one.
 func buildCarrierStore(t *testing.T) string {
 	t.Helper()
+	return buildCarrierStoreShards(t, 1)
+}
+
+func buildCarrierStoreShards(t *testing.T, shards int) string {
+	t.Helper()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
 	sample := loadCorpus(t)
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20})
+	c, err := Open(Options{Dir: dir, Shards: shards, SegmentSize: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,11 +57,11 @@ func buildCarrierStore(t *testing.T) string {
 			}
 		}
 	}
-	put(0, 900)
+	put(0, 900*shards)
 	if _, err := c.RetrainDict(1500); err != nil {
 		t.Skipf("dictionary training unavailable: %v", err)
 	}
-	put(900, 3000)
+	put(900*shards, 3000*shards)
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -656,6 +656,8 @@ type Collection struct {
 	// lastDictVerify is when the dictionary files were last checked, in unix nanos, so
 	// maintenance passes share one check per dictVerifyInterval rather than one each.
 	lastDictVerify atomic.Int64
+	// lastDictReplica is when the dictionary replica census last ran, paced the same way.
+	lastDictReplica atomic.Int64
 	// maxBytesHint mirrors Retention.MaxBytes for the seal-time check, which runs on the
 	// APPENDING goroutine. Reading it through Retention() takes maintMu, which a retrain or
 	// a merge holds for minutes -- so every seal would stall behind a maintenance pass just
