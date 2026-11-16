@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -96,11 +97,11 @@ func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
 // dereferenced, never Closed: an in-flight scan may still be decompressing through one
 // (its pinned segment holds the codec reference), so the GC reclaims each codec when
 // its last user finishes.
-func (r *dictReg) prune(keep func(Codec) bool) []uint32 {
+func (r *dictReg) prune(keep func(id uint32, c Codec) bool) []uint32 {
 	r.mu.Lock()
 	var removed []uint32
 	for id, c := range r.byID {
-		if id == 0 || keep(c) {
+		if id == 0 || keep(id, c) {
 			continue
 		}
 		delete(r.byID, id)
@@ -137,6 +138,182 @@ func (r *dictReg) releaseEncodersExcept(keep Codec) {
 	for _, c := range codecs {
 		if z, ok := c.(*zstdCodec); ok {
 			z.releaseEncoder()
+		}
+	}
+}
+
+// ErrMissingDictionaries is returned by Open when segment files name compression
+// dictionaries the store cannot supply. It is a distinct error because the operator
+// action is distinct: the dictionaries have to be restored (dicts/attic/, a backup, the
+// filesystem), and nothing a restart or a repair does will help.
+//
+// Opening anyway is not an option worth offering by default. The records are intact and a
+// restored dictionary brings every one of them back, so the damage is recoverable right
+// up until something writes to the store believing those segments are gone.
+var ErrMissingDictionaries = errors.New("collections: segment files name dictionaries this store does not have")
+
+// MissingDictionaryError says which dictionaries are missing and names a segment that
+// needs each, so the message is actionable without a second investigation.
+type MissingDictionaryError struct {
+	// IDs are the missing dictionary ids, ascending.
+	IDs []uint32
+	// Example maps each id to one segment file naming it; there are usually many.
+	Example map[uint32]string
+	// Segments counts the segment files that cannot be decoded in total.
+	Segments int
+}
+
+func (e *MissingDictionaryError) Error() string {
+	parts := make([]string, 0, len(e.IDs))
+	for _, id := range e.IDs {
+		parts = append(parts, fmt.Sprintf("%d (e.g. %s)", id, filepath.Base(e.Example[id])))
+	}
+	return fmt.Sprintf("%v: missing dicts/%s.zst, needed by %d segment file(s): %s",
+		ErrMissingDictionaries, plural(e.IDs), e.Segments, strings.Join(parts, ", "))
+}
+
+func (e *MissingDictionaryError) Unwrap() error { return ErrMissingDictionaries }
+
+// plural renders an id list for the error message: "7" for one, "{6,7,9}" for several.
+func plural(ids []uint32) string {
+	if len(ids) == 1 {
+		return fmt.Sprintf("%d", ids[0])
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("%d", id))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// recoveredSegmentDictID returns the dictionary id of a file recovery will actually LOAD,
+// mirroring loadShard's rule exactly: the name must end in ".dat" and match
+// "seg-<n>.d<dict>.dat". Anything else is a stray loadShard ignores.
+//
+// This is deliberately STRICTER than dictIDFromSegmentName, and the asymmetry is the
+// point. Keeping a dictionary is generous -- any file that looks like it might need one
+// protects it, because the cost of being wrong is tens of KB. REFUSING TO OPEN is not: a
+// store with a stray .dat naming a pruned dictionary opens today and must keep opening,
+// since recovery never looked at that file and nothing is lost by its absence. Refusing
+// on it would turn a harmless leftover into a daemon that will not start.
+func recoveredSegmentDictID(name string) (uint32, bool) {
+	if !strings.HasSuffix(name, ".dat") {
+		return 0, false
+	}
+	var n uint64
+	var dictID uint32
+	if _, err := fmt.Sscanf(name, "seg-%d.d%d.dat", &n, &dictID); err != nil {
+		return 0, false
+	}
+	return dictID, true
+}
+
+// verifyDictCoverage reports whether every dictionary named by a segment file recovery
+// will load is registered. It runs before any segment is mapped, so a store that cannot be
+// fully read is refused whole rather than discovered half-open.
+//
+// It reads the shard directories by number, exactly as Open does, so the dicts directory
+// and quarantine/ are not among them. Id 0 is the base codec, reconstructed from Options
+// and never a file. A shard directory that cannot be read is left to loadShard, which
+// reports it properly.
+func verifyDictCoverage(dir string, shards int, reg *dictReg) error {
+	named := map[uint32]string{}
+	count := 0
+	for i := 0; i < shards; i++ {
+		shardDir := filepath.Join(dir, fmt.Sprintf("%d", i))
+		entries, err := os.ReadDir(shardDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			id, ok := recoveredSegmentDictID(e.Name())
+			if !ok || id == 0 {
+				continue
+			}
+			if _, have := reg.codecFor(id); have {
+				continue
+			}
+			count++
+			if _, seen := named[id]; !seen {
+				named[id] = filepath.Join(shardDir, e.Name())
+			}
+		}
+	}
+	if len(named) == 0 {
+		return nil
+	}
+	ids := make([]uint32, 0, len(named))
+	for id := range named {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+	return &MissingDictionaryError{IDs: ids, Example: named, Segments: count}
+}
+
+// dictsDirRecreated counts how many times a dictionary write had to recreate the dicts
+// directory because it had gone missing under a running store.
+var dictsDirRecreated atomic.Int64
+
+// DictsDirRecreated reports how many times, since the process started, persisting a
+// dictionary found its directory gone and recreated it.
+//
+// It is never expected to be non-zero. Nothing in this package removes that directory, so
+// a non-zero count means something outside the process did -- and every dictionary that
+// was in it is gone with it, including dicts/attic/, which lives inside it. The store
+// keeps working on the codecs it already holds in memory and fails at the NEXT open, so
+// this counter is the only warning available in between. A daemon should surface it.
+func DictsDirRecreated() int64 { return dictsDirRecreated.Load() }
+
+// dictIDFromSegmentName returns the dictionary id encoded in a segment file name, which is
+// the ONLY place that id is recorded -- the segment's bytes do not carry it.
+//
+// It deliberately accepts any prefix, not just "seg". Rewrites in flight (compaction,
+// merge, reseal) stage their output under other prefixes, and a file left behind by one
+// that was interrupted still needs its dictionary to be read. Matching loosely keeps a
+// dictionary alive that nothing needs; matching strictly destroys one that something does.
+func dictIDFromSegmentName(name string) (uint32, bool) {
+	base, ok := strings.CutSuffix(name, ".dat")
+	if !ok {
+		return 0, false
+	}
+	i := strings.LastIndex(base, ".d")
+	if i < 0 {
+		return 0, false
+	}
+	digits := base[i+2:]
+	if digits == "" {
+		return 0, false
+	}
+	var id uint64
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		id = id*10 + uint64(r-'0')
+		if id > math.MaxUint32 {
+			return 0, false
+		}
+	}
+	return uint32(id), true
+}
+
+// collectSegmentDictIDs adds to into every dictionary id named by a segment file in
+// shardDir. An unreadable directory contributes nothing, which leaves the caller with the
+// in-memory answer it had before.
+func collectSegmentDictIDs(shardDir string, into map[uint32]bool) {
+	entries, err := os.ReadDir(shardDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if id, ok := dictIDFromSegmentName(e.Name()); ok {
+			into[id] = true
 		}
 	}
 }
@@ -179,6 +356,9 @@ func writeDictFile(path string, dict []byte) error {
 	// Recreate the dicts directory if it went missing at runtime. It is created at
 	// Open, but a retrain must not fail with ENOENT (open ".../dicts/N.zst: no such
 	// file or directory") just because the directory disappeared underneath us.
+	if _, statErr := os.Stat(filepath.Dir(path)); statErr != nil {
+		dictsDirRecreated.Add(1)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -308,6 +488,15 @@ func Open(opts Options) (*Collection, error) {
 		return nil, fmt.Errorf("load dictionaries: %w", err)
 	}
 	c.openIdxDiag.Timing.LoadDicts = time.Since(dictStart)
+	// Every dictionary a segment FILE names must be registered before anything is mapped.
+	// Nothing else holds those bytes -- not the segments, not the sidecars, and not a
+	// snapshot, which stores logical ads and so needs the dictionaries rather than
+	// preserving them -- so a store missing one cannot be served and must not be written
+	// to. Checking here, against the file names, reports every missing id at once instead
+	// of failing at whichever segment recovery reached first.
+	if coverErr := verifyDictCoverage(opts.Dir, len(c.shards), c.dicts); coverErr != nil {
+		return nil, coverErr
+	}
 	if latest != 0 {
 		if codec, ok := c.dicts.codecFor(latest); ok {
 			c.codec.Store(&codecHolder{codec})

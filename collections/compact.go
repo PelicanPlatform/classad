@@ -435,12 +435,24 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	return len(dict), nil
 }
 
-// pruneDicts drops registered dictionaries that no live segment references (keeping the
-// current write codec), unlinking their on-disk .zst files. Called after a retrain's
+// pruneDicts retires registered dictionaries that nothing references (keeping the current
+// write codec), moving their .zst files to dicts/attic/. Called after a retrain's
 // recompaction (which retires old-codec segments en masse) and at Open (loadDicts loads
 // the full on-disk history; recovery then references only the ids live segments carry).
+//
+// "Nothing references it" is asked of the segment FILES as well as of the mapped segments.
+// A segment's dictionary id is recorded only in its file name, so a file this process did
+// not map -- recovery declined it, a rewrite left it staged, a reap is deferred behind a
+// pin -- is invisible to the in-memory answer, and retiring its dictionary is what makes
+// the store unopenable: the id is unregistered at the next start and recovery fails with
+// "references unknown dictionary N".
+//
+// The directory read is cheap beside the passes this follows, and erring toward keeping a
+// dictionary costs tens of KB while erring the other way costs every record in every
+// segment that names it.
 func (c *Collection) pruneDicts() {
 	live := map[Codec]bool{c.currentCodec(): true}
+	onDisk := map[uint32]bool{}
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		for _, seg := range sh.segs {
@@ -448,9 +460,13 @@ func (c *Collection) pruneDicts() {
 				live[seg.codec] = true
 			}
 		}
+		segDir := sh.segDir // immutable after Open; the readdir runs off the lock
 		sh.mu.RUnlock()
+		if segDir != "" {
+			collectSegmentDictIDs(segDir, onDisk)
+		}
 	}
-	c.dicts.prune(func(cd Codec) bool { return live[cd] })
+	c.dicts.prune(func(id uint32, cd Codec) bool { return live[cd] || onDisk[id] })
 }
 
 // reindexAfterCompaction rebuilds the segment indexes after compaction replaced the
