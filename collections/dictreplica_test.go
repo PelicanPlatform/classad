@@ -294,65 +294,6 @@ func TestMaintenanceRunsTheReplicaCensus(t *testing.T) {
 	}
 }
 
-// TestDictionaryIsRecoverableFromASegment is the point of the whole mechanism: with
-// dicts/ gone, the dictionary is still inside the segments that need it.
-func TestDictionaryIsRecoverableFromASegment(t *testing.T) {
-	dir := buildCarrierStore(t)
-	func() {
-		c := openCarrier(t, dir, 1)
-		c.EnsureDictReplicas()
-		if err := c.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	dicts := filepath.Join(dir, "dicts")
-	want, err := os.ReadFile(filepath.Join(dicts, "1.zst"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rerr := os.RemoveAll(dicts); rerr != nil { // the whole directory, as it went in production
-		t.Fatal(rerr)
-	}
-	if _, oerr := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20}); oerr == nil {
-		t.Fatal("control: the store opened with no dictionaries at all")
-	}
-
-	// Find a copy the way a recovery pass would: ask the segments.
-	var found []byte
-	for _, name := range trailerCarriers(t, dir, 1, 1) {
-		tr, ok := readSegTrailerFile(filepath.Join(dir, "0", name))
-		if !ok {
-			continue
-		}
-		if b, has := tr.dictReplica(1); has {
-			found = append([]byte(nil), b...)
-			break
-		}
-	}
-	if found == nil {
-		t.Fatal("no segment carried a copy of the dictionary")
-	}
-	if !bytes.Equal(found, want) {
-		t.Fatal("the copy is not the dictionary")
-	}
-
-	if mkErr := os.MkdirAll(dicts, 0o755); mkErr != nil {
-		t.Fatal(mkErr)
-	}
-	if werr := os.WriteFile(filepath.Join(dicts, "1.zst"), found, 0o644); werr != nil {
-		t.Fatal(werr)
-	}
-	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20})
-	if err != nil {
-		t.Fatalf("the store did not open on the recovered dictionary: %v", err)
-	}
-	defer c.Close()
-	if n := c.Len(); n == 0 {
-		t.Error("no records came back")
-	}
-}
-
 // TestEnsureDictReplicasReportsAStoreWithNowhereToPutACopy: a young archive whose only
 // segment is the one still being appended to has no carrier at all. The census must say
 // the level is unmet rather than report a clean pass over nothing -- this is the state a

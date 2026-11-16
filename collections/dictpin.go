@@ -85,12 +85,18 @@ type DictFault struct {
 	// records were never at risk while this process lived; the next one would have lost
 	// them.
 	Repaired bool
+	// From is the segment file a repaired copy came out of, when the dictionary was not
+	// rewritten from the open descriptor but found in a segment trailer at Open. Empty
+	// otherwise.
+	From string
 	// Err is why a repair was not possible, or why the check itself could not finish.
 	Err error
 }
 
 func (f *DictFault) Error() string {
 	switch {
+	case f.Kind == DictFaultMissing && f.Repaired && f.From != "":
+		return fmt.Sprintf("collections: dictionary file %s was missing and was restored from the copy in %s; the primary copy was lost while this store was not running", f.Path, f.From)
 	case f.Kind == DictFaultMissing && f.Repaired:
 		return fmt.Sprintf("collections: dictionary file %s had been removed and was rewritten from the open descriptor; something outside this process is deleting dictionaries", f.Path)
 	case f.Kind == DictFaultMissing:

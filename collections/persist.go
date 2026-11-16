@@ -116,6 +116,23 @@ func (r *dictReg) register(dict []byte, build func(dict []byte) (Codec, error)) 
 	return id, codec, nil
 }
 
+// install registers a codec under a dictionary id that is already decided -- recovery
+// reading dicts/, or a copy restored from a segment trailer -- rather than assigning a new
+// one the way register does. pin may be nil when the file could not be held open, which
+// costs the later file check and nothing else.
+func (r *dictReg) install(id uint32, codec Codec, pin *dictPin) {
+	if pin != nil {
+		r.setPin(id, pin)
+	}
+	r.mu.Lock()
+	r.byID[id] = codec
+	r.idOf[codec] = id
+	if id >= r.next {
+		r.next = id + 1
+	}
+	r.mu.Unlock()
+}
+
 // prune removes every registered dictionary except id 0 (the base codec) and those
 // keep returns true for, unlinking each removed id's on-disk .zst. Without pruning the
 // registry grows by one codec per retrain FOREVER -- each an un-Closed zstd
@@ -471,14 +488,7 @@ func (c *Collection) loadDicts(dictsDir string) (latest uint32, err error) {
 			pin.close()
 			return 0, fmt.Errorf("rebuild codec for dict %d: %w", id, err)
 		}
-		c.dicts.setPin(id, pin)
-		c.dicts.mu.Lock()
-		c.dicts.byID[id] = codec
-		c.dicts.idOf[codec] = id
-		if id >= c.dicts.next {
-			c.dicts.next = id + 1
-		}
-		c.dicts.mu.Unlock()
+		c.dicts.install(id, codec, pin)
 		if id > latest {
 			latest = id
 		}
@@ -562,7 +572,17 @@ func Open(opts Options) (*Collection, error) {
 	// to. Checking here, against the file names, reports every missing id at once instead
 	// of failing at whichever segment recovery reached first.
 	if coverErr := verifyDictCoverage(opts.Dir, len(c.shards), c.dicts); coverErr != nil {
-		return nil, coverErr
+		// Before refusing, ask the segments. Copies of each dictionary ride in segment
+		// trailers precisely so that losing dicts/ is survivable, and a copy restored here
+		// is the dictionary -- it names its own id and a codec is built from it before
+		// anything is written. Only what cannot be found this way is fatal.
+		var mde *MissingDictionaryError
+		if errors.As(coverErr, &mde) && c.restoreDictsFromSegments(opts.Dir, mde.IDs) > 0 {
+			coverErr = verifyDictCoverage(opts.Dir, len(c.shards), c.dicts)
+		}
+		if coverErr != nil {
+			return nil, coverErr
+		}
 	}
 	if latest != 0 {
 		if codec, ok := c.dicts.codecFor(latest); ok {

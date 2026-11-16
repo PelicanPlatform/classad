@@ -350,23 +350,26 @@ func TestDictReplicaIsReadableAndDecodesItsSegment(t *testing.T) {
 		t.Errorf("dictReplicaIDs = %v; want [1]", ids)
 	}
 
-	// The proof that matters: the store opens on the copy alone.
+	// The proof that matters: with the file gone the store still opens, because Open
+	// restores the copy itself (see dictrecover.go), and the file it writes back is the
+	// dictionary byte for byte.
 	if rmErr := os.Remove(path); rmErr != nil {
 		t.Fatal(rmErr)
 	}
-	if _, oerr := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20}); oerr == nil {
-		t.Fatal("control: the store opened without dictionary 1")
-	}
-	if werr := os.WriteFile(path, got, 0o644); werr != nil {
-		t.Fatal(werr)
-	}
 	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20})
 	if err != nil {
-		t.Fatalf("restoring the dictionary from the trailer did not make the store openable: %v", err)
+		t.Fatalf("the store did not open on the copy carried in its own segment: %v", err)
 	}
 	defer c.Close()
 	if n := c.Len(); n == 0 {
 		t.Error("no records came back")
+	}
+	back, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the dictionary was not written back: %v", err)
+	}
+	if !bytes.Equal(back, want) {
+		t.Error("what was written back is not the dictionary that was lost")
 	}
 }
 

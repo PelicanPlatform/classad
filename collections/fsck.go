@@ -182,6 +182,15 @@ type FsckReport struct {
 	// telling an operator to restore a dictionary that will not open is worse than
 	// saying nothing.
 	DictsInAttic []uint32
+	// DictsInSegments are missing dictionaries a copy of which is carried in a segment
+	// trailer. Those segments are recoverable too, and more cheaply than from the attic:
+	// Open restores such a copy by itself. A file here that does not load is not offered,
+	// for the same reason as the attic.
+	DictsInSegments []uint32
+	// DictReplicas counts, per dictionary id, how many segment trailers carry a copy. It
+	// is the answer to "how close is this store to losing a dictionary for good": a
+	// dictionary present in dicts/ and nowhere else is one deletion away.
+	DictReplicas map[uint32]int
 	// DictsDamaged are dictionary files that exist but cannot be used -- empty, truncated,
 	// or not a zstd dictionary at all. They are NOT in DictsPresent: a file that does not
 	// load is not a dictionary the store has, and Open fails on it exactly as it does on
@@ -365,7 +374,26 @@ func (r *FsckReport) String() string {
 	for _, d := range r.DictsDamaged {
 		fmt.Fprintf(&b, "  DAMAGED dictionary %d: %s -- %s\n", d.ID, d.Path, d.Why)
 	}
+	inSeg := make(map[uint32]bool, len(r.DictsInSegments))
+	for _, id := range r.DictsInSegments {
+		inSeg[id] = true
+	}
+	// Every dictionary the store HAS, not just those a copy was found for: a dictionary
+	// carried nowhere is the one worth saying something about, and it is absent from the
+	// replica map entirely.
+	for _, id := range r.DictsPresent {
+		if n := r.DictReplicas[id]; n < dictReplicaTarget {
+			fmt.Fprintf(&b, "  THIN dictionary %d: %d of %d segment copies -- "+
+				"losing dicts/%d.zst would take the segments naming it\n",
+				id, n, dictReplicaTarget, id)
+		}
+	}
 	for _, id := range r.DictsMissing {
+		if inSeg[id] {
+			fmt.Fprintf(&b, "  RECOVERABLE dictionary %d: a copy is carried in a segment -- "+
+				"reopening the store restores it\n", id)
+			continue
+		}
 		if attic[id] {
 			fmt.Fprintf(&b, "  RECOVERABLE dictionary %d: in dicts/attic/%d.zst -- "+
 				"move it back to dicts/ to read those segments\n", id, id)
@@ -452,12 +480,26 @@ func Fsck(dir string) (*FsckReport, error) {
 	for _, id := range inAttic {
 		retired[id] = true
 	}
+	// What the segments themselves carry. This is both the redundancy level for every
+	// dictionary and, for a missing one, a recovery that costs nothing to offer.
+	r.DictReplicas = countDictReplicas(dir)
+	inSegments := map[uint32]bool{}
+	if len(missing) > 0 {
+		for id, rep := range sweepDictReplicas(dir, countShardDirs(dir), missing) {
+			_ = rep
+			inSegments[id] = true
+		}
+	}
 	for id := range missing {
 		r.DictsMissing = append(r.DictsMissing, id)
 		if retired[id] {
 			r.DictsInAttic = append(r.DictsInAttic, id)
 		}
+		if inSegments[id] {
+			r.DictsInSegments = append(r.DictsInSegments, id)
+		}
 	}
+	sort.Slice(r.DictsInSegments, func(i, j int) bool { return r.DictsInSegments[i] < r.DictsInSegments[j] })
 	sort.Slice(r.DictsInAttic, func(i, j int) bool { return r.DictsInAttic[i] < r.DictsInAttic[j] })
 	sort.Slice(r.DictsMissing, func(i, j int) bool { return r.DictsMissing[i] < r.DictsMissing[j] })
 
