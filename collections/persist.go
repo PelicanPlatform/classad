@@ -559,9 +559,16 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 
 	// Segments are collected first and ordered afterwards by CONTENT (see below), so the
 	// id assigned here is provisional.
+	//
+	// firstSeq/hasSeq are that content key, read once here rather than in the comparator:
+	// a sort asks for a key O(n log n) times, and reading it from the mapping each time
+	// turns one pass over the segments into repeated scattered touches across all of them,
+	// which on a cold mmap is page faults rather than arithmetic.
 	type loadedSeg struct {
-		seg *segment
-		num uint64
+		seg      *segment
+		num      uint64
+		firstSeq uint64
+		hasSeq   bool
 	}
 	var loaded []loadedSeg
 
@@ -622,7 +629,9 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		}
 		seg.used = used
 		seg.synced = used
-		loaded = append(loaded, loadedSeg{seg, sf.num})
+		// Read the ordering key now, while this segment's pages are the ones in hand.
+		firstSeq, hasSeq := segFirstSeq(seg)
+		loaded = append(loaded, loadedSeg{seg: seg, num: sf.num, firstSeq: firstSeq, hasSeq: hasSeq})
 	}
 	// Order segments by their CONTENT -- the commit sequence of their first record -- rather
 	// than by the number in their file name.
@@ -636,18 +645,22 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// returning ancient ads, silently.
 	//
 	// The first record's seq is the first 8 bytes of the segment, so this costs one read per
-	// segment: no scan, no decompression, and no ordering metadata to keep in the file name
-	// or anywhere else that could disagree with the data.
-	sort.SliceStable(loaded, func(i, j int) bool {
-		si, iok := segFirstSeq(loaded[i].seg)
-		sj, jok := segFirstSeq(loaded[j].seg)
-		if iok != jok {
-			return iok // an empty segment carries no position; sort it last
+	// segment -- taken above, as the segment was mapped -- and no scan, no decompression, and
+	// no ordering metadata to keep in the file name or anywhere else that could disagree with
+	// the data.
+	//
+	// Not SliceStable: the num tiebreak is a total order already, since a shard cannot hold
+	// two segments with the same file number, so there are no equal elements for stability to
+	// preserve and the stable sort's extra comparisons buy nothing.
+	sort.Slice(loaded, func(i, j int) bool {
+		li, lj := &loaded[i], &loaded[j]
+		if li.hasSeq != lj.hasSeq {
+			return li.hasSeq // an empty segment carries no position; sort it last
 		}
-		if iok && si != sj {
-			return si < sj
+		if li.hasSeq && li.firstSeq != lj.firstSeq {
+			return li.firstSeq < lj.firstSeq
 		}
-		return loaded[i].num < loaded[j].num // deterministic tiebreak
+		return li.num < lj.num // deterministic tiebreak
 	})
 	for i := range loaded {
 		loaded[i].seg.id = uint32(i)
@@ -665,10 +678,10 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	dirStart := time.Now()
 	if sh.childParentHash != nil || c.timeTravel() != nil {
 		os.Remove(filepath.Join(shardDir, dirSnapName))
-		c.rebuildDir(sh)
+		c.rebuildDir(sh, shardDir)
 		tm.DirRebuilt = true
 	} else if !c.tryLoadDirSnapshot(sh, shardDir) {
-		c.rebuildDir(sh) // sets sh.act to the last (active) segment
+		c.rebuildDir(sh, shardDir) // sets sh.act to the last (active) segment
 		tm.DirRebuilt = true
 	}
 	c.openIdxDiag.ChainLinksRepaired += c.relinkActiveChains(sh)
@@ -834,9 +847,9 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 // its segment's extent was misframed by a damaged totalLen; the segment's damage is then derived
 // again (reframeSegment). Either finding restarts the replay, so every decision is made by a walk
 // that skips all the damage known.
-func (c *Collection) rebuildDir(sh *shard) {
+func (c *Collection) rebuildDir(sh *shard, shardDir string) {
 	if sh.appendOnly {
-		c.rebuildAppendLog(sh)
+		c.rebuildAppendLog(sh, shardDir)
 		return
 	}
 	type best struct {
@@ -942,7 +955,11 @@ func (c *Collection) rebuildDir(sh *shard) {
 		stamps, delMarks = stamps[:0], delMarks[:0]
 		lastSeq, lastKeys = 0, map[string]struct{}{}
 		changed := false
-		for _, seg := range sh.segs {
+		// Reported per pass: a reframe restarts the replay, and a count that carried over
+		// from the abandoned pass would run past its own total.
+		prog := newOpenProgress(shardDir, OpenRebuildDir, len(sh.segs))
+		for segi, seg := range sh.segs {
+			prog.step(segi)
 			if seg == nil {
 				continue
 			}
@@ -1372,12 +1389,14 @@ func (c *Collection) reframeSegment(seg *segment, last bool) {
 // here). It only recovers the commit sequence, the per-segment min sequence, the live count, and
 // the active (last) segment for continued appends. A segment whose walk is misframed is reframed
 // and walked again, as in rebuildDir.
-func (c *Collection) rebuildAppendLog(sh *shard) {
+func (c *Collection) rebuildAppendLog(sh *shard, shardDir string) {
 	var maxSeq uint64
 	count, sysCount := 0, 0
 	walked := 0
 	defer func() { c.recWalked.Add(int64(walked)) }()
-	for _, seg := range sh.segs {
+	prog := newOpenProgress(shardDir, OpenRebuildDir, len(sh.segs))
+	for segi, seg := range sh.segs {
+		prog.step(segi)
 		if seg == nil {
 			continue
 		}
@@ -1765,11 +1784,20 @@ func recExtentEndsCleanly(data []byte, used int) bool {
 	return recTotalLen(data, uint32(used)) == 0
 }
 
+// segFirstSeqReads counts calls to segFirstSeq, so a test can hold the ordering key to its
+// cost model: one read per segment loaded. It is a mapping read, and loadShard's sort has as
+// many elements as the shard has segments, so a key read from inside that comparator instead
+// of once per segment is the difference between one pass and O(n log n) scattered touches --
+// on a cold mmap, page faults. The regression is invisible to every correctness test, because
+// the order it produces is identical either way.
+var segFirstSeqReads atomic.Int64
+
 // segFirstSeq returns the commit sequence of a segment's first record, which is its position
 // in append order. ok is false for an empty segment.
 //
 // A damaged first record's seq is not believed; the first record past its damage is used instead.
 func segFirstSeq(seg *segment) (uint64, bool) {
+	segFirstSeqReads.Add(1)
 	if seg == nil || seg.used < recHeaderSize {
 		return 0, false
 	}
