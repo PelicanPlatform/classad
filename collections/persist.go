@@ -845,10 +845,22 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			f.Close()
 			return 0, err
 		}
-		seg, err := openMmapSegment(uint32(len(loaded)), codec, f, int(st.Size()))
+		// The trailer, if any, sits past the arena and is read before the mapping is made,
+		// because it decides how much of the file to map: the mapping must cover exactly
+		// the arena, as it did before trailers existed. A file with no trailer -- every
+		// segment written before this, and every non-carrier -- maps whole.
+		mapSize := st.Size()
+		trailer, hasTrailer := readSegTrailerAt(f, st.Size())
+		if hasTrailer {
+			mapSize -= int64(trailer.bytes)
+		}
+		seg, err := openMmapSegment(uint32(len(loaded)), codec, f, int(mapSize))
 		if err != nil {
 			f.Close()
 			return 0, err
+		}
+		if hasTrailer {
+			seg.carriedDicts = trailer.dictReplicaIDs()
 		}
 		// Everything between here and the end of loadShard that touches this mapping --
 		// the extent walk below, rebuildDir, a zone recompute -- reads it front to back,
