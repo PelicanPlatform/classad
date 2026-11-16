@@ -88,6 +88,17 @@ type Options struct {
 	// reclaim, so discarding it silently is how a store leaks files nobody looks for.
 	// nil discards it.
 	OnHighMarkError func(error)
+	// OnDictFault is called when a maintenance check finds a compression dictionary's
+	// file missing, replaced, or changed underneath the store (see dictpin.go). The
+	// argument is a *DictFault, so errors.As reaches the id and the kind.
+	//
+	// This is the loud half of the check and the one worth wiring up. The counters say
+	// how many; only this says which, and when. A missing file is rewritten from the
+	// descriptor the store still holds, so by the time the callback runs the damage is
+	// usually already undone -- but something outside the process is deleting
+	// dictionaries, and that is worth an operator's attention before the restart that
+	// would have made it permanent. nil discards it.
+	OnDictFault func(error)
 	// ProfileBucketBytes is the quantile resolution of each sealed segment's retention
 	// profile, in stored bytes (see segprofile.go). 0 means 1 MiB, lowered to an eighth of
 	// SegmentSize when that is smaller -- a bucket near or above the segment size leaves a
@@ -639,6 +650,12 @@ type Collection struct {
 	// onHighMarkErr reports a failed reclaim from the seal-time size eviction (see
 	// Options.OnHighMarkError). nil discards it.
 	onHighMarkErr func(error)
+	// onDictFault reports a dictionary file that is no longer what was loaded from it
+	// (see Options.OnDictFault). nil discards it.
+	onDictFault func(error)
+	// lastDictVerify is when the dictionary files were last checked, in unix nanos, so
+	// maintenance passes share one check per dictVerifyInterval rather than one each.
+	lastDictVerify atomic.Int64
 	// maxBytesHint mirrors Retention.MaxBytes for the seal-time check, which runs on the
 	// APPENDING goroutine. Reading it through Retention() takes maintMu, which a retrain or
 	// a merge holds for minutes -- so every seal would stall behind a maintenance pass just
@@ -1126,6 +1143,7 @@ func New(opts Options) *Collection {
 	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.
 	c.internAtSeal = opts.InternAtSeal && opts.AppendOnly && opts.Dir != ""
 	c.onHighMarkErr = opts.OnHighMarkError
+	c.onDictFault = opts.OnDictFault
 	c.maxBytesHint.Store(opts.Retention.MaxBytes)
 	// Reads are only worth verifying against a persistent segment: an in-memory
 	// arena cannot have been corrupted on disk, and its records carry the same CRC

@@ -112,6 +112,11 @@ type maintPass struct {
 // beginMaint publishes the start of a pass. total is the work it budgeted, or 0 when it
 // cannot say. The returned handle must have finish called on it, normally deferred.
 func (c *Collection) beginMaint(phase MaintPhase, total int) *maintPass {
+	// Every maintenance pass passes through here -- merge, compact, retrain, rotate,
+	// columnarize, backfill, reindex -- which makes it the one place that covers all of
+	// them. The check is rate-limited (dictVerifyInterval), so hooking the frequent
+	// passes costs no more than hooking the rare ones.
+	c.maybeVerifyDictFiles()
 	now := time.Now()
 	m := &maintPass{
 		c:     c,

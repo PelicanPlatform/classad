@@ -35,6 +35,11 @@ type dictReg struct {
 	byID map[uint32]Codec // dictionary id -> codec
 	idOf map[Codec]uint32 // codec -> dictionary id
 	next uint32           // next id to assign
+	// pins holds each persisted dictionary's file open, with a fingerprint of what was
+	// read from it, so the bytes survive an unlink and a file that changed underneath the
+	// store can be told from one that did not. Empty for an in-memory collection, which
+	// has no files. See dictpin.go.
+	pins map[uint32]*dictPin
 }
 
 // newDictReg creates a registry with base registered as dictionary id 0.
@@ -43,6 +48,7 @@ func newDictReg(base Codec) *dictReg {
 		byID: map[uint32]Codec{0: base},
 		idOf: map[Codec]uint32{base: 0},
 		next: 1,
+		pins: map[uint32]*dictPin{},
 	}
 }
 
@@ -92,8 +98,15 @@ func (r *dictReg) register(dict []byte, build func(dict []byte) (Codec, error)) 
 		return 0, nil, err
 	}
 	if dir != "" {
-		if err := writeDictFile(filepath.Join(dir, fmt.Sprintf("%d.zst", id)), stamped); err != nil {
+		path := filepath.Join(dir, fmt.Sprintf("%d.zst", id))
+		if err := writeDictFile(path, stamped); err != nil {
 			return 0, nil, err
+		}
+		// Hold the file open from here on. A failure to pin is not a failure to register:
+		// the dictionary is on disk and the codec is sound, and all that is lost is the
+		// ability to notice later that the file went away.
+		if pin, _, err := pinDictFile(path); err == nil {
+			r.setPin(id, pin)
 		}
 	}
 	r.mu.Lock()
@@ -125,6 +138,10 @@ func (r *dictReg) prune(keep func(id uint32, c Codec) bool) []uint32 {
 	dir := r.dir
 	r.mu.Unlock()
 	for _, id := range removed {
+		// Drop the pin FIRST. A retired dictionary is supposed to leave dicts/, and a pin
+		// left behind would read that departure as a file something deleted and put it
+		// straight back -- undoing the retire and leaking a descriptor per pass.
+		r.dropPin(id)
 		if dir != "" {
 			retireDictFile(dir, id)
 		}
@@ -430,7 +447,9 @@ func (c *Collection) loadDicts(dictsDir string) (latest uint32, err error) {
 			continue
 		}
 		path := filepath.Join(dictsDir, e.Name())
-		dict, err := os.ReadFile(path)
+		// One open serves both: the bytes this load needs, and the descriptor the store
+		// keeps for the life of the dictionary (see dictpin.go).
+		pin, dict, err := pinDictFile(path)
 		if err != nil {
 			return 0, err
 		}
@@ -449,8 +468,10 @@ func (c *Collection) loadDicts(dictsDir string) (latest uint32, err error) {
 		}
 		codec, err := NewZSTDCodec(dict)
 		if err != nil {
+			pin.close()
 			return 0, fmt.Errorf("rebuild codec for dict %d: %w", id, err)
 		}
+		c.dicts.setPin(id, pin)
 		c.dicts.mu.Lock()
 		c.dicts.byID[id] = codec
 		c.dicts.idOf[codec] = id
@@ -1813,6 +1834,10 @@ func (c *Collection) teardown(discard bool) error {
 		}
 		c.persistWatchEpoch(watchSeqs, watchStamp)
 	}
+	// Release the dictionary files' descriptors. They are held for the life of the
+	// collection so a vanished dictionary can be noticed and rewritten (see dictpin.go);
+	// past here nothing will read them again.
+	c.dicts.closePins()
 	// The columnar-block cache is NOT closed here: c.colCache is the process-wide cache for this
 	// collection's kind, shared with every other open collection of that kind, and it lives for the
 	// life of the process. This collection's entries are not evicted either. Block ids are
