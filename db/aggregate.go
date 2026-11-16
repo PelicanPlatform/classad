@@ -117,6 +117,22 @@ const (
 	// server too old to know it refuses the query instead of returning "undefined" for the
 	// column.
 	AggApproxCountDistinct
+
+	// AggTopKThreshold is the k-th best value of the argument in the group: the CUTOFF for
+	// "the k rows of each group with the largest (or smallest) argument". AggSpec.K says how
+	// many and AggSpec.Desc which end.
+	//
+	// It exists to answer a ranking window -- ROW_NUMBER() OVER (PARTITION BY g ORDER BY o)
+	// with a QUALIFY -- without shipping the group. See aggtopk.go for what the caller does
+	// with the cutoff and why it is a cutoff rather than the rows.
+	//
+	// A group holding fewer than K numeric values reports UNDEFINED: it has no cutoff, and
+	// every row of it belongs in the answer.
+	//
+	// It sits past AggMax, so a request carrying one reaches only a frame with fields for K
+	// and Desc -- a selector alone would say "the k-th best" without saying which k or which
+	// end, and a server reading it as something else would answer a different question.
+	AggTopKThreshold
 )
 
 // ErrListAggregateNeedsBound reports a list-valued aggregate asked for where no bound on it
@@ -149,6 +165,14 @@ type AggSpec struct {
 	// still takes an argument attribute: p95(RequestMemory) is UserFunc "p95", Arg
 	// "RequestMemory".
 	UserFunc string
+
+	// K and Desc parameterise AggTopKThreshold and are ignored by every other function: how
+	// many values the cutoff keeps, and whether the best are the largest (Desc) or the
+	// smallest. They live on the spec rather than on the request because two cutoffs over one
+	// query are two different questions -- the newest 5 per owner beside the oldest 1 -- where
+	// AggList's cap is one bound on the whole reduction.
+	K    int
+	Desc bool
 }
 
 // AggRow is one group's result: the group-by column values followed by the
@@ -402,6 +426,13 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 		if a.Func == AggList && (a.Arg == "" || a.Arg == "*") {
 			return nil, fmt.Errorf("LIST(*) is not meaningful; name an attribute or an expression")
 		}
+		// TOPK_THRESHOLD(*) has it too: the rows of a group are not a number, so there is
+		// nothing to take the k-th best of. A non-positive K is refused here rather than
+		// answered as undefined, which is what a group of fewer than K rows reports and would
+		// read as "no cutoff" instead of "that request makes no sense".
+		if a.Func == AggTopKThreshold && !topKSpecValid(a) {
+			return nil, fmt.Errorf("TOPK_THRESHOLD needs a positive K and an attribute to order by")
+		}
 	}
 	// Resolve user-defined aggregates once, so the reduction does no lookup per group, and
 	// contain a panic from one for the whole query rather than per row (see udafPanic).
@@ -595,6 +626,10 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value, maxList int) {
 		// decision, exactly as it is for the built-ins, which drop undefined inside the
 		// reference implementation rather than before it.
 		a.user.Add(v)
+	case AggTopKThreshold:
+		// Same accumulator the columnar pass folds, fed the same way -- which is what makes
+		// the two rungs answer alike. It drops the non-numbers itself (see topKThresholdAcc).
+		a.user.Add(v)
 	case AggList:
 		// Undefined is kept, not skipped -- see AggList: two lists over one group stay
 		// positionally aligned only if every row contributes to both.
@@ -652,6 +687,12 @@ func (a *aggAcc) result(spec AggSpec) string {
 	case AggMax:
 		return ValueText(classad.Max(a.vals))
 	case AggUser:
+		return ValueText(a.user.Result())
+	case AggTopKThreshold:
+		// ValueText, the same renderer the columnar rung runs its accumulators through, so
+		// the two cannot render one cutoff two ways. AggList's reason for borrowing the group
+		// renderer instead does not reach here: a cutoff is a number or undefined, never a
+		// string or a list, so there is nothing whose quotes ValueText would drop.
 		return ValueText(a.user.Result())
 	case AggList:
 		// Rendered as a ClassAd LIST LITERAL by the group renderer, not by ValueText,

@@ -59,11 +59,14 @@ func mergeUDAFGroupSinks(dst, src collections.GroupSink) {
 // columns. ok=false means nothing was computed and the caller must scan.
 //
 // WHAT IT SERVES, and the one asymmetry with the built-in grouped rung. Every value aggregate must
-// be an AggUser whose accumulator takes column values; COUNT(*) rides along, filtered or not,
-// because a group's record count and its filtered counts are kept beside the accumulators rather
-// than derived from them. A built-in SUM or MIN in the same request is refused: a group holds
-// either the fixed statistics or the caller's accumulators, never both, so serving the mixture
-// would mean two passes, and two passes over one request is a different plan rather than this one.
+// reduce into an accumulator that takes column values: an AggUser whose registration yields a
+// ColumnAccumulator, or AggTopKThreshold, whose per-group state is k values and so is an
+// accumulator rather than one of the fixed numeric statistics. COUNT(*) rides along, filtered or
+// not, because a group's record count and its filtered counts are kept beside the accumulators
+// rather than derived from them. A built-in SUM or MIN in the same request is refused: a group
+// holds either the fixed statistics or the caller's accumulators, never both, so serving the
+// mixture would mean two passes, and two passes over one request is a different plan rather than
+// this one.
 //
 // COLUMNS ARE NOT DE-DUPLICATED HERE, which is the opposite of what the built-in rung does. There,
 // MIN(x) beside MAX(x) reads x once and shares one statistics accumulator, because the statistics
@@ -104,6 +107,20 @@ func GroupedUserFromColumns(src GroupValuesSource, constraint string, groupCols 
 				countFilters = append(countFilters, a.Filter)
 			}
 			cslot[i] = j
+			continue
+		}
+		// The per-group top-K cutoff rides this rung rather than the built-in one: its state is
+		// k values per group, which is an accumulator and not one of the fixed numeric
+		// statistics. Its accumulator is a ColumnAccumulator by construction, so unlike a
+		// registered aggregate there is nothing to look up and nothing to decline.
+		if a.Func == AggTopKThreshold {
+			if !topKSpecValid(a) {
+				return nil, false, nil
+			}
+			slot[i] = len(cols)
+			cols = append(cols, collections.GroupAggCol{Attr: a.Arg, Filter: a.Filter})
+			userAggs = append(userAggs, topKAggregate{k: a.K, desc: a.Desc})
+			anyUser = true
 			continue
 		}
 		if a.Func != AggUser || a.Arg == "" || a.Arg == "*" {

@@ -328,6 +328,19 @@ func RegisteredAggregates() []string {
 func resolveAggregates(aggs []AggSpec) ([]Aggregate, error) {
 	var out []Aggregate
 	for i, a := range aggs {
+		// The per-group top-K cutoff is an Accumulator like a registered aggregate, so it is
+		// resolved here and the whole reduction below -- state per group, Merge across the
+		// fan-out, Result at the end -- is the one the user-defined path already runs.
+		if a.Func == AggTopKThreshold {
+			if !topKSpecValid(a) {
+				return nil, fmt.Errorf("TOPK_THRESHOLD needs a positive K and an attribute to order by")
+			}
+			if out == nil {
+				out = make([]Aggregate, len(aggs))
+			}
+			out[i] = topKAggregate{k: a.K, desc: a.Desc}
+			continue
+		}
 		if a.Func != AggUser {
 			continue
 		}
