@@ -184,15 +184,15 @@ func TestInsertSelectRefusedOnReadOnlyConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cat.CreateTable("history"); err != nil {
-		t.Fatal(err)
+	if _, createErr := cat.CreateTable("history"); createErr != nil {
+		t.Fatal(createErr)
 	}
 	summary, err := cat.CreateTable("daily_summaries")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := summary.SetPrimaryKey([]string{"Owner"}); err != nil {
-		t.Fatal(err)
+	if setErr := summary.SetPrimaryKey([]string{"Owner"}); setErr != nil {
+		t.Fatal(setErr)
 	}
 	s := NewServerCatalog(cat)
 	defer s.Close()
@@ -224,5 +224,106 @@ func TestInsertSelectFeaturesAdvertised(t *testing.T) {
 		if !strings.Contains(feats, string(want)) {
 			t.Errorf("server does not advertise %q; advertised: %s", want, feats)
 		}
+	}
+}
+
+// A roll-up whose SOURCE is an archive. This is the shape the feature is for -- history is
+// append-only -- and it reaches a different reduction path from a mutable table's.
+func TestInsertSelectFromArchiveSource(t *testing.T) {
+	cat, err := db.OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
+		SegmentSize:      1 << 12,
+		CategoricalAttrs: []string{"Owner"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"alice": 5, "bob": 3}
+	for owner, n := range want {
+		for i := 0; i < n; i++ {
+			ad, perr := classad.Parse(fmt.Sprintf(`[ Owner = "%s"; JobStatus = 4 ]`, owner))
+			if perr != nil {
+				t.Fatal(perr)
+			}
+			if appendErr := arch.Append(ad); appendErr != nil {
+				t.Fatal(appendErr)
+			}
+		}
+	}
+	summary, err := cat.CreateTable("daily_summaries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setErr := summary.SetPrimaryKey([]string{"Owner"}); setErr != nil {
+		t.Fatal(setErr)
+	}
+
+	s := NewServerCatalog(cat)
+	defer s.Close()
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConn(sconn) }()
+	c := NewClient(cconn)
+	defer c.Close()
+
+	n, err := c.InsertSelect(context.Background(), "daily_summaries", "history", "true",
+		[]db.GroupCol{{Attr: "Owner"}},
+		[]db.AggSpec{{Func: db.AggCount, Arg: "*"}},
+		[]string{"Owner", "Jobs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(want) {
+		t.Fatalf("rolled up %d rows from the archive, want %d", n, len(want))
+	}
+	for owner, jobs := range want {
+		ad, ok := summary.LookupClassAd(`"` + owner + `"`)
+		if !ok {
+			t.Fatalf("no summary row for %s; keys are %v", owner, summary.Keys())
+		}
+		got, _ := ad.EvaluateAttr("Jobs").IntValue()
+		if int(got) != jobs {
+			t.Errorf("%s: Jobs = %d, want %d", owner, got, jobs)
+		}
+	}
+}
+
+// A source that does not exist is named as such, rather than failing as an empty roll-up
+// that writes nothing and reports success.
+func TestInsertSelectRefusesMissingSource(t *testing.T) {
+	c, _, _, cleanup := rollupPair(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := c.SetPrimaryKey(ctx, "daily_summaries", []string{"Owner"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.InsertSelect(ctx, "daily_summaries", "nosuchsource", "true",
+		[]db.GroupCol{{Attr: "Owner"}},
+		[]db.AggSpec{{Func: db.AggCount, Arg: "*"}},
+		[]string{"Owner", "Jobs"})
+	if err == nil {
+		t.Fatal("roll-up from a missing source succeeded, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "no such table") {
+		t.Fatalf("error %v should name the missing source", err)
+	}
+}
+
+// A bad constraint is reported as the error it is, not as a malformed request.
+func TestInsertSelectReportsBadConstraint(t *testing.T) {
+	c, _, _, cleanup := rollupPair(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := c.SetPrimaryKey(ctx, "daily_summaries", []string{"Owner"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.InsertSelect(ctx, "daily_summaries", "history", "this is not )( an expression",
+		[]db.GroupCol{{Attr: "Owner"}},
+		[]db.AggSpec{{Func: db.AggCount, Arg: "*"}},
+		[]string{"Owner", "Jobs"})
+	if err == nil {
+		t.Fatal("a malformed constraint was accepted, want a refusal")
 	}
 }

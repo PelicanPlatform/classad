@@ -504,8 +504,11 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 			TypedValues: make([]classad.Value, len(aggs)),
 		}
 		for i, a := range aggs {
-			row.Values[i] = gs.accs[i].result(a)
-			row.TypedValues[i] = gs.accs[i].resultValue(a)
+			// Reduced ONCE and then rendered. SUM/AVG/MIN/MAX fold the group's whole value
+			// slice, so asking for the text and the value separately would fold it twice.
+			v := gs.accs[i].resultValue(a)
+			row.TypedValues[i] = v
+			row.Values[i] = renderAggValue(a, v)
 		}
 		return []AggRow{row}, nil
 	}
@@ -519,8 +522,10 @@ func aggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 			TypedValues: make([]classad.Value, len(aggs)),
 		}
 		for i, a := range aggs {
-			row.Values[i] = gs.accs[i].result(a)
-			row.TypedValues[i] = gs.accs[i].resultValue(a)
+			// Reduced ONCE and then rendered; see the group-less branch above.
+			v := gs.accs[i].resultValue(a)
+			row.TypedValues[i] = v
+			row.Values[i] = renderAggValue(a, v)
 			// Allocated only for a row that actually lost something, so the field
 			// stays nil for every aggregate that cannot elide and for every group
 			// of a list-valued one that fitted.
@@ -647,48 +652,26 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value, maxList int) {
 	}
 }
 
-func (a *aggAcc) result(spec AggSpec) string {
-	switch spec.Func {
-	case AggCount:
-		// COUNT(*) counts every row; COUNT(col) counts rows where col is defined.
-		if spec.Arg == "*" {
-			return strconv.Itoa(a.rows)
-		}
-		return strconv.Itoa(a.defN)
-	case AggCountDistinct:
-		return strconv.Itoa(len(a.seen))
-	case AggApproxCountDistinct:
-		// A group that saw no defined value renders 0 without a sketch ever existing, which
-		// is the same answer the exact form gives and is exact there too.
-		if a.approx == nil {
-			return "0"
-		}
-		return strconv.FormatUint(a.approx.estimate(), 10)
-	case AggSum:
-		return ValueText(classad.Sum(a.vals))
-	case AggAvg:
-		return ValueText(classad.Avg(a.vals))
-	case AggMin:
-		return ValueText(classad.Min(a.vals))
-	case AggMax:
-		return ValueText(classad.Max(a.vals))
-	case AggUser:
-		return ValueText(a.user.Result())
-	case AggList:
-		// Rendered as a ClassAd LIST LITERAL by the group renderer, not by ValueText,
-		// because this cell has to be read back as a value and ValueText's output
-		// cannot be: it drops a string's quotes, so a list of owners would come back
-		// as a list of bare identifiers that evaluate to undefined, and it would send
-		// a list through the unparser, which keeps a literal's unevaluated source.
-		// GroupValueText is already the renderer whose text is a literal every kind
-		// inverts through ParseGroupValue, so a list aggregate is read back exactly.
-		//
-		// The cost of borrowing it, stated because it surprises: a string element
-		// arrives QUOTED and an integral real reads as the integer it equals, which is
-		// the group renderer's canonicalisation and not this aggregate's choice.
-		return GroupValueText(classad.NewListValue(a.vals))
+// renderAggValue spells an aggregate's answer the way its own output cell is spelled.
+//
+// A LIST goes through the GROUP renderer, not ValueText, because this cell has to be read
+// back as a value and ValueText's output cannot be: it drops a string's quotes, so a list
+// of owners would come back as a list of bare identifiers that evaluate to undefined, and
+// it would send a list through the unparser, which keeps a literal's unevaluated source.
+// GroupValueText is already the renderer whose text is a literal every kind inverts through
+// ParseGroupValue, so a list aggregate is read back exactly.
+//
+// The cost of borrowing it, stated because it surprises: a string element arrives QUOTED
+// and an integral real reads as the integer it equals, which is the group renderer's
+// canonicalisation and not this aggregate's choice.
+//
+// Every other aggregate renders through ValueText, which is the spelling its cell has
+// always had. TestAggResultValueMatchesResultText pins that, per aggregate.
+func renderAggValue(spec AggSpec, v classad.Value) string {
+	if spec.Func == AggList {
+		return GroupValueText(v)
 	}
-	return "undefined"
+	return ValueText(v)
 }
 
 // resultValue is result as a VALUE: the same answer before it is rendered.
@@ -714,9 +697,10 @@ func (a *aggAcc) result(spec AggSpec) string {
 // this in-process producer and left nil by the client. A caller that has it should use
 // it; one that does not must keep reading the text, which is why result stays.
 //
-// THE TWO MUST AGREE. result is the authority for what the answer IS -- it is what every
-// existing reader sees -- and this returns the same answer unrendered.
-// TestAggResultValueMatchesResultText pins that for every aggregate.
+// This is now the ONLY place an aggregate's answer is decided. The output cell is
+// renderAggValue of what this returns, so the text and the value cannot disagree and the
+// group's values are folded once rather than once per form.
+// TestAggResultValueMatchesResultText pins the rendering, per aggregate.
 func (a *aggAcc) resultValue(spec AggSpec) classad.Value {
 	switch spec.Func {
 	case AggCount:

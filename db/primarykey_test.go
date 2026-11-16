@@ -13,8 +13,8 @@ func TestSetPrimaryKeyPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.SetPrimaryKey([]string{"Day", "Owner"}); err != nil {
-		t.Fatal(err)
+	if setErr := d.SetPrimaryKey([]string{"Day", "Owner"}); setErr != nil {
+		t.Fatal(setErr)
 	}
 	d.Close()
 
@@ -39,8 +39,8 @@ func TestPrimaryKeySurvivesLaterIndexChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.SetPrimaryKey([]string{"Day", "Owner"}); err != nil {
-		t.Fatal(err)
+	if setErr := d.SetPrimaryKey([]string{"Day", "Owner"}); setErr != nil {
+		t.Fatal(setErr)
 	}
 	// Any operation that persists the index config; AddIndex is the common one.
 	d.AddIndex([]string{"Owner"}, []string{"RequestMemory"})

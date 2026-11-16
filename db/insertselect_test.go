@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // rollupFixture builds a source table of job-shaped ads and a summary table keyed by Owner.
@@ -23,8 +25,8 @@ func rollupFixture(t *testing.T, owners []string, perOwner int) (src, summary *D
 			n++
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	summary, err = Open("")
@@ -112,8 +114,8 @@ func TestInsertSelectRerunPicksUpSourceChanges(t *testing.T) {
 
 	tx := src.Begin()
 	tx.NewClassAd("extra", mustAd(t, "Owner = \"alice\"\nRequestCpus = 10\nJobStatus = 4"))
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	rollup(t, src, summary, "true")
 
@@ -212,4 +214,150 @@ func TestInsertSelectWritesNothingOnRefusal(t *testing.T) {
 func summaryKeys(t *testing.T, d *DB) []string {
 	t.Helper()
 	return d.Keys()
+}
+
+// How each value KIND lands in the written ad.
+//
+// The two that matter are not the scalars. UNDEFINED must leave the attribute out, because
+// in a ClassAd an absent attribute IS undefined and writing `X = undefined` creates one
+// where the query found none -- every later `is undefined` test and every projection then
+// sees a different shape. ERROR must refuse, because stored it propagates into everything
+// that reads the column with nothing in the row to say which input produced it.
+func TestBuildInsertAdsValueKinds(t *testing.T) {
+	spec := InsertSpec{
+		GroupCols: []GroupCol{{Attr: "G"}},
+		Aggs:      []AggSpec{{Func: AggMax, Arg: "v"}},
+		Names:     []string{"G", "Val"},
+	}
+	cases := []struct {
+		name  string
+		v     classad.Value
+		check func(t *testing.T, ad *classad.ClassAd)
+	}{{
+		name: "integer",
+		v:    classad.NewIntValue(7),
+		check: func(t *testing.T, ad *classad.ClassAd) {
+			if got, _ := ad.EvaluateAttr("Val").IntValue(); got != 7 {
+				t.Fatalf("Val = %d, want 7", got)
+			}
+			if !ad.EvaluateAttr("Val").IsInteger() {
+				t.Fatal("Val should be an integer")
+			}
+		},
+	}, {
+		name: "real",
+		v:    classad.NewRealValue(2.5),
+		check: func(t *testing.T, ad *classad.ClassAd) {
+			if got, _ := ad.EvaluateAttr("Val").RealValue(); got != 2.5 {
+				t.Fatalf("Val = %v, want 2.5", got)
+			}
+		},
+	}, {
+		name: "string stays a string",
+		v:    classad.NewStringValue("4"),
+		check: func(t *testing.T, ad *classad.ClassAd) {
+			v := ad.EvaluateAttr("Val")
+			if !v.IsString() {
+				t.Fatalf("Val is a %v, want a string -- the whole point is that \"4\" is not 4", v)
+			}
+			if s, _ := v.StringValue(); s != "4" {
+				t.Fatalf("Val = %q, want \"4\"", s)
+			}
+		},
+	}, {
+		name: "bool",
+		v:    classad.NewBoolValue(true),
+		check: func(t *testing.T, ad *classad.ClassAd) {
+			if !ad.EvaluateAttr("Val").IsBool() {
+				t.Fatalf("Val is a %v, want a bool", ad.EvaluateAttr("Val"))
+			}
+		},
+	}, {
+		name: "list round-trips",
+		v:    classad.NewListValue([]classad.Value{classad.NewIntValue(1), classad.NewStringValue("a")}),
+		check: func(t *testing.T, ad *classad.ClassAd) {
+			v := ad.EvaluateAttr("Val")
+			if !v.IsList() {
+				t.Fatalf("Val is a %v, want a list", v)
+			}
+			elems, err := v.ListValue()
+			if err != nil || len(elems) != 2 {
+				t.Fatalf("elements = %v (err %v), want 2", elems, err)
+			}
+			if !elems[0].IsInteger() || !elems[1].IsString() {
+				t.Fatalf("element kinds not preserved: %v, %v", elems[0], elems[1])
+			}
+		},
+	}, {
+		name: "undefined leaves the attribute OUT",
+		v:    classad.NewUndefinedValue(),
+		check: func(t *testing.T, ad *classad.ClassAd) {
+			if _, ok := ad.Lookup("Val"); ok {
+				t.Fatal("undefined wrote an attribute; it must be absent, which is how a ClassAd spells undefined")
+			}
+			if !ad.EvaluateAttr("Val").IsUndefined() {
+				t.Fatal("the absent attribute should still evaluate as undefined")
+			}
+		},
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := []AggRow{{
+				Group:       []string{`"g1"`},
+				GroupValues: []classad.Value{classad.NewStringValue("g1")},
+				Values:      []string{ValueText(tc.v)},
+				TypedValues: []classad.Value{tc.v},
+			}}
+			ads, err := BuildInsertAds(rows, spec)
+			if err != nil {
+				t.Fatalf("BuildInsertAds: %v", err)
+			}
+			if len(ads) != 1 {
+				t.Fatalf("got %d ads, want 1", len(ads))
+			}
+			tc.check(t, ads[0])
+		})
+	}
+}
+
+func TestBuildInsertAdsRefusesErrorValue(t *testing.T) {
+	rows := []AggRow{{
+		Group:       []string{`"g1"`},
+		GroupValues: []classad.Value{classad.NewStringValue("g1")},
+		Values:      []string{"error"},
+		TypedValues: []classad.Value{classad.NewErrorValue()},
+	}}
+	_, err := BuildInsertAds(rows, InsertSpec{
+		GroupCols: []GroupCol{{Attr: "G"}},
+		Aggs:      []AggSpec{{Func: AggMax, Arg: "v"}},
+		Names:     []string{"G", "Val"},
+	})
+	if err == nil {
+		t.Fatal("an error value was stored, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "Val") {
+		t.Fatalf("error %v should name the column", err)
+	}
+}
+
+// A row with no typed aggregate values is refused, not guessed at from the text.
+func TestBuildInsertAdsRefusesUntypedAggregates(t *testing.T) {
+	rows := []AggRow{{
+		Group:       []string{`"g1"`},
+		GroupValues: []classad.Value{classad.NewStringValue("g1")},
+		Values:      []string{"12"},
+		// TypedValues deliberately nil: what a row read off the wire looks like.
+	}}
+	_, err := BuildInsertAds(rows, InsertSpec{
+		GroupCols: []GroupCol{{Attr: "G"}},
+		Aggs:      []AggSpec{{Func: AggCount, Arg: "*"}},
+		Names:     []string{"G", "Jobs"},
+	})
+	if err == nil {
+		t.Fatal("a row with no typed values was accepted, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "guessing") {
+		t.Fatalf("error %v should say it refuses to guess the type", err)
+	}
 }
