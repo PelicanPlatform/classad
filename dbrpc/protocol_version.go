@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 7
+const ProtocolVersion = 8
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -146,6 +146,15 @@ const (
 	// different cause, and deliberately not an "undefined" column.
 	FeatNamedAggregate Feature = "namedagg"
 
+	// FeatTopKAggregate is the aggregate frame carrying a per-aggregate K and DESC
+	// (opAggregateTopK, opArchiveAggregateTopK), which is what lets a request ask for
+	// db.AggTopKThreshold -- the k-th best value of the argument in each group. Postdates
+	// advertisement, so silence is a no -- but silence is still probed rather than refused
+	// outright, for FeatNamedAggregate's reason: a server that does not know the opcode
+	// refuses the OPCODE, before it parses a body, so the probe's answer is a clean stBadReq
+	// before any row and never a cutoff computed for a k it invented.
+	FeatTopKAggregate Feature = "topkagg"
+
 	// FeatTypedGroups is the aggregate reply whose GROUP cells are tagged VALUES rather
 	// than the group's rendered text (opAggregateTyped, opArchiveAggregateTyped).
 	// Postdates advertisement, so silence is a no.
@@ -244,6 +253,7 @@ var serverFeatures = []Feature{
 	FeatJoinAgg,
 	FeatJoinStats,
 	FeatJoinBand,
+	FeatTopKAggregate,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar

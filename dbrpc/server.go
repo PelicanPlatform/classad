@@ -862,6 +862,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamAggregateNamed(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opAggregateTyped:
 		sc.s.streamAggregateTyped(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+	case opAggregateTopK:
+		sc.s.streamAggregateTopK(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchTables:
 		sc.s.streamMatchTables(sc.ctx, reqID, body, priv, sc.write)
 	case opWatch:
@@ -882,6 +884,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.streamArchiveAggregateNamed(reqID, body)
 	case opArchiveAggregateTyped:
 		sc.streamArchiveAggregateTyped(reqID, body)
+	case opArchiveAggregateTopK:
+		sc.streamArchiveAggregateTopK(reqID, body)
 	case opQueryKeys:
 		sc.s.streamQueryKeys(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTxnQuery:

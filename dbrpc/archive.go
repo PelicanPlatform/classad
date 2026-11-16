@@ -98,6 +98,13 @@ func (sc *serverConn) streamArchiveAggregateTyped(reqID uint64, r *reader) {
 	sc.archiveAggregate(reqID, r, aggSpecNamed, false, true)
 }
 
+// streamArchiveAggregateTopK is streamArchiveAggregateTyped whose specs also carry K and DESC
+// (opArchiveAggregateTopK), which is what lets a request ask for the per-group top-K cutoff
+// over a history table.
+func (sc *serverConn) streamArchiveAggregateTopK(reqID uint64, r *reader) {
+	sc.archiveAggregate(reqID, r, aggSpecTopK, false, true)
+}
+
 // archiveAggregate is the body shared by the archive aggregate opcodes. form says how wide the
 // frame is -- whether each group column is followed by a bucket width, and each aggregate spec
 // by a filter expression and an aggregate name -- rather than the base opcode's narrow one.
@@ -319,13 +326,18 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 	// A server that can type the group cells is asked to. The typed opcode carries the named
 	// frame, so the request widens to it: widths on every group column and the trailing stats
 	// byte below.
-	typed := c.SupportsNewer(FeatTypedGroups)
+	typed := c.SupportsNewer(FeatTypedGroups) || wire >= aggSpecTopK
 	if typed {
-		wire, extended = aggSpecNamed, true
+		extended = true
+		if wire < aggSpecNamed {
+			wire = aggSpecNamed // widen to the typed frame; never narrow one already wider
+		}
 	}
 	build := func(id uint64) []byte {
 		o := opArchiveAggregate
 		switch {
+		case wire >= aggSpecTopK:
+			o = opArchiveAggregateTopK
 		case typed:
 			o = opArchiveAggregateTyped
 		case wire >= aggSpecNamed:
@@ -372,8 +384,8 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 	}
 	// As in ArchiveAggregateBucketed. This path already sends the extended frame, so asking
 	// for typed cells only widens it to the named one.
-	typed := c.SupportsNewer(FeatTypedGroups)
-	if typed {
+	typed := c.SupportsNewer(FeatTypedGroups) || wire >= aggSpecTopK
+	if typed && wire < aggSpecNamed {
 		wire = aggSpecNamed
 	}
 	build := func(id uint64) []byte {
@@ -386,6 +398,9 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 		}
 		if typed {
 			o = opArchiveAggregateTyped
+		}
+		if wire >= aggSpecTopK {
+			o = opArchiveAggregateTopK
 		}
 		b := putStr(putStr(req(id, o), name), constraint)
 		b = putI32(b, int32(len(groups)))

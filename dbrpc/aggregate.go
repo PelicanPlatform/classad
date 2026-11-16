@@ -62,9 +62,11 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 	// A server that can send typed group cells is asked to: the reply then carries the
 	// groups as values and nothing parses a label. The typed opcode's frame is the NAMED
 	// one, so asking for it widens the request form to match.
-	typed := c.SupportsNewer(FeatTypedGroups)
-	if typed {
-		form = aggSpecNamed
+	// The top-K opcodes are typed-only, so a top-K request is a typed one whatever the peer
+	// advertised -- a server that has the opcode has typed groups by construction.
+	typed := c.SupportsNewer(FeatTypedGroups) || form >= aggSpecTopK
+	if typed && form < aggSpecNamed {
+		form = aggSpecNamed // widen to the typed opcode's frame; never narrow one already wider
 	}
 	build := func(id uint64) []byte {
 		// A request naming a user-defined aggregate goes out on the named opcode, a filtered
@@ -77,6 +79,9 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 			}
 			if typed {
 				o = opAggregateTyped
+			}
+			if form >= aggSpecTopK {
+				o = opAggregateTopK
 			}
 			b := putStr(putStr(req(id, o), table), constraint)
 			b = putI32(b, int32(len(groupBy)))
@@ -121,6 +126,9 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 				// deliberately no fallback -- retrying without the filters, or without the
 				// aggregate's name, would answer a different question and report it as
 				// success.
+				if form >= aggSpecTopK {
+					return nil, ErrTopKAggregateUnsupported
+				}
 				if form >= aggSpecNamed {
 					return nil, ErrNamedAggregateUnsupported
 				}
@@ -154,13 +162,15 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 	}
 	// See AggregateTable: a server that can type the group cells is asked to, which widens
 	// the request to the named frame the typed opcode carries.
-	typed := c.SupportsNewer(FeatTypedGroups)
-	if typed {
+	typed := c.SupportsNewer(FeatTypedGroups) || form >= aggSpecTopK
+	if typed && form < aggSpecNamed {
 		form = aggSpecNamed
 	}
 	build := func(id uint64) []byte {
 		o := opAggregateBucketed
 		switch {
+		case form >= aggSpecTopK:
+			o = opAggregateTopK // the named request shape plus K and DESC, typed cells back
 		case typed:
 			o = opAggregateTyped // the named request shape, with typed group cells back
 		case form >= aggSpecNamed:
@@ -203,6 +213,9 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 				// caller can fall back to client-side bucketing -- but NOT for a filtered
 				// or named request, where dropping the filters or the aggregate's name
 				// would change the answer.
+				if form >= aggSpecTopK {
+					return nil, ErrTopKAggregateUnsupported
+				}
 				if form >= aggSpecNamed {
 					return nil, ErrNamedAggregateUnsupported
 				}
@@ -267,6 +280,13 @@ func (s *Server) streamAggregateTyped(ctx context.Context, reqID uint64, r *read
 	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecNamed, true, write, qlog)
 }
 
+// streamAggregateTopK is streamAggregateTyped whose specs also carry K and DESC
+// (opAggregateTopK), which is what lets a request ask for the per-group top-K cutoff. The
+// reply is the Typed one.
+func (s *Server) streamAggregateTopK(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, aggSpecTopK, true, write, qlog)
+}
+
 func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate bool, form aggSpecForm, typed bool, write func([]byte), qlog func(QueryLog)) {
 	table := r.str()
 	constraint := r.str()
@@ -287,16 +307,18 @@ func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *rea
 	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, typed, write, qlog)
 }
 
-// aggSpecForm selects which of the three aggregate-spec tails a frame carries. It is one
-// value rather than a pair of booleans so that the encoder and the decoder cannot disagree
-// about a combination that does not exist: a named frame always carries filters too, because
-// the named opcodes are the extended frame plus a name, and nothing writes a name without one.
+// aggSpecForm selects which of the aggregate-spec tails a frame carries. It is one value
+// rather than a set of booleans so that the encoder and the decoder cannot disagree about a
+// combination that does not exist: each form is the one below it plus a field, because each
+// opcode family is the one below it plus a field, and nothing writes a later field without
+// the earlier ones.
 type aggSpecForm int
 
 const (
 	aggSpecBase     aggSpecForm = iota // [func u8][arg]            -- opAggregate, opArchiveAggregate
 	aggSpecFiltered                    // [func u8][arg][filter]    -- the *Filtered opcodes
-	aggSpecNamed                       // [func u8][arg][filter][name] -- the *Named opcodes
+	aggSpecNamed                       // [func u8][arg][filter][name] -- the *Named and *Typed opcodes
+	aggSpecTopK                        // [func u8][arg][filter][name][k i32][desc u8] -- the *TopK opcodes
 )
 
 // readAggSpecs reads the [nAgg]{[func u8][arg]} tail shared by the aggregate opcodes,
@@ -320,6 +342,13 @@ func readAggSpecs(r *reader, reqID uint64, write func([]byte), form aggSpecForm)
 			// read as anything else, so a name sent beside a built-in selector is ignored
 			// rather than refused.
 			aggs[i].UserFunc = r.str()
+		}
+		if form >= aggSpecTopK {
+			// Zero for every other function. A K of zero beside AggTopKThreshold is refused
+			// by the engine rather than defaulted: there is no sensible k to invent, and a
+			// cutoff computed for the wrong one is a number that returns the wrong rows.
+			aggs[i].K = int(r.i32())
+			aggs[i].Desc = r.u8() != 0
 		}
 		// Only the named frame has a field to put an aggregate's name in. On the older
 		// frames a selector asking for a user-defined one cannot be satisfied by anything
@@ -390,8 +419,19 @@ func (c *Client) refuseUnservableAggregate(aggs []AggSpec, form aggSpecForm) err
 		return fmt.Errorf("%w: the server advertised its features and this was not among them",
 			ErrNamedAggregateUnsupported)
 	}
+	if form >= aggSpecTopK && c.Supports(FeatTopKAggregate) == SupportNo {
+		return fmt.Errorf("%w: the server advertised its features and this was not among them",
+			ErrTopKAggregateUnsupported)
+	}
 	return nil
 }
+
+// ErrTopKAggregateUnsupported reports a per-group top-K cutoff asked of a server whose frame
+// has no field for K (see FeatTopKAggregate). There is deliberately no fallback: the question
+// cannot be re-asked in a narrower frame, and asking a different one -- a MIN, or the cutoff
+// for some other k -- would answer successfully with the wrong rows.
+var ErrTopKAggregateUnsupported = errors.New(
+	"dbrpc: server does not support the per-group top-K aggregate")
 
 // anyFiltered reports whether some spec needs the extended opcodes: a per-aggregate filter,
 // or a function an older server would not recognize. Without one the request goes out on the
@@ -426,12 +466,27 @@ func anyNamed(aggs []AggSpec) bool {
 // byte-identical to what an older client would have sent whenever it can.
 func aggSpecFormFor(aggs []AggSpec) aggSpecForm {
 	switch {
+	case anyTopK(aggs):
+		return aggSpecTopK
 	case anyNamed(aggs):
 		return aggSpecNamed
 	case anyFiltered(aggs):
 		return aggSpecFiltered
 	}
 	return aggSpecBase
+}
+
+// anyTopK reports whether some spec asks for the per-group top-K cutoff, which is what routes
+// a request onto the *TopK opcodes. It implies anyFiltered -- db.AggTopKThreshold sits past
+// AggMax -- so a top-K request is an extended one carrying two more fields, never a narrower
+// frame.
+func anyTopK(aggs []AggSpec) bool {
+	for _, a := range aggs {
+		if a.Func == db.AggTopKThreshold {
+			return true
+		}
+	}
+	return false
 }
 
 // putAggSpecs writes the [nAgg]{[func u8][arg]([filter]([name]))} tail.
@@ -444,6 +499,9 @@ func putAggSpecs(b []byte, aggs []AggSpec, form aggSpecForm) []byte {
 		}
 		if form >= aggSpecNamed {
 			b = putStr(b, a.UserFunc)
+		}
+		if form >= aggSpecTopK {
+			b = putU8(putI32(b, int32(a.K)), boolByte(a.Desc))
 		}
 	}
 	return b

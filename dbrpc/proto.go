@@ -498,6 +498,28 @@ const (
 	// [name][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name]}[stats u8]
 	opArchiveAggregateTyped op = 79
 
+	// opAggregateTopK and opArchiveAggregateTopK are the Typed pair with two more fields per
+	// aggregate spec: K and DESC, which parameterise db.AggTopKThreshold -- the k-th best
+	// value of the argument in each group, the cutoff that answers "the k rows of every group
+	// with the largest (or smallest) argument" without shipping the groups.
+	//
+	// A PAIR OF NEW OPCODES RATHER THAN TWO MORE FIELDS ON THE TYPED ONES, for the reason the
+	// bands have. A selector a server does not know is answered "undefined" for that column --
+	// odd but survivable. K is different: a server that read the frame without them would take
+	// the following bytes as the next spec and misparse the rest of the request, and a server
+	// that knew the function but not its K would have to invent one. A cutoff computed for the
+	// wrong k is a plausible number that silently returns the wrong rows, so the question is
+	// asked only in a frame that can carry the whole of it.
+	//
+	// Typed only, for opAggregateTyped's reason inverted: these ship after typed group cells
+	// exist, so there is no older peer whose reply shape they would be changing, and the reply
+	// that needs no parse-back is the only one worth defining.
+	//
+	// [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name][k i32][desc u8]}
+	opAggregateTopK op = 84
+	// [name][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter][name][k i32][desc u8]}[stats u8]
+	opArchiveAggregateTopK op = 85
+
 	// opJoinAgg is a GROUP BY over a join's rows, reduced in the store: the join opcodes'
 	// plan followed by the reduction, answered with one row per GROUP.
 	//

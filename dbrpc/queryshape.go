@@ -343,6 +343,12 @@ func aggFuncName(f AggFunc) string {
 		return "max"
 	case db.AggList:
 		return "list"
+	case db.AggTopKThreshold:
+		// The k is deliberately NOT in the name. A fingerprint groups the queries a table is
+		// being asked, and "the newest 5 per owner" and "the newest 50 per owner" are one
+		// query shape with a different parameter -- naming the k would scatter one shape
+		// across a report as many.
+		return "topk threshold"
 	}
 	return "agg" + strconv.Itoa(int(f))
 }
