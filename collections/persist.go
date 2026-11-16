@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -96,11 +97,11 @@ func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
 // dereferenced, never Closed: an in-flight scan may still be decompressing through one
 // (its pinned segment holds the codec reference), so the GC reclaims each codec when
 // its last user finishes.
-func (r *dictReg) prune(keep func(Codec) bool) []uint32 {
+func (r *dictReg) prune(keep func(id uint32, c Codec) bool) []uint32 {
 	r.mu.Lock()
 	var removed []uint32
 	for id, c := range r.byID {
-		if id == 0 || keep(c) {
+		if id == 0 || keep(id, c) {
 			continue
 		}
 		delete(r.byID, id)
@@ -137,6 +138,57 @@ func (r *dictReg) releaseEncodersExcept(keep Codec) {
 	for _, c := range codecs {
 		if z, ok := c.(*zstdCodec); ok {
 			z.releaseEncoder()
+		}
+	}
+}
+
+// dictIDFromSegmentName returns the dictionary id encoded in a segment file name, which is
+// the ONLY place that id is recorded -- the segment's bytes do not carry it.
+//
+// It deliberately accepts any prefix, not just "seg". Rewrites in flight (compaction,
+// merge, reseal) stage their output under other prefixes, and a file left behind by one
+// that was interrupted still needs its dictionary to be read. Matching loosely keeps a
+// dictionary alive that nothing needs; matching strictly destroys one that something does.
+func dictIDFromSegmentName(name string) (uint32, bool) {
+	base, ok := strings.CutSuffix(name, ".dat")
+	if !ok {
+		return 0, false
+	}
+	i := strings.LastIndex(base, ".d")
+	if i < 0 {
+		return 0, false
+	}
+	digits := base[i+2:]
+	if digits == "" {
+		return 0, false
+	}
+	var id uint64
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		id = id*10 + uint64(r-'0')
+		if id > math.MaxUint32 {
+			return 0, false
+		}
+	}
+	return uint32(id), true
+}
+
+// collectSegmentDictIDs adds to into every dictionary id named by a segment file in
+// shardDir. An unreadable directory contributes nothing, which leaves the caller with the
+// in-memory answer it had before.
+func collectSegmentDictIDs(shardDir string, into map[uint32]bool) {
+	entries, err := os.ReadDir(shardDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if id, ok := dictIDFromSegmentName(e.Name()); ok {
+			into[id] = true
 		}
 	}
 }

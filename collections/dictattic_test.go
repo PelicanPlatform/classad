@@ -63,7 +63,7 @@ func TestPruneRetiresDictionaryInsteadOfDeleting(t *testing.T) {
 		}
 	}
 
-	removed := reg.prune(func(c Codec) bool { return c == keepMe })
+	removed := reg.prune(func(_ uint32, c Codec) bool { return c == keepMe })
 	t.Logf("prune removed ids %v from the registry", removed)
 
 	if _, err := os.Stat(filepath.Join(dictsDir, fmt.Sprintf("%d.zst", keepID))); err != nil {
@@ -113,7 +113,7 @@ func TestAtticDictionaryStillDecodes(t *testing.T) {
 	plain := samples[42]
 	frame := codec.Compress(nil, plain)
 
-	reg.prune(func(Codec) bool { return false })
+	reg.prune(func(uint32, Codec) bool { return false })
 
 	raw, err := os.ReadFile(filepath.Join(dictsDir, "attic", fmt.Sprintf("%d.zst", id)))
 	if err != nil {
