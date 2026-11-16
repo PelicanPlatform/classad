@@ -28,14 +28,21 @@ package collections
 //
 //	[ ...arena..., zero fill to the original segment size ]
 //	[ section bodies, in directory order                  ]
-//	[ directory: nsec * (id u16 | pad u16 | len u32)      ]
+//	[ directory: nsec * (id u16 | pad u16 | len u32 | crc32c u32) ]
 //	[ foot: trailerBytes u64 | nsec u32 | crc32c u32 | magic u32("SGT1") ]
 //
-// The CRC is load-bearing in a way the sidecar's is not. The trailer sits in a region that
-// was block-reserved and zero-filled, and is rewritten in place when a section is added, so
-// a torn write could leave bytes that happen to end in the magic. A trailer that does not
-// verify is treated as no trailer at all: the segment maps whole, which is exactly what
-// every segment written before this did.
+// EVERY SECTION CARRIES ITS OWN CHECKSUM, and the foot's covers the directory and the foot
+// alone -- not the bodies. That split is what makes a damaged trailer recoverable in
+// pieces rather than lost whole. The directory is the index, so if it does not verify
+// nothing can be located and the trailer is gone; but once it does, every (id, length,
+// checksum) is known good, each body can be checked on its own, and one bad section costs
+// exactly itself. A trailer holding three dictionary replicas does not lose all three
+// because one segment got a bad block.
+//
+// The foot's checksum is also what keeps a zero-filled region that happens to end in the
+// magic from reading as a trailer. A trailer whose DIRECTORY does not verify is treated as
+// no trailer at all: the segment maps whole, which is exactly what every segment written
+// before this did.
 
 import (
 	"encoding/binary"
@@ -51,8 +58,9 @@ const (
 	segTrailerMagic = 0x53475431 // "SGT1"
 	// segTrailerFootLen is trailerBytes u64 + nsec u32 + crc32c u32 + magic u32.
 	segTrailerFootLen = 20
-	// segTrailerDirEntryLen is id u16 + pad u16 (so the length is 4-byte aligned) + len u32.
-	segTrailerDirEntryLen = 8
+	// segTrailerDirEntryLen is id u16 + pad u16 (so the length is 4-byte aligned) + len u32
+	// + the section's own crc32c u32.
+	segTrailerDirEntryLen = 12
 	// segTrailerMaxSections bounds what the foot may claim before the directory is read,
 	// so a corrupt nsec cannot make the reader address far outside the file.
 	segTrailerMaxSections = 64
@@ -85,6 +93,11 @@ type segTrailerSection struct {
 // may repeat: a carrier holding two dictionary replicas has two sections with the same id.
 type segTrailer struct {
 	sections []segTrailerSection
+	// damaged are the ids of sections whose body failed its own checksum. The directory
+	// verified, so each of these is known to have been written and known to be unusable
+	// now -- which is a different and more useful fact than the section simply being
+	// absent. Nothing else in the trailer is affected by them.
+	damaged []uint16
 	// bytes is the trailer's whole on-disk length, which is what a reader subtracts from
 	// the file size to get the arena.
 	bytes int
@@ -107,14 +120,18 @@ func buildSegTrailer(sections []segTrailerSection) []byte {
 	for _, s := range kept {
 		out = append(out, s.body...)
 	}
+	dirAt := len(out)
 	for _, s := range kept {
 		out = binary.LittleEndian.AppendUint16(out, s.id)
 		out = binary.LittleEndian.AppendUint16(out, 0) // pad
 		out = binary.LittleEndian.AppendUint32(out, uint32(len(s.body)))
+		out = binary.LittleEndian.AppendUint32(out, crc32.Checksum(s.body, crcTable))
 	}
 	out = binary.LittleEndian.AppendUint64(out, uint64(total))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(kept)))
-	out = binary.LittleEndian.AppendUint32(out, crc32.Checksum(out, crcTable))
+	// Over the directory and the foot's own fields, NOT over the bodies: each body is
+	// checked against its directory entry instead, so one bad block costs one section.
+	out = binary.LittleEndian.AppendUint32(out, crc32.Checksum(out[dirAt:], crcTable))
 	return binary.LittleEndian.AppendUint32(out, segTrailerMagic)
 }
 
@@ -130,9 +147,6 @@ func parseSegTrailer(b []byte) (segTrailer, bool) {
 	if binary.LittleEndian.Uint32(foot[16:]) != segTrailerMagic {
 		return segTrailer{}, false
 	}
-	if crc32.Checksum(b[:len(b)-8], crcTable) != binary.LittleEndian.Uint32(foot[12:]) {
-		return segTrailer{}, false
-	}
 	total := binary.LittleEndian.Uint64(foot[0:])
 	nsec := binary.LittleEndian.Uint32(foot[8:])
 	if total != uint64(len(b)) || nsec > segTrailerMaxSections {
@@ -140,6 +154,13 @@ func parseSegTrailer(b []byte) (segTrailer, bool) {
 	}
 	dirLen := int(nsec) * segTrailerDirEntryLen
 	if len(b) < dirLen+segTrailerFootLen {
+		return segTrailer{}, false
+	}
+	// The directory is the index: nothing can be located without it, so it is checked
+	// first and as a whole. Its checksum covers the foot's own fields too, which is what
+	// stops a zero-filled tail that happens to end in the magic from reading as a trailer.
+	if crc32.Checksum(b[len(b)-segTrailerFootLen-dirLen:len(b)-8], crcTable) !=
+		binary.LittleEndian.Uint32(foot[12:]) {
 		return segTrailer{}, false
 	}
 	dir := b[len(b)-segTrailerFootLen-dirLen : len(b)-segTrailerFootLen]
@@ -153,8 +174,17 @@ func parseSegTrailer(b []byte) (segTrailer, bool) {
 		if n < 0 || at+n > len(bodies) {
 			return segTrailer{}, false
 		}
-		t.sections = append(t.sections, segTrailerSection{id: id, body: bodies[at : at+n]})
+		body := bodies[at : at+n]
 		at += n
+		// The directory verified, so this entry's length and checksum are known good and
+		// the slice above is in the right place. A body that fails its own checksum
+		// therefore costs exactly itself: it is named as damaged and every other section
+		// is handed back untouched.
+		if crc32.Checksum(body, crcTable) != binary.LittleEndian.Uint32(e[8:]) {
+			t.damaged = append(t.damaged, id)
+			continue
+		}
+		t.sections = append(t.sections, segTrailerSection{id: id, body: body})
 	}
 	// Body bytes the directory does not address are left alone rather than refused. The
 	// CRC has already vouched for them, so they are not damage; they are a writer doing
@@ -350,6 +380,10 @@ func addDictReplica(path string, arenaUsed int, id uint32, dict []byte) error {
 	}
 	var keep []segTrailerSection
 	if t, ok := readSegTrailerFile(path); ok {
+		// t.sections holds only what verified, so a section whose body failed its own
+		// checksum is dropped by this rewrite rather than carried forward as garbage.
+		// That is the right outcome and not a silent one: the damage is reported by Fsck,
+		// and a damaged replica is replaced by the next census.
 		for _, s := range t.sections {
 			if s.id == segSecDictReplica {
 				if got, _, ok := decodeDictReplica(s.body); ok && got == id {

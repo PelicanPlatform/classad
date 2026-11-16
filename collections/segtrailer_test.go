@@ -123,25 +123,34 @@ func TestSegTrailerRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSegTrailerRejectsDamage: the trailer lives in a region that was block-reserved and
-// zero-filled and is rewritten in place, so a torn write can leave bytes that end in the
-// magic. Anything that does not verify must read as NO trailer, which maps the segment
-// whole -- exactly what every segment written before trailers existed does.
-func TestSegTrailerRejectsDamage(t *testing.T) {
+// TestSegTrailerRejectsDirectoryDamage: the directory is the index. Nothing in the
+// trailer can be located without it, so damage there loses the trailer whole -- and that
+// has to read as NO trailer, which maps the segment exactly as every segment written
+// before trailers existed.
+//
+// The foot's checksum is also what keeps a zero-filled region that happens to end in the
+// magic from being taken for one.
+func TestSegTrailerRejectsDirectoryDamage(t *testing.T) {
+	bodyLen := 256
 	good := buildSegTrailer([]segTrailerSection{
-		{id: segSecDictReplica, body: encodeDictReplica(3, bytes.Repeat([]byte("dict"), 64))},
+		{id: segSecDictReplica, body: encodeDictReplica(3, bytes.Repeat([]byte("dict"), 63))},
 		{id: 9, body: []byte("another section")},
 	})
 	if _, ok := parseSegTrailer(good); !ok {
 		t.Fatal("control: the undamaged trailer does not parse")
 	}
+	dirAt := len(good) - segTrailerFootLen - 2*segTrailerDirEntryLen
+	if dirAt != bodyLen+len("another section") {
+		t.Fatalf("directory starts at %d; the test's arithmetic is wrong", dirAt)
+	}
 
-	// One flipped bit anywhere -- body, directory or foot -- must be caught.
-	for _, off := range []int{0, 7, len(good) / 2, len(good) - 24, len(good) - 20, len(good) - 9} {
+	// One flipped bit anywhere in the directory or the foot.
+	for _, off := range []int{dirAt, dirAt + 5, dirAt + segTrailerDirEntryLen,
+		len(good) - segTrailerFootLen, len(good) - 9, len(good) - 1} {
 		damaged := append([]byte(nil), good...)
 		damaged[off] ^= 0x01
 		if _, ok := parseSegTrailer(damaged); ok {
-			t.Errorf("a flipped bit at offset %d was not caught", off)
+			t.Errorf("a flipped bit at offset %d (directory/foot) was not caught", off)
 		}
 	}
 	for _, tc := range []struct {
@@ -165,6 +174,54 @@ func TestSegTrailerRejectsDamage(t *testing.T) {
 	binary.LittleEndian.PutUint32(absurd[len(absurd)-12:], segTrailerMaxSections+1)
 	if _, ok := parseSegTrailer(absurd); ok {
 		t.Error("a foot claiming too many sections was accepted")
+	}
+}
+
+// TestSegTrailerLosesOnlyTheDamagedSection is why each section carries its own checksum.
+// A trailer holding three dictionary replicas must not lose all three because one segment
+// got a bad block: the directory says where each body is and what it should hash to, so a
+// damaged body costs exactly itself and is NAMED, which is a more useful fact than the
+// section simply being absent.
+func TestSegTrailerLosesOnlyTheDamagedSection(t *testing.T) {
+	first := encodeDictReplica(1, bytes.Repeat([]byte("one"), 40))
+	middle := encodeDictReplica(2, bytes.Repeat([]byte("two"), 40))
+	last := []byte("a section this build does not know")
+	good := buildSegTrailer([]segTrailerSection{
+		{id: segSecDictReplica, body: first},
+		{id: segSecDictReplica, body: middle},
+		{id: 4242, body: last},
+	})
+
+	// Damage the middle body, which is the hardest case: the sections around it are
+	// located by lengths that sit in the (undamaged) directory, not by scanning.
+	damaged := append([]byte(nil), good...)
+	damaged[len(first)+7] ^= 0x01
+
+	tr, ok := parseSegTrailer(damaged)
+	if !ok {
+		t.Fatal("a trailer with one damaged body was thrown away whole")
+	}
+	if len(tr.damaged) != 1 || tr.damaged[0] != segSecDictReplica {
+		t.Errorf("damaged = %v; want one section %d", tr.damaged, segSecDictReplica)
+	}
+	if len(tr.sections) != 2 {
+		t.Fatalf("%d sections survived; want 2", len(tr.sections))
+	}
+	if !bytes.Equal(tr.sections[0].body, first) {
+		t.Error("the section before the damage did not survive intact")
+	}
+	if tr.sections[1].id != 4242 || !bytes.Equal(tr.sections[1].body, last) {
+		t.Error("the section after the damage did not survive intact")
+	}
+	// And the point of it: the replica that was not damaged is still usable.
+	if got, has := tr.dictReplica(1); !has || !bytes.Equal(got, first[4:]) {
+		t.Error("the undamaged dictionary replica is no longer readable")
+	}
+	if _, has := tr.dictReplica(2); has {
+		t.Error("the damaged replica was handed back as if it were good")
+	}
+	if ids := tr.dictReplicaIDs(); len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("dictReplicaIDs = %v; want [1]", ids)
 	}
 }
 
@@ -451,13 +508,19 @@ func TestSegTrailerToleratesUnaddressedBodyBytes(t *testing.T) {
 	// by the checksum first.
 	build := func(bodies []byte, id uint16, declared uint32) []byte {
 		out := append([]byte(nil), bodies...)
+		dirAt := len(out)
 		out = binary.LittleEndian.AppendUint16(out, id)
 		out = binary.LittleEndian.AppendUint16(out, 0)
 		out = binary.LittleEndian.AppendUint32(out, declared)
+		var sum uint32
+		if int(declared) <= len(bodies) {
+			sum = crc32.Checksum(bodies[:declared], crcTable)
+		}
+		out = binary.LittleEndian.AppendUint32(out, sum)
 		total := len(bodies) + segTrailerDirEntryLen + segTrailerFootLen
 		out = binary.LittleEndian.AppendUint64(out, uint64(total))
 		out = binary.LittleEndian.AppendUint32(out, 1)
-		out = binary.LittleEndian.AppendUint32(out, crc32.Checksum(out, crcTable))
+		out = binary.LittleEndian.AppendUint32(out, crc32.Checksum(out[dirAt:], crcTable))
 		return binary.LittleEndian.AppendUint32(out, segTrailerMagic)
 	}
 
