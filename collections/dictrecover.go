@@ -91,8 +91,12 @@ func sweepDictReplicas(dir string, shards int, want map[uint32]bool) map[uint32]
 // usableDictReplica reports whether bytes found in a trailer are a dictionary this store
 // can use for id. See sweepDictReplicas for why the id has to agree.
 func usableDictReplica(dict []byte, id uint32) bool {
-	got, ok := dictIDOf(dict)
-	if !ok || (got != id && got != legacyDictID) {
+	if _, ok := dictIDOf(dict); !ok {
+		return false
+	}
+	// A stamped dictionary must name this slot. One that is not stamped names no slot at
+	// all and is taken at its label, exactly as loadDicts takes such a file.
+	if slot, named := dictSlotOf(dict); named && slot != id {
 		return false
 	}
 	codec, err := NewZSTDCodec(dict)
