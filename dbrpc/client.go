@@ -879,6 +879,35 @@ func (c *Client) WatchHead(ctx context.Context, table string) ([]byte, error) {
 	return append([]byte(nil), body.bytesRef()...), nil
 }
 
+// watchStopWait bounds the stop handshake. opWatchStop is best effort by its own contract --
+// a server that never hears it drops the watch when the connection goes -- so it must never
+// be the thing that holds a shutdown open.
+const watchStopWait = 5 * time.Second
+
+// watchStop builds the cancel function a watch hands back: it tells the server to end the
+// stream, once, and frees the read loop while it does so.
+//
+// Draining here is not tidiness, it is what keeps the connection from deadlocking. One
+// goroutine delivers every frame on this connection, this stop's own response among them,
+// and by the time a watcher gives up that loop may already be parked handing THIS stream a
+// frame nobody will read again. Waiting for the response without draining closes a cycle:
+// the response cannot arrive until the read loop moves, and the read loop cannot move until
+// someone reads this stream. It is not a slow shutdown, it is a permanent one, and it takes
+// every other call on the connection with it. Draining in the background breaks the cycle
+// from the other side; the bounded context covers a server that has stopped answering at
+// all, so the wait cannot outlive a termination grace period.
+func (c *Client) watchStop(id uint64, frames <-chan []byte) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			go drain(frames)
+			ctx, cancel := context.WithTimeout(context.Background(), watchStopWait)
+			defer cancel()
+			_, _, _ = c.callCtx(ctx, func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) }) //nolint:errcheck // best effort: see above
+		})
+	}
+}
+
 // WatchTable streams changes to the named table.
 func (c *Client) WatchTable(ctx context.Context, table string, cursor []byte) (<-chan WatchEvent, func(), error) {
 	id, frames, _, err := c.callStream(func(rid uint64) []byte {
@@ -887,20 +916,14 @@ func (c *Client) WatchTable(ctx context.Context, table string, cursor []byte) (<
 	if err != nil {
 		return nil, nil, err
 	}
-	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			_, _, _ = c.callCtx(context.Background(), func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) }) //nolint:errcheck // best effort: a server that never hears the stop drops the watch when the connection goes
-		})
-	}
+	stop := c.watchStop(id, frames)
 	events := make(chan WatchEvent, 64)
 	go func() {
 		defer close(events)
 		for {
 			select {
 			case <-ctx.Done():
-				stop() // tell the server to end the stream; frames is drained below
-				drain(frames)
+				stop() // tells the server to end the stream and drains it; see watchStop
 				return
 			case frame, ok := <-frames:
 				if !ok {
@@ -918,7 +941,6 @@ func (c *Client) WatchTable(ctx context.Context, table string, cursor []byte) (<
 				case events <- ev:
 				case <-ctx.Done():
 					stop()
-					drain(frames)
 					return
 				}
 			}
