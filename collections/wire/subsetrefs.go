@@ -138,9 +138,16 @@ func AppendAdSubsetInlineRefs(dst []byte, src Ad, keep func(name []byte, h uint3
 	// 20k real job ads with a 21-attribute projection, the indexed form ran 382ms against 190ms
 	// for this one, because the common case needs a SINGLE pass and pays for an index it never
 	// re-reads.
+	// walk is the entry cursor, declared outside the loop and reset in place rather than
+	// written as `c = &cursor{...}`, which the compiler could not keep on the stack. That one
+	// allocation is per CALL, and this is called once per record by every reference-chasing
+	// wire scan -- so it was 100,000 allocations on a 100,000-row scan, against a scratch
+	// buffer the caller reuses across the whole iteration precisely to avoid them.
+	var walk cursor
 	for {
 		again = false
-		c = &cursor{b: src, pos: entriesStart, ok: true, inline: true}
+		walk = cursor{b: src, pos: entriesStart, ok: true, inline: true}
+		c = &walk
 		for i := uint64(0); i < attrCount && c.ok; i++ {
 			entryStart := c.pos
 			name := c.readNameBytes()
