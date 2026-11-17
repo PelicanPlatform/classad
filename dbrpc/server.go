@@ -351,7 +351,7 @@ func (o op) isMutating() bool {
 		opCreateTableMem, opTableToMemory, opCreateView, opDropView,
 		opCreateExporter, opDropExporter, opPutExporterState,
 		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem,
-		opSetPrimaryKey, opInsertSelect:
+		opSetPrimaryKey, opInsertSelect, opInsertRows:
 		return true
 	}
 	return false
@@ -889,6 +889,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.serveSetPrimaryKey(reqID, body, sc.write)
 	case opInsertSelect:
 		sc.s.serveInsertSelect(sc.ctx, reqID, body, priv, sc.write)
+	case opInsertRows:
+		sc.s.serveInsertRows(sc.ctx, reqID, body, priv, sc.write)
 	case opQueryKeys:
 		sc.s.streamQueryKeys(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTxnQuery:

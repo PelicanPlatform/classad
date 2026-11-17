@@ -80,23 +80,7 @@ func (s InsertSpec) Validate() error {
 
 // covers reports whether every declared key column is among the inserted column names.
 func (s InsertSpec) covers(keyCols []string) error {
-	have := make(map[string]bool, len(s.Names))
-	for _, n := range s.Names {
-		have[strings.ToLower(n)] = true
-	}
-	var missing []string
-	for _, k := range keyCols {
-		if !have[strings.ToLower(k)] {
-			missing = append(missing, k)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf(
-			"insert: the target's primary key is (%s) but the inserted columns (%s) do not "+
-				"include %s, so no row can be given a key",
-			strings.Join(keyCols, ", "), strings.Join(s.Names, ", "), strings.Join(missing, ", "))
-	}
-	return nil
+	return checkKeyCovered(s.Names, keyCols, "insert")
 }
 
 // BuildInsertAds turns aggregate result rows into the ads to be written.
