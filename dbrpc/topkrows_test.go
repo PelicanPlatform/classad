@@ -461,3 +461,93 @@ func TestTopKRowsOpcodeRowsSurviveLaterTraffic(t *testing.T) {
 		}
 	}
 }
+
+// TestTopKRowsOpcodeCarriesNonScalarGroups covers the one group kind the value codec has no
+// form for: a LIST or a nested ad.
+//
+// Such a group crosses as its group TEXT under the excExpr tag, exactly as appendAggRow sends
+// one, and the client reads the value back out of that text -- exact, because a group's text is
+// a ClassAd literal. Both halves of that are untested by every scalar case above, and a client
+// that read the tag as a plain string group would report a DIFFERENT group label for the same
+// rows without failing anything.
+func TestTopKRowsOpcodeCarriesNonScalarGroups(t *testing.T) {
+	d, err := db.OpenConfig(db.Config{Dir: t.TempDir(), SegmentSize: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	s := NewServer(d)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConnOpts(sconn, ServeOptions{IncludePrivate: true}) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close() }()
+
+	tx := d.Begin()
+	for i := 0; i < 20; i++ {
+		ad, perr := classad.ParseOld(fmt.Sprintf(
+			"Tags = { %d, %d }\nQDate = %d\nPayload = \"p%d\"", i%2, (i%2)+1, 1700000000+i, i))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := TopKRowsSpec{
+		GroupCols: []db.GroupCol{{Attr: "Tags"}},
+		OrderBy:   db.OrderOne("QDate", true),
+		K:         2, Attrs: []string{"Payload"},
+	}
+	got, err := c.TopKRowsPerGroup(context.Background(), "true", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := d.TopKRowsPerGroupWire("true", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, g := renderLocalGroups(t, want), renderWireGroups(t, got)
+	if len(g) != 2 || len(w) != 2 {
+		t.Fatalf("groups: opcode %d, rung %d, want 2 each", len(g), len(w))
+	}
+	for label, rows := range w {
+		if !strings.HasPrefix(label, "{") {
+			t.Fatalf("group label %q is not a list literal, so this test is not exercising "+
+				"the non-scalar path", label)
+		}
+		if g[label] != rows {
+			t.Errorf("group %q: opcode %q, rung %q", label, g[label], rows)
+		}
+	}
+}
+
+// TestTopKRowsOpcodeRejections covers the refusals: a table that does not exist, and a
+// constraint the store cannot parse. Both must come back as errors rather than as an empty
+// answer, which a caller would read as "nothing matched".
+func TestTopKRowsOpcodeRejections(t *testing.T) {
+	_, c, done := topKFixture(t, 2, 10, 0)
+	defer done()
+	spec := TopKRowsSpec{
+		GroupCols: []db.GroupCol{{Attr: "Owner"}}, OrderBy: db.OrderOne("QDate", true),
+		K: 2, Attrs: []string{"Payload"},
+	}
+	t.Run("no such table", func(t *testing.T) {
+		if _, err := c.TopKRowsPerGroupTable(context.Background(), "nope", "true", spec); err == nil {
+			t.Fatal("a table that does not exist answered")
+		}
+	})
+	t.Run("unparseable constraint", func(t *testing.T) {
+		if _, err := c.TopKRowsPerGroup(context.Background(), "this is not (a constraint", spec); err == nil {
+			t.Fatal("an unparseable constraint answered")
+		}
+	})
+	t.Run("k of zero", func(t *testing.T) {
+		bad := spec
+		bad.K = 0
+		if _, err := c.TopKRowsPerGroup(context.Background(), "true", bad); err == nil {
+			t.Fatal("K=0 answered")
+		}
+	})
+}
