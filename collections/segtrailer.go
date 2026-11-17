@@ -81,6 +81,20 @@ const (
 	// dictionaries as damaged rather than as missing: those ARE compressed, by the zstd
 	// dictionary that is gone.
 	segSecDictReplica uint16 = 1
+	// segSecDictFingerprint records WHICH compression dictionary a segment's records were
+	// written under, and what that dictionary was: the id, its length, and a CRC-32C of
+	// its bytes.
+	//
+	// The id alone is already on disk -- it is in the file name, and since stamping it is
+	// in every frame header too -- so what this adds is the third case. A dictionary file
+	// that is stamped with the right id but holds DIFFERENT BYTES passes every check
+	// there was: loadDicts accepts it, fsck's file check accepts it, and then every frame
+	// fails its content checksum, is classified as an ordinary decode skip, and the
+	// records quietly stop appearing in results. Bitrot in a dictionary file reaches that
+	// state on its own.
+	//
+	// Body: dictID u32 | dictLen u32 | dictCRC u32.
+	segSecDictFingerprint uint16 = 2
 )
 
 // segTrailerSection is one typed piece of a trailer.
@@ -327,6 +341,29 @@ func segArenaEnd(path string) (int64, error) {
 	return st.Size(), nil
 }
 
+// encodeDictFingerprint builds a segSecDictFingerprint body.
+func encodeDictFingerprint(id uint32, dictLen int, crc uint32) []byte {
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint32(b[0:], id)
+	binary.LittleEndian.PutUint32(b[4:], uint32(dictLen))
+	binary.LittleEndian.PutUint32(b[8:], crc)
+	return b
+}
+
+// dictFingerprint returns what a trailer records about the dictionary its segment was
+// written under. ok is false when it records none, which is every segment sealed before
+// fingerprints existed and every one with no room for a trailer.
+func (t segTrailer) dictFingerprint() (id, dictLen, crc uint32, ok bool) {
+	for _, s := range t.sections {
+		if s.id == segSecDictFingerprint && len(s.body) >= 12 {
+			return binary.LittleEndian.Uint32(s.body[0:]),
+				binary.LittleEndian.Uint32(s.body[4:]),
+				binary.LittleEndian.Uint32(s.body[8:]), true
+		}
+	}
+	return 0, 0, 0, false
+}
+
 // encodeDictReplica builds a segSecDictReplica body: the dictionary id, then the
 // dictionary's own bytes, uncompressed.
 func encodeDictReplica(id uint32, dict []byte) []byte {
@@ -399,9 +436,9 @@ const replicaSizeRatio = 8
 // been, inside the arena, with room to spare.
 const trailerWalkGuard = recHeaderSize
 
-// addDictReplica writes a copy of a compression dictionary into a sealed segment file's
-// trailer, replacing any copy of the same dictionary already there and keeping every other
-// section, including ones this build does not recognise.
+// updateSegTrailer rewrites a sealed segment file's trailer, handing revise the sections
+// that are there now and writing back whatever it returns. It is the one way anything adds
+// to a trailer, so the rules below hold for every section kind.
 //
 // arenaUsed is the segment's written extent. The caller has it (the segment, or its
 // sidecar, records it) and this cannot safely guess: see trailerWalkGuard.
@@ -409,6 +446,34 @@ const trailerWalkGuard = recHeaderSize
 // The segment must be SEALED. A trailer sits past the arena and an active segment's appends
 // grow into it; recovery maps only the arena, so an active segment that acquired a trailer
 // would quietly lose that space.
+//
+// Sections that failed their own checksum are NOT handed to revise and so are dropped by
+// the rewrite rather than carried forward as garbage. That is the right outcome and not a
+// silent one: the damage is reported by Fsck, and a damaged replica is replaced by the next
+// census.
+func updateSegTrailer(path string, arenaUsed int, revise func([]segTrailerSection) []segTrailerSection) error {
+	arenaEnd, err := segArenaEnd(path)
+	if err != nil {
+		return err
+	}
+	if int64(arenaUsed)+trailerWalkGuard > arenaEnd {
+		return fmt.Errorf("%w: %d of %d bytes written leaves no room before the trailer",
+			ErrNoRoomForReplica, arenaUsed, arenaEnd)
+	}
+	var have []segTrailerSection
+	if t, ok := readSegTrailerFile(path); ok {
+		for _, s := range t.sections {
+			// Copy: these alias the buffer the read allocated, and the rebuild appends
+			// them into a new one.
+			have = append(have, segTrailerSection{id: s.id, body: append([]byte(nil), s.body...)})
+		}
+	}
+	return writeSegTrailer(path, arenaEnd, revise(have))
+}
+
+// addDictReplica writes a copy of a compression dictionary into a sealed segment file's
+// trailer, replacing any copy of the same dictionary already there and keeping every other
+// section, including ones this build does not recognise.
 func addDictReplica(path string, arenaUsed int, id uint32, dict []byte) error {
 	if id == 0 || len(dict) == 0 {
 		return fmt.Errorf("collections: dictionary %d has nothing to replicate", id)
@@ -420,27 +485,36 @@ func addDictReplica(path string, arenaUsed int, id uint32, dict []byte) error {
 	if int64(len(dict))*replicaSizeRatio > arenaEnd {
 		return fmt.Errorf("%w: %d bytes into a %d byte segment", ErrNoRoomForReplica, len(dict), arenaEnd)
 	}
-	if int64(arenaUsed)+trailerWalkGuard > arenaEnd {
-		return fmt.Errorf("%w: %d of %d bytes written leaves no room before the trailer",
-			ErrNoRoomForReplica, arenaUsed, arenaEnd)
-	}
-	var keep []segTrailerSection
-	if t, ok := readSegTrailerFile(path); ok {
-		// t.sections holds only what verified, so a section whose body failed its own
-		// checksum is dropped by this rewrite rather than carried forward as garbage.
-		// That is the right outcome and not a silent one: the damage is reported by Fsck,
-		// and a damaged replica is replaced by the next census.
-		for _, s := range t.sections {
+	return updateSegTrailer(path, arenaUsed, func(have []segTrailerSection) []segTrailerSection {
+		keep := have[:0]
+		for _, s := range have {
 			if s.id == segSecDictReplica {
 				if got, _, ok := decodeDictReplica(s.body); ok && got == id {
 					continue // replaced below
 				}
 			}
-			// Copy: these alias the buffer the read allocated, and the rebuild appends
-			// them into a new one.
-			keep = append(keep, segTrailerSection{id: s.id, body: append([]byte(nil), s.body...)})
+			keep = append(keep, s)
 		}
+		return append(keep, segTrailerSection{id: segSecDictReplica, body: encodeDictReplica(id, dict)})
+	})
+}
+
+// addDictFingerprint records which compression dictionary a sealed segment was written
+// under, and what that dictionary was. Unlike a replica it costs twelve bytes, so it is
+// not bounded against the segment's size -- only against the walk guard, which every
+// trailer must respect.
+func addDictFingerprint(path string, arenaUsed int, id uint32, dict []byte) error {
+	if id == 0 || len(dict) == 0 {
+		return fmt.Errorf("collections: dictionary %d has nothing to fingerprint", id)
 	}
-	keep = append(keep, segTrailerSection{id: segSecDictReplica, body: encodeDictReplica(id, dict)})
-	return writeSegTrailer(path, arenaEnd, keep)
+	body := encodeDictFingerprint(id, len(dict), crc32.Checksum(dict, crcTable))
+	return updateSegTrailer(path, arenaUsed, func(have []segTrailerSection) []segTrailerSection {
+		keep := have[:0]
+		for _, s := range have {
+			if s.id != segSecDictFingerprint {
+				keep = append(keep, s)
+			}
+		}
+		return append(keep, segTrailerSection{id: segSecDictFingerprint, body: body})
+	})
 }

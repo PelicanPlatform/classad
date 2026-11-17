@@ -60,6 +60,9 @@ type FsckSegment struct {
 	Path   string
 	Size   int
 	DictID uint32 // the dictionary named in the file name
+	// probed and probeFailures are how many sample records were decoded with the
+	// dictionary named above, and how many refused. See dictprobe.go.
+	probed, probeFailures int
 	// DictUnusable is set when DictID names a compression dictionary this store cannot
 	// supply -- no file in dicts/, or a file that does not load. The segment's framing and
 	// checksums are still checked and Records still counts what verified, because that is
@@ -218,6 +221,11 @@ type FsckReport struct {
 	// are not damaged and nothing is lost; they are in the wrong places, and Repair puts
 	// them right by re-filing each under the id it names.
 	DictsMislabelled []FsckDictLabel
+	// DictChecks are the segments where the dictionary recorded in the trailer and the
+	// records themselves disagree about which dictionary this is, or where one of the two
+	// could not be had. Checking twice is what separates a wrong dictionary from damaged
+	// records; see dictprobe.go. Segments where both checks are content are not listed.
+	DictChecks []FsckDictCheck
 	// Trailers is damage in the segment trailers: one whose directory will not read at
 	// all, or sections inside one that failed their own checksum. A trailer that was
 	// never written is not damage and is not reported here.
@@ -405,6 +413,9 @@ func (r *FsckReport) String() string {
 	for _, d := range r.DictsDamaged {
 		fmt.Fprintf(&b, "  DAMAGED dictionary %d: %s -- %s\n", d.ID, d.Path, d.Why)
 	}
+	for _, c := range r.DictChecks {
+		fmt.Fprintf(&b, "  DICTIONARY MISMATCH %s: %s\n", filepath.Base(c.Path), c.Verdict())
+	}
 	for _, m := range r.DictsMislabelled {
 		fmt.Fprintf(&b, "  MISLABELLED %s: it carries dictionary id %d, not %d -- "+
 			"the segments naming %d would decode to nothing\n",
@@ -466,6 +477,9 @@ func Fsck(dir string) (*FsckReport, error) {
 		have[id] = true
 	}
 	have[0] = true // id 0 is the base codec, reconstructed from Options, never a file
+	// One codec per usable dictionary, so each segment's probe costs a decode rather than
+	// a dictionary load. See dictprobe.go.
+	kits := newDictProbeKits(filepath.Join(dir, "dicts"), present)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -502,7 +516,7 @@ func Fsck(dir string) (*FsckReport, error) {
 						"dictionary it needs may be pruned at the next open"})
 				continue
 			}
-			seg, segErr := fsckSegment(path, dictID)
+			seg, segErr := fsckSegment(path, dictID, kits[dictID])
 			if segErr != nil {
 				r.Strays = append(r.Strays, FsckStray{path, segErr.Error()})
 				continue
@@ -510,6 +524,11 @@ func Fsck(dir string) (*FsckReport, error) {
 			if !have[dictID] {
 				missing[dictID] = true
 				seg.DictUnusable = true
+			}
+			if dictID != 0 {
+				if chk := checkSegDict(path, dictID, kits[dictID], seg.probed, seg.probeFailures); !chk.agrees() {
+					r.DictChecks = append(r.DictChecks, chk)
+				}
 			}
 			r.Segments = append(r.Segments, *seg)
 		}
@@ -655,7 +674,7 @@ func fsckDictFile(path string) string {
 
 // fsckSegment walks one segment file, resyncing past damage instead of stopping at
 // it, and reports every readable record and every unreadable run.
-func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
+func fsckSegment(path string, dictID uint32, kit *dictProbeKit) (*FsckSegment, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read: %w", err)
@@ -690,6 +709,8 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 	// the rest of the file. Only when the framing itself is unusable do we fall back to
 	// scanning for the next offset that verifies.
 	var run *FsckDamage
+	// probes are the largest compressed ads seen, kept for the dictionary probe below.
+	var probes [][]byte
 	// starts records each framed record's start for the columnar offset check: true for a
 	// keyed record that verified, false for a record that did not.
 	starts := map[int]bool{}
@@ -712,6 +733,10 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			dictVerified = dictVerified || recIsDict(data, uint32(off))
 			if !recIsMarker(data, uint32(off)) {
 				starts[off] = true
+				// Keep the largest compressed ads as probe samples. Largest first
+				// because a record that compressed well is one that leaned on the
+				// dictionary, and an incompressible record decodes under any of them.
+				probes = keepLargestProbe(probes, recAd(data, uint32(off)))
 			}
 			off += total
 			continue
@@ -794,6 +819,7 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			}
 		}
 	}
+	s.probed, s.probeFailures = runDictProbe(kit, probes)
 	return s, nil
 }
 

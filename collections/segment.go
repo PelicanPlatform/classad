@@ -120,8 +120,12 @@ type segment struct {
 	// trailer, ascending (see segtrailer.go). Read at recovery and set when a copy is
 	// written; nil for a segment carrying none, which is almost all of them.
 	carriedDicts []uint32
-	used         int   // write cursor (guarded by shard lock)
-	dead         int64 // bytes belonging to superseded/dead records (updated under shard lock)
+	// fingerprinted is whether this segment's trailer records which dictionary its
+	// records were written under, and what that dictionary was. Read at recovery and set
+	// when one is written; false for every segment sealed before fingerprints existed.
+	fingerprinted bool
+	used          int   // write cursor (guarded by shard lock)
+	dead          int64 // bytes belonging to superseded/dead records (updated under shard lock)
 
 	// Time-travel scan pruning (guarded by the shard lock; recomputed on recovery).
 	// A scan at snapshot S0 can skip this segment entirely when no record in it is

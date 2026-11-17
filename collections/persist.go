@@ -886,6 +886,25 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		}
 		if hasTrailer {
 			seg.carriedDicts = trailer.dictReplicaIDs()
+			_, _, _, seg.fingerprinted = trailer.dictFingerprint()
+			// The trailer is already read, so asking whether the dictionary this store
+			// just loaded is the one these records were written with costs a comparison.
+			// Open does not REFUSE on it -- one signal is not enough to keep a daemon
+			// down -- but it must not be silent either: the alternative is serving this
+			// segment as if it were empty.
+			c.dicts.mu.Lock()
+			pin := c.dicts.pins[sf.dictID]
+			c.dicts.mu.Unlock()
+			if checkSegFingerprint(trailer, sf.dictID, pin) {
+				dictFingerprintMismatches.Add(1)
+				if c.onDictFault != nil {
+					c.onDictFault(&DictFault{
+						ID: sf.dictID, Kind: DictFaultMismatch,
+						Path: filepath.Join(c.dir, "dicts", fmt.Sprintf("%d.zst", sf.dictID)),
+						From: filepath.Join(shardDir, sf.name),
+					})
+				}
+			}
 		}
 		// Everything between here and the end of loadShard that touches this mapping --
 		// the extent walk below, rebuildDir, a zone recompute -- reads it front to back,

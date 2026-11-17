@@ -104,6 +104,10 @@ type carrier struct {
 	used  int
 	// rank orders carriers within a shard, newest first.
 	rank uint64
+	// dictID is the compression dictionary this segment's records were written under,
+	// and fingerprinted whether its trailer already records which one that was.
+	dictID        uint32
+	fingerprinted bool
 	// carries is what this segment's trailer already holds, snapshotted under the shard
 	// lock with everything else. The pass reads THIS rather than the segment, because the
 	// segment's own list is appended to under that lock and a concurrent census -- a
@@ -156,9 +160,10 @@ func (c *Collection) takeDictCensus() dictCensus {
 			for _, id := range seg.carriedDicts {
 				carries[id] = true
 			}
+			segDict, _ := c.dicts.idFor(seg.codec)
 			cen.carriers = append(cen.carriers, carrier{
 				shard: i, seg: seg, path: seg.path, used: seg.used, rank: seg.maxSeq,
-				carries: carries,
+				carries: carries, dictID: segDict, fingerprinted: seg.fingerprinted,
 			})
 		}
 		sh.mu.RUnlock()
@@ -191,7 +196,54 @@ func (c *Collection) ensureDictReplicas() []DictReplicaState {
 		}
 		out = append(out, st)
 	}
+	c.recordDictFingerprints(&cen)
 	return out
+}
+
+// dictFingerprintBudget bounds how many fingerprints one pass writes. Every sealed segment
+// wants one and an archive has thousands, so without a budget the first census after an
+// upgrade would write to every segment in the store in a single maintenance pass. They are
+// twelve bytes each and in no hurry.
+const dictFingerprintBudget = 64
+
+// recordDictFingerprints writes, into each sealed segment that lacks one, which dictionary
+// its records were written under and what that dictionary was.
+//
+// This is the half of the check that outlives the process. The id is already on disk in
+// the file name, so what the fingerprint adds is the ability to notice that the FILE under
+// that id is no longer the dictionary those records were compressed with -- which nothing
+// else sees until every one of them fails to decode.
+func (c *Collection) recordDictFingerprints(cen *dictCensus) {
+	spent := 0
+	for i := range cen.carriers {
+		if spent >= dictFingerprintBudget {
+			return
+		}
+		cand := &cen.carriers[i]
+		if cand.fingerprinted || cand.dictID == 0 {
+			continue // already recorded, or written under the base codec, which has no file
+		}
+		c.dicts.mu.Lock()
+		pin := c.dicts.pins[cand.dictID]
+		c.dicts.mu.Unlock()
+		if pin == nil {
+			continue
+		}
+		if err := addDictFingerprint(cand.path, cand.used, cand.dictID, pin.loaded()); err != nil {
+			continue // no room, or a segment reaped out from under this pass
+		}
+		noteFingerprinted(c.shards[cand.shard], cand.seg)
+		cand.fingerprinted = true
+		spent++
+	}
+}
+
+// noteFingerprinted records a fingerprint just written, under the shard lock that guards
+// the segment's mutable state.
+func noteFingerprinted(sh *shard, seg *segment) {
+	sh.mu.Lock()
+	seg.fingerprinted = true
+	sh.mu.Unlock()
 }
 
 // topUpDictReplica writes copies of one dictionary until the target is met or the

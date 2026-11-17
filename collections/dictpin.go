@@ -59,6 +59,13 @@ const (
 	// DictFaultChanged: the same file, different contents. Also not overwritten, for the
 	// same reason.
 	DictFaultChanged
+	// DictFaultMismatch: the dictionary file is not the one a segment's records were
+	// written with, according to the fingerprint that segment recorded at seal
+	// (segtrailer.go). Unlike the three above this is not about the file CHANGING under a
+	// running store -- it is noticed at Open, against a dictionary this process has only
+	// just loaded, and it is the one state in which every record of that segment decodes
+	// to nothing while everything else about the store looks correct.
+	DictFaultMismatch
 )
 
 func (k DictFaultKind) String() string {
@@ -69,6 +76,8 @@ func (k DictFaultKind) String() string {
 		return "replaced"
 	case DictFaultChanged:
 		return "changed"
+	case DictFaultMismatch:
+		return "not the dictionary these records were written with"
 	}
 	return fmt.Sprintf("DictFaultKind(%d)", int(k))
 }
@@ -99,6 +108,10 @@ type DictFault struct {
 
 func (f *DictFault) Error() string {
 	switch {
+	case f.Kind == DictFaultMismatch:
+		return fmt.Sprintf("collections: dictionary file %s is not the one %s was written with -- "+
+			"its recorded fingerprint does not match -- so every record in that segment will fail to decode; "+
+			"run Fsck, which probes the records as well as comparing the fingerprint", f.Path, f.From)
 	case f.Kind == DictFaultMissing && f.Repaired && f.From != "":
 		return fmt.Sprintf("collections: dictionary file %s was missing and was restored from the copy in %s; the primary copy was lost while this store was not running", f.Path, f.From)
 	case f.Kind == DictFaultMissing && f.Repaired:
