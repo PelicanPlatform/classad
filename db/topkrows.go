@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"iter"
 	"math"
 	"sort"
 	"strings"
@@ -73,6 +74,18 @@ type TopKRowsSpec struct {
 // OrderOne is the spec for the common single-term ordering.
 func OrderOne(attr string, desc bool) []TopKOrderTerm {
 	return []TopKOrderTerm{{Attr: attr, Desc: desc}}
+}
+
+// TopKRowsSource is a table the top-k rungs can read: the mutable DB and an ArchiveTable both
+// expose exactly these two scans with these signatures, which is why one implementation serves
+// both rather than the archive growing a parallel copy of it.
+//
+// History is where "the top N per group" mostly points -- the five longest jobs each owner ran
+// last month is a question about completed jobs, not queued ones -- so an archive that could not
+// answer it was the bigger gap of the two.
+type TopKRowsSource interface {
+	QueryProjectStats(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error)
+	QueryRawWireRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error)
 }
 
 // TopKRowsGroup is one group's answer: the group columns' values and its best rows, ordered.
@@ -214,15 +227,25 @@ func (t *topKRowKeep) ordered() [][]classad.Value {
 // are ordered by the order attribute, best first. A group with fewer than K ranked rows returns
 // all of them.
 func (db *DB) TopKRowsPerGroup(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
-	return db.topKRowsPerGroup(constraint, spec, nil)
+	return topKRowsPerGroup(db, constraint, spec, nil)
 }
 
 // TopKRowsPerGroupStats is TopKRowsPerGroup filling stats (may be nil) with the scan's work.
 func (db *DB) TopKRowsPerGroupStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
-	return db.topKRowsPerGroup(constraint, spec, stats)
+	return topKRowsPerGroup(db, constraint, spec, stats)
 }
 
-func (db *DB) topKRowsPerGroup(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
+// TopKRowsPerGroup is DB.TopKRowsPerGroup over a history table.
+func (t *ArchiveTable) TopKRowsPerGroup(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(t, constraint, spec, nil)
+}
+
+// TopKRowsPerGroupStats is ArchiveTable.TopKRowsPerGroup filling stats (may be nil).
+func (t *ArchiveTable) TopKRowsPerGroupStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(t, constraint, spec, stats)
+}
+
+func topKRowsPerGroup(src TopKRowsSource, constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
@@ -253,7 +276,7 @@ func (db *DB) topKRowsPerGroup(constraint string, spec TopKRowsSpec, stats *coll
 	}
 	keep := len(spec.Attrs)
 
-	seq, err := db.QueryProjectStats(constraint, attrs, stats)
+	seq, err := src.QueryProjectStats(constraint, attrs, stats)
 	if err != nil {
 		return nil, err
 	}

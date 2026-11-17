@@ -167,15 +167,25 @@ func numValueOfNode(node []byte) (NumValue, bool) {
 // what comes back -- the rows are bytes, and they carry the group and order attributes whether or
 // not the caller's Attrs named them.
 func (db *DB) TopKRowsPerGroupWire(constraint string, spec TopKRowsSpec) ([]TopKRowsWireGroup, error) {
-	return db.topKRowsPerGroupWire(constraint, spec, nil)
+	return topKRowsPerGroupWire(db, constraint, spec, nil)
 }
 
 // TopKRowsPerGroupWireStats is TopKRowsPerGroupWire filling stats (may be nil) with the scan's work.
 func (db *DB) TopKRowsPerGroupWireStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
-	return db.topKRowsPerGroupWire(constraint, spec, stats)
+	return topKRowsPerGroupWire(db, constraint, spec, stats)
 }
 
-func (db *DB) topKRowsPerGroupWire(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
+// TopKRowsPerGroupWire is DB.TopKRowsPerGroupWire over a history table.
+func (t *ArchiveTable) TopKRowsPerGroupWire(constraint string, spec TopKRowsSpec) ([]TopKRowsWireGroup, error) {
+	return topKRowsPerGroupWire(t, constraint, spec, nil)
+}
+
+// TopKRowsPerGroupWireStats is ArchiveTable.TopKRowsPerGroupWire filling stats (may be nil).
+func (t *ArchiveTable) TopKRowsPerGroupWireStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
+	return topKRowsPerGroupWire(t, constraint, spec, stats)
+}
+
+func topKRowsPerGroupWire(src TopKRowsSource, constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
@@ -208,7 +218,7 @@ func (db *DB) topKRowsPerGroupWire(constraint string, spec TopKRowsSpec, stats *
 		need(t.Attr)
 	}
 
-	seq, err := db.QueryRawWireRefsStats(constraint, attrs, false, stats)
+	seq, err := src.QueryRawWireRefsStats(constraint, attrs, false, stats)
 	if err != nil {
 		return nil, err
 	}
