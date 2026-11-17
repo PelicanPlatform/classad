@@ -134,7 +134,7 @@ func BenchmarkTopKRowsPerGroup(b *testing.B) {
 			for b.Loop() {
 				groups, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 					GroupCols: []GroupCol{{Attr: "Owner"}},
-					OrderAttr: "QDate", Desc: true, K: k, Attrs: []string{"QDate"},
+					OrderBy:   OrderOne("QDate", true), K: k, Attrs: []string{"QDate"},
 				})
 				if err != nil {
 					b.Fatal(err)

@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"iter"
 	"math"
 	"sort"
 	"strings"
@@ -36,23 +37,55 @@ import (
 // ORDER WITHIN A GROUP is the order asked for: the rows come back sorted by the order attribute,
 // best first, so a caller numbering them does not sort again.
 
+// TopKOrderTerm is one term of the ordering, most significant first.
+type TopKOrderTerm struct {
+	Attr string
+	Desc bool
+}
+
 // TopKRowsSpec is one "k rows per group" request.
 //
-// OrderAttr must be numeric in the rows that are to be ranked. A row whose order attribute is
-// absent, non-numeric or a NaN is NOT ranked and does not appear -- the same rule the numeric
-// aggregates follow, and the only one under which "the newest five" means anything. Such a row
-// still belongs to its group for any other purpose; this call simply has nothing to order it by.
+// Every ordering attribute must be numeric in the rows that are to be ranked. A row where ANY of
+// them is absent, non-numeric or a NaN is NOT ranked and does not appear -- the same rule the
+// numeric aggregates follow, and the only one under which "the newest five" means anything. Such
+// a row still belongs to its group for any other purpose; this call simply has nothing to order
+// it by.
+//
+// WHY THE ORDERING IS A LIST. "The top 5" is only a well-defined SET of rows when the ordering is
+// total over them. Where it ties across the K-th place, which rows come back is a choice, and
+// this makes a different choice than a client sorting the same rows does -- measured, not
+// supposed: see TestTopKTieBreakingAgainstAClientRanking. A caller that needs the answer to be
+// determined writes an ordering that cannot tie, which for a job table is QDate then ClusterId,
+// both already in the ad. A single term remains the common spelling and is what a caller writes
+// when it does not care which of several equal rows it gets.
 type TopKRowsSpec struct {
 	// GroupCols are the PARTITION BY columns. Empty means one partition holding every row,
 	// which is the plain "top k overall" and is served here too.
 	GroupCols []GroupCol
-	OrderAttr string
-	Desc      bool
-	K         int
+	// OrderBy is the ordering, most significant term first. It must name at least one term.
+	OrderBy []TopKOrderTerm
+	K       int
 	// Attrs are the attributes each returned row carries, as QueryProject's are. The group
-	// columns and the order attribute are NOT added for you: a caller that wants them in the
-	// rows asks for them, exactly as it would of a projection.
+	// columns and the ordering attributes are NOT added for you: a caller that wants them in
+	// the rows asks for them, exactly as it would of a projection.
 	Attrs []string
+}
+
+// OrderOne is the spec for the common single-term ordering.
+func OrderOne(attr string, desc bool) []TopKOrderTerm {
+	return []TopKOrderTerm{{Attr: attr, Desc: desc}}
+}
+
+// TopKRowsSource is a table the top-k rungs can read: the mutable DB and an ArchiveTable both
+// expose exactly these two scans with these signatures, which is why one implementation serves
+// both rather than the archive growing a parallel copy of it.
+//
+// History is where "the top N per group" mostly points -- the five longest jobs each owner ran
+// last month is a question about completed jobs, not queued ones -- so an archive that could not
+// answer it was the bigger gap of the two.
+type TopKRowsSource interface {
+	QueryProjectStats(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error)
+	QueryRawWireRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error)
 }
 
 // TopKRowsGroup is one group's answer: the group columns' values and its best rows, ordered.
@@ -61,15 +94,52 @@ type TopKRowsGroup struct {
 	Rows   [][]classad.Value
 }
 
+// validate rejects a spec no rung can serve. Both rungs call it, so a spec accepted by one is
+// accepted by the other -- a request that errored on the value rung and quietly returned
+// something on the wire rung would be the worst kind of divergence between them.
+func (s TopKRowsSpec) validate() error {
+	if s.K <= 0 {
+		return fmt.Errorf("classad-db: top-k rows needs a positive K")
+	}
+	if len(s.OrderBy) == 0 {
+		return fmt.Errorf("classad-db: top-k rows needs an attribute to order by")
+	}
+	for _, t := range s.OrderBy {
+		if t.Attr == "" || t.Attr == "*" {
+			return fmt.Errorf("classad-db: an ordering term must name an attribute")
+		}
+	}
+	for _, g := range s.GroupCols {
+		if g.Attr == "" || g.Attr == "*" {
+			return fmt.Errorf("classad-db: a group column must name an attribute")
+		}
+		if g.BucketWidth < 0 {
+			return fmt.Errorf("classad-db: a group column's bucket width cannot be negative")
+		}
+	}
+	return nil
+}
+
 // topKRowKeep holds one group's best k rows. vals is unordered and at most k long, so offer is
 // O(k) and the state is bounded by the REQUEST rather than by the group -- which is what makes
 // this safe to point at a history table where a group holds millions of rows.
 type topKRowKeep struct {
-	vals []NumValue
-	rows [][]classad.Value
-	k    int
-	desc bool
+	// vals holds every kept row's ordering values end to end, stride terms long, so one keep
+	// is two allocations however many terms the ordering has.
+	vals  []NumValue
+	rows  [][]classad.Value
+	k     int
+	terms []TopKOrderTerm
 }
+
+func (t *topKRowKeep) stride() int { return len(t.terms) }
+
+func (t *topKRowKeep) at(i int) []NumValue {
+	n := t.stride()
+	return t.vals[i*n : (i+1)*n]
+}
+
+func (t *topKRowKeep) count() int { return len(t.vals) / t.stride() }
 
 // topKWorse reports whether a is the value a better one would evict: the smallest when keeping the
 // largest k (desc), the largest when keeping the smallest k (asc).
@@ -91,25 +161,43 @@ func topKWorse(a, b NumValue, desc bool) bool {
 	return a.F > b.F
 }
 
-func (t *topKRowKeep) offer(v NumValue, row []classad.Value) {
-	if v.Kind == NumReal && math.IsNaN(v.F) {
-		return // never evicted, so it would hold a slot against every real row
+// topKWorseRow is topKWorse over a whole ordering: the first term that separates a from b
+// decides, and an ordering whose every term ties reports false, so neither row evicts the other
+// and the one already held stays.
+func topKWorseRow(a, b []NumValue, terms []TopKOrderTerm) bool {
+	for i, t := range terms {
+		if topKWorse(a[i], b[i], t.Desc) {
+			return true
+		}
+		if topKWorse(b[i], a[i], t.Desc) {
+			return false
+		}
 	}
-	if len(t.vals) < t.k {
-		t.vals = append(t.vals, v)
+	return false
+}
+
+func (t *topKRowKeep) offer(vals []NumValue, row []classad.Value) {
+	for _, v := range vals {
+		if v.Kind == NumReal && math.IsNaN(v.F) {
+			return // never evicted, so it would hold a slot against every real row
+		}
+	}
+	if t.count() < t.k {
+		t.vals = append(t.vals, vals...)
 		t.rows = append(t.rows, row)
 		return
 	}
 	wi := t.worstIdx()
-	if topKWorse(t.vals[wi], v, t.desc) {
-		t.vals[wi], t.rows[wi] = v, row
+	if topKWorseRow(t.at(wi), vals, t.terms) {
+		copy(t.at(wi), vals)
+		t.rows[wi] = row
 	}
 }
 
 func (t *topKRowKeep) worstIdx() int {
 	wi := 0
-	for i := 1; i < len(t.vals); i++ {
-		if topKWorse(t.vals[i], t.vals[wi], t.desc) {
+	for i := 1; i < t.count(); i++ {
+		if topKWorseRow(t.at(i), t.at(wi), t.terms) {
 			wi = i
 		}
 	}
@@ -124,7 +212,7 @@ func (t *topKRowKeep) ordered() [][]classad.Value {
 		idx[i] = i
 	}
 	sort.SliceStable(idx, func(a, b int) bool {
-		return topKWorse(t.vals[idx[b]], t.vals[idx[a]], t.desc)
+		return topKWorseRow(t.at(idx[b]), t.at(idx[a]), t.terms)
 	})
 	out := make([][]classad.Value, len(idx))
 	for i, j := range idx {
@@ -139,28 +227,27 @@ func (t *topKRowKeep) ordered() [][]classad.Value {
 // are ordered by the order attribute, best first. A group with fewer than K ranked rows returns
 // all of them.
 func (db *DB) TopKRowsPerGroup(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
-	return db.topKRowsPerGroup(constraint, spec, nil)
+	return topKRowsPerGroup(db, constraint, spec, nil)
 }
 
 // TopKRowsPerGroupStats is TopKRowsPerGroup filling stats (may be nil) with the scan's work.
 func (db *DB) TopKRowsPerGroupStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
-	return db.topKRowsPerGroup(constraint, spec, stats)
+	return topKRowsPerGroup(db, constraint, spec, stats)
 }
 
-func (db *DB) topKRowsPerGroup(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
-	if spec.K <= 0 {
-		return nil, fmt.Errorf("classad-db: top-k rows needs a positive K")
-	}
-	if spec.OrderAttr == "" || spec.OrderAttr == "*" {
-		return nil, fmt.Errorf("classad-db: top-k rows needs an attribute to order by")
-	}
-	for _, g := range spec.GroupCols {
-		if g.Attr == "" || g.Attr == "*" {
-			return nil, fmt.Errorf("classad-db: a group column must name an attribute")
-		}
-		if g.BucketWidth < 0 {
-			return nil, fmt.Errorf("classad-db: a group column's bucket width cannot be negative")
-		}
+// TopKRowsPerGroup is DB.TopKRowsPerGroup over a history table.
+func (t *ArchiveTable) TopKRowsPerGroup(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(t, constraint, spec, nil)
+}
+
+// TopKRowsPerGroupStats is ArchiveTable.TopKRowsPerGroup filling stats (may be nil).
+func (t *ArchiveTable) TopKRowsPerGroupStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(t, constraint, spec, stats)
+}
+
+func topKRowsPerGroup(src TopKRowsSource, constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
+	if err := spec.validate(); err != nil {
+		return nil, err
 	}
 
 	// One projection carrying what the caller asked for, then the group columns and the order
@@ -183,10 +270,13 @@ func (db *DB) topKRowsPerGroup(constraint string, spec TopKRowsSpec, stats *coll
 	for i, g := range spec.GroupCols {
 		groupAt[i] = need(g.Attr)
 	}
-	orderAt := need(spec.OrderAttr)
+	orderAt := make([]int, len(spec.OrderBy))
+	for i, t := range spec.OrderBy {
+		orderAt[i] = need(t.Attr)
+	}
 	keep := len(spec.Attrs)
 
-	seq, err := db.QueryProjectStats(constraint, attrs, stats)
+	seq, err := src.QueryProjectStats(constraint, attrs, stats)
 	if err != nil {
 		return nil, err
 	}
@@ -198,10 +288,19 @@ func (db *DB) topKRowsPerGroup(constraint string, spec TopKRowsSpec, stats *coll
 	at := map[string]int{}
 	var groups []*groupEntry
 	var label strings.Builder
+	ovals := make([]NumValue, len(spec.OrderBy)) // reused: the keep copies what it keeps
 	for row := range seq {
-		ov, ok := numValueOf(row[orderAt])
-		if !ok {
-			continue // nothing to rank it by; see TopKRowsSpec
+		ranked := true
+		for i, at := range orderAt {
+			v, ok := numValueOf(row[at])
+			if !ok {
+				ranked = false // nothing to rank it by; see TopKRowsSpec
+				break
+			}
+			ovals[i] = v
+		}
+		if !ranked {
+			continue
 		}
 		// Keyed on the same rendering a GROUP BY groups by, so two rows fall together here
 		// exactly when the aggregate engine would have put them in one group.
@@ -233,13 +332,13 @@ func (db *DB) topKRowsPerGroup(constraint string, spec TopKRowsSpec, stats *coll
 			at[label.String()] = i
 			groups = append(groups, &groupEntry{
 				values: values,
-				keep:   &topKRowKeep{k: spec.K, desc: spec.Desc},
+				keep:   &topKRowKeep{k: spec.K, terms: spec.OrderBy},
 			})
 		}
 		// The projected row is the scan's own slice and is reused for the next record, so a
 		// row the keep retains is copied. Only the attributes the caller asked for are kept:
 		// a group column appended above for the grouping is not smuggled into the answer.
-		groups[i].keep.offer(ov, append([]classad.Value(nil), row[:keep]...))
+		groups[i].keep.offer(ovals, append([]classad.Value(nil), row[:keep]...))
 	}
 
 	out := make([]TopKRowsGroup, len(groups))

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -30,7 +31,7 @@ func topKRowsFixture(t *testing.T, owners, rows int) *DB {
 			n++
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	return d
@@ -58,8 +59,7 @@ func TestTopKRowsPerGroupKeepsTheBestRows(t *testing.T) {
 
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "QDate",
-		Desc:      true,
+		OrderBy:   OrderOne("QDate", true),
 		K:         k,
 		Attrs:     []string{"Cpus"},
 	})
@@ -95,8 +95,7 @@ func TestTopKRowsAscendingTakesTheOtherEnd(t *testing.T) {
 	d := topKRowsFixture(t, 2, 20)
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "QDate",
-		Desc:      false,
+		OrderBy:   OrderOne("QDate", false),
 		K:         3,
 		Attrs:     []string{"Cpus"},
 	})
@@ -121,8 +120,7 @@ func TestTopKRowsShortGroupReturnsAllOfIt(t *testing.T) {
 	d := topKRowsFixture(t, 2, 3)
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "QDate",
-		Desc:      true,
+		OrderBy:   OrderOne("QDate", true),
 		K:         10,
 		Attrs:     []string{"Cpus"},
 	})
@@ -158,7 +156,7 @@ func TestTopKRowsIsExactOnTies(t *testing.T) {
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "QDate", Desc: true, K: 2, Attrs: []string{"Cpus"},
+		OrderBy:   OrderOne("QDate", true), K: 2, Attrs: []string{"Cpus"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +195,7 @@ func TestTopKRowsSkipsUnrankableRows(t *testing.T) {
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "QDate", Desc: true, K: 5, Attrs: []string{"Cpus"},
+		OrderBy:   OrderOne("QDate", true), K: 5, Attrs: []string{"Cpus"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -222,7 +220,7 @@ func TestTopKRowsSkipsUnrankableRows(t *testing.T) {
 func TestTopKRowsNoGroupColsIsOnePartition(t *testing.T) {
 	d := topKRowsFixture(t, 4, 10)
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
-		OrderAttr: "QDate", Desc: true, K: 3, Attrs: []string{"QDate"},
+		OrderBy: OrderOne("QDate", true), K: 3, Attrs: []string{"QDate"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +244,7 @@ func TestTopKRowsHonoursTheConstraint(t *testing.T) {
 	d := topKRowsFixture(t, 2, 20)
 	got, err := d.TopKRowsPerGroup("Cpus < 5", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "QDate", Desc: true, K: 2, Attrs: []string{"Cpus"},
+		OrderBy:   OrderOne("QDate", true), K: 2, Attrs: []string{"Cpus"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +284,7 @@ func TestTopKRowsRanksBooleansLikeTheColumnPass(t *testing.T) {
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "Held", Desc: true, K: 2, Attrs: []string{"Cpus"},
+		OrderBy:   OrderOne("Held", true), K: 2, Attrs: []string{"Cpus"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -338,7 +336,7 @@ func TestTopKRowsSkipsNaN(t *testing.T) {
 	}
 	got, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "Owner"}},
-		OrderAttr: "QDate", Desc: true, K: 3, Attrs: []string{"Cpus"},
+		OrderBy:   OrderOne("QDate", true), K: 3, Attrs: []string{"Cpus"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -364,14 +362,18 @@ func TestTopKRowsRefusals(t *testing.T) {
 		name string
 		spec TopKRowsSpec
 	}{
-		{"k=0", TopKRowsSpec{OrderAttr: "QDate", K: 0}},
-		{"negative k", TopKRowsSpec{OrderAttr: "QDate", K: -1}},
-		{"no order attribute", TopKRowsSpec{OrderAttr: "", K: 3}},
-		{"star order attribute", TopKRowsSpec{OrderAttr: "*", K: 3}},
+		{"k=0", TopKRowsSpec{OrderBy: OrderOne("QDate", true), K: 0}},
+		{"negative k", TopKRowsSpec{OrderBy: OrderOne("QDate", true), K: -1}},
+		{"no ordering at all", TopKRowsSpec{K: 3}},
+		{"empty ordering", TopKRowsSpec{OrderBy: []TopKOrderTerm{}, K: 3}},
+		{"no order attribute", TopKRowsSpec{OrderBy: OrderOne("", true), K: 3}},
+		{"star order attribute", TopKRowsSpec{OrderBy: OrderOne("*", true), K: 3}},
+		{"second term names nothing", TopKRowsSpec{
+			OrderBy: []TopKOrderTerm{{Attr: "QDate", Desc: true}, {Attr: ""}}, K: 3}},
 		{"star group column", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "*"}}, OrderAttr: "QDate", K: 3}},
+			GroupCols: []GroupCol{{Attr: "*"}}, OrderBy: OrderOne("QDate", true), K: 3}},
 		{"negative bucket", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "QDate", BucketWidth: -5}}, OrderAttr: "QDate", K: 3}},
+			GroupCols: []GroupCol{{Attr: "QDate", BucketWidth: -5}}, OrderBy: OrderOne("QDate", true), K: 3}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := d.TopKRowsPerGroup("true", c.spec); err == nil {
@@ -379,4 +381,94 @@ func TestTopKRowsRefusals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTopKRowsNeedsEveryOrderingTerm pins that a row is ranked only when EVERY ordering term
+// gives it a number, not just the first.
+//
+// A row whose second term is missing has no place in a total order: it cannot be compared with
+// the rows that have one, and ranking it as though the term were zero invents a position. The
+// one-term rule already said "absent, non-numeric or NaN is not ranked"; this is that rule
+// applied to a list, and it is the case a differential test between the two rungs cannot see,
+// because both rungs would be wrong together.
+func TestTopKRowsNeedsEveryOrderingTerm(t *testing.T) {
+	d, err := OpenConfig(Config{Dir: t.TempDir(), SegmentSize: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	tx := d.Begin()
+	n := 0
+	add := func(text string) {
+		ad, perr := classad.ParseOld(text)
+		if perr != nil {
+			t.Fatalf("fixture %q: %v", text, perr)
+		}
+		tx.NewClassAd(fmt.Sprintf("k%d", n), ad)
+		n++
+	}
+	// Rankable: both terms numeric. These are the only rows that may come back.
+	for i := 0; i < 6; i++ {
+		add(fmt.Sprintf("Owner = \"o\"\nQDate = %d\nTie = %d\nPayload = \"ok%d\"", 1700000000+i, i, i))
+	}
+	// Not rankable, each for a different reason, and each with a PERFECTLY GOOD first term --
+	// a newer QDate than any row above, so a rung that ranked on the first term alone would
+	// put every one of them ahead of the rows that belong.
+	add("Owner = \"o\"\nQDate = 1800000000\nPayload = \"no-second-term\"")
+	add("Owner = \"o\"\nQDate = 1800000001\nTie = \"text\"\nPayload = \"second-term-string\"")
+	add("Owner = \"o\"\nQDate = 1800000002\nTie = undefined\nPayload = \"second-term-undefined\"")
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := TopKRowsSpec{
+		GroupCols: []GroupCol{{Attr: "Owner"}},
+		OrderBy: []TopKOrderTerm{
+			{Attr: "QDate", Desc: true},
+			{Attr: "Tie", Desc: true},
+		},
+		K:     4,
+		Attrs: []string{"Payload"},
+	}
+	check := func(name string, rows []string) {
+		t.Helper()
+		if len(rows) != 4 {
+			t.Fatalf("%s: kept %d rows, want 4", name, len(rows))
+		}
+		for _, p := range rows {
+			if !strings.HasPrefix(p, "ok") {
+				t.Errorf("%s: kept %q, which has no usable second ordering term", name, p)
+			}
+		}
+	}
+
+	got, err := d.TopKRowsPerGroup("true", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("value rung: %d groups, want 1", len(got))
+	}
+	var vrows []string
+	for _, r := range got[0].Rows {
+		p, perr := r[0].StringValue()
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		vrows = append(vrows, p)
+	}
+	check("value rung", vrows)
+
+	wgot, err := d.TopKRowsPerGroupWire("true", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wgot) != 1 {
+		t.Fatalf("wire rung: %d groups, want 1", len(wgot))
+	}
+	var wrows []string
+	for _, r := range decodeWireRows(t, wgot[0].Rows, []string{"Payload"}) {
+		wrows = append(wrows, strings.Trim(r, "\""))
+	}
+	check("wire rung", wrows)
 }

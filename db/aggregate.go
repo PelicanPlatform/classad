@@ -868,6 +868,41 @@ func GroupValueText(v classad.Value) string {
 	return v.String()
 }
 
+// AppendGroupValueText appends exactly what GroupValueText returns, without building the string.
+//
+// It is for a caller assembling a group KEY in a buffer it reuses -- a scan folding a record per
+// iteration, where GroupValueText's return is allocated, hashed and dropped. The numeric kinds
+// append in place; anything else falls back to GroupValueText, because those kinds are rare in a
+// group column and an append form of each would be a second rendering to keep in step with this
+// one.
+//
+// The two MUST agree: a key assembled here and a key assembled there name the same group, and a
+// scan that used both would otherwise split one group in two. TestAppendGroupValueTextMatches
+// holds them together.
+func AppendGroupValueText(dst []byte, v classad.Value) []byte {
+	switch {
+	case v.IsInteger():
+		if n, err := v.IntValue(); err == nil {
+			return strconv.AppendInt(dst, n, 10)
+		}
+	case v.IsReal():
+		if f, err := v.RealValue(); err == nil {
+			return appendNumberGroupText(dst, f)
+		}
+	}
+	return append(dst, GroupValueText(v)...)
+}
+
+// appendNumberGroupText is numberGroupText appending in place. Same two branches, same bounds:
+// an integral float in int64's range reads as the integer, so 2.0 and 2 are one group.
+func appendNumberGroupText(dst []byte, f float64) []byte {
+	const twoPow63 = float64(1 << 63) // the first float64 above MaxInt64
+	if f == math.Trunc(f) && f >= -twoPow63 && f < twoPow63 {
+		return strconv.AppendInt(dst, int64(f), 10)
+	}
+	return strconv.AppendFloat(dst, f, 'g', -1, 64)
+}
+
 // groupListText renders a list's group as a ClassAd list literal -- "{ 1,2 }", and "{  }" when
 // empty -- with every element rendered by GroupValueText in turn.
 //
