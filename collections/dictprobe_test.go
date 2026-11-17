@@ -408,3 +408,79 @@ func TestOpenIsQuietAboutASegmentThatRecordedNothing(t *testing.T) {
 		t.Error("no records came back")
 	}
 }
+
+// TestDictCheckVerdicts covers the four readings of the two signals as TEXT, because the
+// verdict is the whole product here -- a report that says "something is wrong with
+// dictionary 3" and leaves an operator to work out whether to replace the dictionary or
+// the segment has done the arithmetic and thrown away the answer.
+//
+// The matches/fails row is exercised here and nowhere else, and that is deliberate: a
+// record whose compressed bytes are corrupt fails its own record CRC first and never
+// becomes a probe sample, so the state is not reachable through the store today. It is
+// reachable in principle -- a segment whose records were written under a different codec
+// than its name claims lands there -- and the branch exists for that, untested beyond its
+// wording.
+func TestDictCheckVerdicts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		c    FsckDictCheck
+		want []string
+	}{
+		{"dictionary is wrong",
+			FsckDictCheck{DictID: 3, Recorded: true, Matches: false, Probed: 4, ProbeFailures: 4},
+			[]string{"dicts/3.zst", "not the one these records were written with", "4 of 4"}},
+		{"fingerprint is wrong",
+			FsckDictCheck{DictID: 3, Recorded: true, Matches: false, Probed: 4},
+			[]string{"records decode", "FINGERPRINT is the untrustworthy one"}},
+		{"nothing to settle it",
+			FsckDictCheck{DictID: 3, Recorded: true, Matches: false},
+			[]string{"no record could be sampled"}},
+		{"records are damaged",
+			FsckDictCheck{DictID: 3, Recorded: true, Matches: true, Probed: 4, ProbeFailures: 2},
+			[]string{"RECORDS are damaged", "2 of 4"}},
+		{"no fingerprint to compare",
+			FsckDictCheck{DictID: 3, Probed: 4, ProbeFailures: 1},
+			[]string{"records no fingerprint", "1 of 4"}},
+	} {
+		got := tc.c.Verdict()
+		for _, want := range tc.want {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s: verdict does not say %q: %s", tc.name, want, got)
+			}
+		}
+		if tc.c.agrees() {
+			t.Errorf("%s: a check with a verdict reported itself as agreeing", tc.name)
+		}
+	}
+	// A check where both signals are content has nothing to say, and is never listed.
+	healthy := FsckDictCheck{DictID: 3, Recorded: true, Matches: true, Probed: 4}
+	if !healthy.agrees() || healthy.Verdict() != "" {
+		t.Errorf("a healthy check produced %q", healthy.Verdict())
+	}
+}
+
+// TestProbeKitsSkipWhatCannotBeProbed: a dictionary with no file, or one that will not
+// load, gets no kit. Fsck already reports both of those, and probing with nothing would
+// only restate them in a second voice -- or, worse, read as a probe that passed.
+func TestProbeKitsSkipWhatCannotBeProbed(t *testing.T) {
+	dicts := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dicts, "7.zst"), []byte("not a dictionary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kits := newDictProbeKits(dicts, []uint32{5, 7})
+	if _, ok := kits[5]; ok {
+		t.Error("built a kit for a dictionary with no file")
+	}
+	if _, ok := kits[7]; ok {
+		t.Error("built a kit from a file that is not a dictionary")
+	}
+	// And the segment check, asked about a file that is not a segment, reports nothing
+	// recorded rather than inventing a disagreement.
+	c := checkSegDict(filepath.Join(t.TempDir(), "absent.dat"), 1, nil, 0, 0)
+	if c.Recorded {
+		t.Error("claimed a fingerprint from a file with no trailer")
+	}
+	if !c.agrees() {
+		t.Error("a segment with nothing recorded and nothing probed was reported as a disagreement")
+	}
+}
