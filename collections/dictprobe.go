@@ -35,6 +35,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync/atomic"
 )
 
@@ -46,6 +48,48 @@ var dictFingerprintMismatches atomic.Int64
 // that is not the one their records were written with. Any count at all means records are
 // being skipped.
 func DictFingerprintMismatches() int64 { return dictFingerprintMismatches.Load() }
+
+// dictMismatchTally counts, for one dictionary, the segments recovery found to disagree
+// with it.
+type dictMismatchTally struct {
+	segments int
+	example  string
+}
+
+// noteDictMismatch records one segment whose fingerprint disagrees with the dictionary
+// loaded for it. Recovery runs a shard at a time and nothing else touches this.
+func (c *Collection) noteDictMismatch(id uint32, segPath string) {
+	if c.dictMismatch == nil {
+		c.dictMismatch = map[uint32]*dictMismatchTally{}
+	}
+	t := c.dictMismatch[id]
+	if t == nil {
+		t = &dictMismatchTally{example: segPath}
+		c.dictMismatch[id] = t
+	}
+	t.segments++
+}
+
+// reportDictMismatches says what recovery found, ONCE per dictionary rather than once per
+// segment. A dictionary that is not the one its records were written with disagrees with
+// EVERY segment naming it, so a line apiece would bury the one fact an operator needs
+// under hundreds of repetitions of it -- and the count is itself the useful part, because
+// it says how much of the store is affected.
+func (c *Collection) reportDictMismatches() {
+	ids := make([]uint32, 0, len(c.dictMismatch))
+	for id := range c.dictMismatch {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		t := c.dictMismatch[id]
+		c.reportDictFault(&DictFault{
+			ID: id, Kind: DictFaultMismatch, Segments: t.segments, From: t.example,
+			Path: filepath.Join(c.dir, "dicts", fmt.Sprintf("%d.zst", id)),
+		})
+	}
+	c.dictMismatch = nil
+}
 
 // checkSegFingerprint compares what a segment recorded about its dictionary against the
 // dictionary the store just loaded for it. ok is false when they disagree.

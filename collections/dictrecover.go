@@ -146,11 +146,9 @@ func (c *Collection) restoreDictsFromSegments(dir string, missing []uint32) int 
 		c.dicts.install(id, codec, pin)
 		dictsRecoveredFromSegments.Add(1)
 		n++
-		if c.onDictFault != nil {
-			c.onDictFault(&DictFault{
-				ID: id, Path: path, Kind: DictFaultMissing, Repaired: true, From: rep.from,
-			})
-		}
+		c.reportDictFault(&DictFault{
+			ID: id, Path: path, Kind: DictFaultMissing, Repaired: true, From: rep.from,
+		})
 	}
 	return n
 }

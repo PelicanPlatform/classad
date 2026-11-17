@@ -33,6 +33,7 @@ package collections
 import (
 	"fmt"
 	"hash/crc32"
+	"log"
 	"os"
 	"sync/atomic"
 	"time"
@@ -98,6 +99,9 @@ type DictFault struct {
 	// wrote (dicts/backup/) or one it found already there -- the attic, or a segment
 	// carrying a replica. Empty when nothing was preserved and nothing needed to be.
 	Preserved string
+	// Segments is how many segment files reported this fault, when it is one a whole
+	// store's worth of segments can report at once (DictFaultMismatch). 0 otherwise.
+	Segments int
 	// From is the segment file a repaired copy came out of, when the dictionary was not
 	// rewritten from the open descriptor but found in a segment trailer at Open. Empty
 	// otherwise.
@@ -109,9 +113,10 @@ type DictFault struct {
 func (f *DictFault) Error() string {
 	switch {
 	case f.Kind == DictFaultMismatch:
-		return fmt.Sprintf("collections: dictionary file %s is not the one %s was written with -- "+
-			"its recorded fingerprint does not match -- so every record in that segment will fail to decode; "+
-			"run Fsck, which probes the records as well as comparing the fingerprint", f.Path, f.From)
+		return fmt.Sprintf("collections: dictionary file %s is not the one %d segment(s) were written with "+
+			"(e.g. %s) -- their recorded fingerprints do not match -- so every record in them will fail to "+
+			"decode; run Fsck, which probes the records as well as comparing the fingerprint",
+			f.Path, f.Segments, f.From)
 	case f.Kind == DictFaultMissing && f.Repaired && f.From != "":
 		return fmt.Sprintf("collections: dictionary file %s was missing and was restored from the copy in %s; the primary copy was lost while this store was not running", f.Path, f.From)
 	case f.Kind == DictFaultMissing && f.Repaired:
@@ -406,11 +411,36 @@ func (c *Collection) maybeVerifyDictFiles() {
 
 // reportDictFaults hands each fault to the callback, if there is one.
 func (c *Collection) reportDictFaults(faults []DictFault) []DictFault {
-	if c.onDictFault == nil {
-		return faults
-	}
 	for i := range faults {
-		c.onDictFault(&faults[i])
+		c.reportDictFault(&faults[i])
 	}
 	return faults
+}
+
+// reportDictFault delivers one fault to whoever is listening: this store's own callback if
+// it has one, and otherwise DictFaultHook, which logs.
+//
+// Defaulting to a log line rather than to silence is the point. Every path in this file
+// exists because a dictionary going wrong used to produce no sign at all until the store
+// was restarted, and a callback nobody wired up is the same silence wearing a different
+// hat.
+func (c *Collection) reportDictFault(err error) {
+	if c.onDictFault != nil {
+		c.onDictFault(err)
+		return
+	}
+	if DictFaultHook != nil {
+		DictFaultHook(err)
+	}
+}
+
+// DictFaultHook is called for every compression-dictionary fault a store does not handle
+// itself -- a file missing, replaced, changed, or found not to be the dictionary its
+// segments were written with.
+//
+// The default logs it with the standard library logger; a daemon with its own logger
+// replaces it, and nil silences it. Options.OnDictFault takes precedence for one store.
+// Set it before opening collections. See CompactUndecodableHook, which works the same way.
+var DictFaultHook = func(err error) {
+	log.Printf("%v", err)
 }
