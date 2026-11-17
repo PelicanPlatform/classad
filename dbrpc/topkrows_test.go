@@ -332,15 +332,40 @@ func TestTopKRowsOpcodeRefusesAnEmptyOrdering(t *testing.T) {
 	}
 }
 
-// TestTopKRowsUnsupportedIsNotAnEmptyAnswer pins the fallback signal. A client that read a
-// missing opcode as "no groups matched" would silently return nothing for a query that has an
-// answer, which is the failure the sentinel exists to prevent.
-func TestTopKRowsUnsupportedIsNotAnEmptyAnswer(t *testing.T) {
-	if !errors.Is(ErrTopKRowsUnsupported, ErrTopKRowsUnsupported) {
-		t.Fatal("sentinel does not match itself")
+// TestTopKRowsAgainstAPeerThatDoesNotAdvertiseIt pins the fallback signal, which is the whole
+// reason the sentinel exists: a client that read a missing opcode as "no groups matched" would
+// return nothing for a query that has an answer, and the caller would believe it.
+//
+// The server behind the pipe can in fact serve the opcode. The refusal must come from the
+// ADVERTISEMENT, before any frame is sent -- that is what lets a caller fall back to fetching
+// and ranking itself rather than discovering the gap as an empty result.
+func TestTopKRowsAgainstAPeerThatDoesNotAdvertiseIt(t *testing.T) {
+	d, err := db.OpenConfig(db.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if ErrTopKRowsUnsupported.Error() == "" {
-		t.Fatal("sentinel has no message for an operator to read")
+	s := NewServer(d)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConnOpts(sconn, ServeOptions{IncludePrivate: true}) }()
+	c := NewClient(cconn, WithPeerSessionAttrs(map[string]string{
+		SessionAttrProtocol: "9",
+		SessionAttrFeatures: string(FeatExtendedAggregate),
+	}))
+	defer func() { c.Close(); s.Close(); d.Close() }()
+
+	if got := c.Supports(FeatTopKRows); got != SupportNo {
+		t.Fatalf("Supports(FeatTopKRows) = %v, want SupportNo", got)
+	}
+	got, err := c.TopKRowsPerGroup(context.Background(), "true", TopKRowsSpec{
+		GroupCols: []db.GroupCol{{Attr: "Owner"}}, OrderBy: db.OrderOne("QDate", true),
+		K: 3, Attrs: []string{"Payload"},
+	})
+	if !errors.Is(err, ErrTopKRowsUnsupported) {
+		t.Fatalf("err = %v, want ErrTopKRowsUnsupported", err)
+	}
+	if got != nil {
+		t.Errorf("refusal also returned %d groups; a caller checking the rows first would "+
+			"read that as an answer", len(got))
 	}
 }
 
