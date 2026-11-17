@@ -167,10 +167,16 @@ func TestTopKRowsIsExactOnTies(t *testing.T) {
 	}
 }
 
-// TestTopKRowsSkipsUnrankableRows covers the rows that have nothing to order them by. They are
-// not ranked and must not displace a row that is -- a string sorting as "greater than" every
-// number would otherwise take the whole answer.
-func TestTopKRowsSkipsUnrankableRows(t *testing.T) {
+// TestTopKRowsRanksEveryRowWhateverTheOrderingHolds covers the rows whose ordering attribute is
+// not a number. They are RANKED, not dropped: a string orders among strings and a missing
+// attribute orders as undefined, by collections.CompareValues.
+//
+// That matters because the class order puts numbers first, so under DESC -- the spelling of "the
+// newest five" -- the rows with no usable date come back AHEAD of the dated ones. It looks wrong
+// and it is what a client sorting the same rows itself produces, which is the whole point of the
+// pushdown: it answers the question the client code it replaces answers. Dropping those rows
+// instead would quietly return a different set and look fast doing it.
+func TestTopKRowsRanksEveryRowWhateverTheOrderingHolds(t *testing.T) {
 	d, err := OpenConfig(Config{SegmentSize: 1 << 16})
 	if err != nil {
 		t.Fatal(err)
@@ -208,10 +214,28 @@ func TestTopKRowsSkipsUnrankableRows(t *testing.T) {
 		c, _ := row[0].IntValue() //nolint:errcheck // the fixture writes integers
 		cpus = append(cpus, int(c))
 	}
-	sort.Ints(cpus)
-	// Only i = 0 and 3 carry a numeric QDate.
-	if len(cpus) != 2 || cpus[0] != 0 || cpus[1] != 3 {
-		t.Errorf("ranked rows = %v, want the two with a numeric QDate ([0 3])", cpus)
+	// Descending reverses the total order, so the classes come back undefined, then string,
+	// then number. Five of six rows survive, and the one evicted is the SMALLEST number -- not
+	// one of the rows that lack a date, which is what dropping the unrankable would have done.
+	//
+	// Rows tied within a class are compared by position rather than by identity: the ordering
+	// cannot separate two undefineds, so which of them comes first is arbitrary and asserting
+	// it would pin an accident.
+	if len(cpus) != 5 {
+		t.Fatalf("ranked %d rows, want 5: %v", len(cpus), cpus)
+	}
+	classOf := map[int]string{2: "undefined", 5: "undefined", 1: "string", 4: "string", 3: "number"}
+	wantClasses := []string{"undefined", "undefined", "string", "string", "number"}
+	for i, c := range cpus {
+		if classOf[c] != wantClasses[i] {
+			t.Fatalf("ranked rows = %v, want the classes %v (undefined, then string, then number)",
+				cpus, wantClasses)
+		}
+	}
+	for _, c := range cpus {
+		if c == 0 {
+			t.Errorf("kept the smallest-dated row (Cpus=0) at k=5; it is the one that should be evicted")
+		}
 	}
 }
 
@@ -261,10 +285,10 @@ func TestTopKRowsHonoursTheConstraint(t *testing.T) {
 	}
 }
 
-// TestTopKRowsRanksBooleansLikeTheColumnPass is the divergence that the two conversions hid: the
-// column pass offers a boolean as NumBool, so a hand-rolled Add that skipped booleans ranked a
-// boolean order column differently depending on which rung answered. Both now go through
-// numValueOf, and this pins it for the row rung.
+// TestTopKRowsRanksBooleansLikeTheColumnPass is the divergence that the two conversions hid: a
+// hand-rolled comparison that skipped booleans ranked a boolean order column differently
+// depending on which rung answered. Both rungs now order through collections.CompareValues,
+// which places false below true, and this pins it for the row rung.
 func TestTopKRowsRanksBooleansLikeTheColumnPass(t *testing.T) {
 	d, err := OpenConfig(Config{SegmentSize: 1 << 16})
 	if err != nil {
@@ -304,16 +328,15 @@ func TestTopKRowsRanksBooleansLikeTheColumnPass(t *testing.T) {
 	}
 }
 
-// TestTopKRowsSkipsNaN is the value that would hold a slot against every real row: a NaN loses
-// every comparison, so it is never the worst and is never evicted. Three NaNs at k=3 would take
-// the whole answer and report it as a full one.
+// TestTopKRowsRanksNaNLastInTheOrder pins where a NaN lands. It is last among numbers in the
+// total order -- rather than comparing false in both directions, which would leave it anywhere a
+// sort happened to put it and is not an order at all -- so DESC brings it back first.
 //
-// THE NaNs ARE INSERTED LAST ON PURPOSE. The scan yields newest first, so they arrive FIRST and
-// fill the keep before any real row is offered -- which is the only order in which the guard
-// matters. Written the other way round the NaNs arrive last, a full keep of real values rejects
-// them on its own, and the test passes with the guard deleted. It did: mutation testing is what
-// caught it.
-func TestTopKRowsSkipsNaN(t *testing.T) {
+// This is the one place the pushdown and a client sorting the same rows genuinely differ: the
+// client's comparison reports a NaN neither above nor below anything, so where it lands there
+// depends on the input order. Being deterministic is worth more than matching something that is
+// itself undetermined.
+func TestTopKRowsRanksNaNLastInTheOrder(t *testing.T) {
 	d, err := OpenConfig(Config{SegmentSize: 1 << 16})
 	if err != nil {
 		t.Fatal(err)
@@ -350,8 +373,27 @@ func TestTopKRowsSkipsNaN(t *testing.T) {
 		cpus = append(cpus, int(c))
 	}
 	sort.Ints(cpus)
-	if len(cpus) != 3 || cpus[0] != 0 || cpus[1] != 1 || cpus[2] != 2 {
-		t.Errorf("top three over a column holding NaNs = %v, want the real rows [0 1 2]", cpus)
+	if len(cpus) != 3 || cpus[0] != 3 || cpus[1] != 4 || cpus[2] != 5 {
+		t.Errorf("top three descending over a column holding NaNs = %v, want the NaN rows [3 4 5]", cpus)
+	}
+
+	// ASCENDING asks for the other end, and the NaNs must leave it: last in the order means
+	// last under ASC. A NaN that came back at both ends would mean it was never ordered at all.
+	asc, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
+		GroupCols: []GroupCol{{Attr: "Owner"}},
+		OrderBy:   OrderOne("QDate", false), K: 3, Attrs: []string{"Cpus"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acpus []int
+	for _, row := range asc[0].Rows {
+		c, _ := row[0].IntValue() //nolint:errcheck // the fixture writes integers
+		acpus = append(acpus, int(c))
+	}
+	sort.Ints(acpus)
+	if len(acpus) != 3 || acpus[0] != 0 || acpus[1] != 1 || acpus[2] != 2 {
+		t.Errorf("bottom three over a column holding NaNs = %v, want the real rows [0 1 2]", acpus)
 	}
 }
 
@@ -383,16 +425,17 @@ func TestTopKRowsRefusals(t *testing.T) {
 	}
 }
 
-// TestTopKRowsNeedsEveryOrderingTerm pins that a row is ranked only when EVERY ordering term
-// gives it a number, not just the first.
+// TestTopKRowsConsultsEveryOrderingTerm pins that a later ordering term decides the rows the
+// earlier ones tie on -- and that it does so across types, now that a term no longer has to be
+// numeric for the row to rank at all.
 //
-// A row whose second term is missing has no place in a total order: it cannot be compared with
-// the rows that have one, and ranking it as though the term were zero invents a position. The
-// one-term rule already said "absent, non-numeric or NaN is not ranked"; this is that rule
-// applied to a list, and it is the case a differential test between the two rungs cannot see,
-// because both rungs would be wrong together.
-func TestTopKRowsNeedsEveryOrderingTerm(t *testing.T) {
-	d, err := OpenConfig(Config{Dir: t.TempDir(), SegmentSize: 1 << 16})
+// The fixture ties the FIRST term deliberately. With distinct first terms a rung that ignored
+// everything after the first would still pass, because the first term alone would pick the same
+// rows; a tie is the only shape that can tell the two apart. The older rows carry the largest
+// second term in the fixture, so a rung that weighed the terms in the wrong order would pull
+// them in.
+func TestTopKRowsConsultsEveryOrderingTerm(t *testing.T) {
+	d, err := OpenConfig(Config{SegmentSize: 1 << 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,16 +450,15 @@ func TestTopKRowsNeedsEveryOrderingTerm(t *testing.T) {
 		tx.NewClassAd(fmt.Sprintf("k%d", n), ad)
 		n++
 	}
-	// Rankable: both terms numeric. These are the only rows that may come back.
-	for i := 0; i < 6; i++ {
-		add(fmt.Sprintf("Owner = \"o\"\nQDate = %d\nTie = %d\nPayload = \"ok%d\"", 1700000000+i, i, i))
-	}
-	// Not rankable, each for a different reason, and each with a PERFECTLY GOOD first term --
-	// a newer QDate than any row above, so a rung that ranked on the first term alone would
-	// put every one of them ahead of the rows that belong.
-	add("Owner = \"o\"\nQDate = 1800000000\nPayload = \"no-second-term\"")
-	add("Owner = \"o\"\nQDate = 1800000001\nTie = \"text\"\nPayload = \"second-term-string\"")
-	add("Owner = \"o\"\nQDate = 1800000002\nTie = undefined\nPayload = \"second-term-undefined\"")
+	// Four rows tied on QDate, separated only by Tie -- which spans the classes, so the
+	// expected order is the class order: undefined, then string, then the numbers descending.
+	add("Owner = \"o\"\nQDate = 1700000000\nTie = 1\nPayload = \"t1\"")
+	add("Owner = \"o\"\nQDate = 1700000000\nTie = 3\nPayload = \"t3\"")
+	add("Owner = \"o\"\nQDate = 1700000000\nTie = \"text\"\nPayload = \"tstr\"")
+	add("Owner = \"o\"\nQDate = 1700000000\nTie = undefined\nPayload = \"tundef\"")
+	// Older, and so out of the top four however large their second term is.
+	add("Owner = \"o\"\nQDate = 1699999999\nTie = 99\nPayload = \"older-a\"")
+	add("Owner = \"o\"\nQDate = 1699999999\nTie = 98\nPayload = \"older-b\"")
 	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -430,14 +472,17 @@ func TestTopKRowsNeedsEveryOrderingTerm(t *testing.T) {
 		K:     4,
 		Attrs: []string{"Payload"},
 	}
+	want := []string{"tundef", "tstr", "t3", "t1"}
 	check := func(name string, rows []string) {
 		t.Helper()
-		if len(rows) != 4 {
-			t.Fatalf("%s: kept %d rows, want 4", name, len(rows))
+		if len(rows) != len(want) {
+			t.Fatalf("%s: kept %d rows, want %d: %v", name, len(rows), len(want), rows)
 		}
-		for _, p := range rows {
-			if !strings.HasPrefix(p, "ok") {
-				t.Errorf("%s: kept %q, which has no usable second ordering term", name, p)
+		for i := range want {
+			if rows[i] != want[i] {
+				t.Errorf("%s: rows = %v, want %v (QDate ties, so Tie decides: undefined, "+
+					"string, then numbers descending)", name, rows, want)
+				return
 			}
 		}
 	}

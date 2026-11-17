@@ -2,7 +2,6 @@ package db
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 
@@ -21,10 +20,11 @@ import (
 // removed on the join (350,978 allocations rendering, 536,132 parsing, together about twice what
 // the join itself cost).
 //
-// So this rung ranks from the WIRE BYTES and keeps them: the order value is read out of its node
-// without building a value, the group key is assembled into one reused buffer, and a kept row is
-// the scan's own bytes copied once. The ROWS -- the wide part, and the part that would be
-// rendered and reparsed -- are never decoded at all.
+// So this rung ranks from the WIRE BYTES and keeps them: the order value is read out of its own
+// node, the group key is assembled into one reused buffer, and a kept row is the scan's own bytes
+// copied once. The ROWS -- the wide part, and the part that would be rendered and reparsed -- are
+// never decoded at all. Only the ordering and group nodes become values, and only those: that is
+// a handful of narrow attributes against a row that may carry a hundred.
 //
 // THE GROUP KEY IS THE REFERENCE'S RELATION, NOT THE NODE BYTES. Keying on the raw nodes was the
 // obvious thing and it is wrong: GroupValueText puts the integer 2 and the real 2.0 in ONE group
@@ -68,7 +68,7 @@ type TopKRowsWireGroup struct {
 type topKWireKeep struct {
 	// vals holds every kept row's ordering values end to end, stride terms long, exactly as
 	// topKRowKeep does.
-	vals  []NumValue
+	vals  []classad.Value
 	rows  [][]byte
 	k     int
 	terms []TopKOrderTerm
@@ -76,19 +76,14 @@ type topKWireKeep struct {
 
 func (t *topKWireKeep) stride() int { return len(t.terms) }
 
-func (t *topKWireKeep) at(i int) []NumValue {
+func (t *topKWireKeep) at(i int) []classad.Value {
 	n := t.stride()
 	return t.vals[i*n : (i+1)*n]
 }
 
 func (t *topKWireKeep) count() int { return len(t.vals) / t.stride() }
 
-func (t *topKWireKeep) offer(vals []NumValue, row []byte) {
-	for _, v := range vals {
-		if v.Kind == NumReal && math.IsNaN(v.F) {
-			return // never evicted, so it would hold a slot against every real row
-		}
-	}
+func (t *topKWireKeep) offer(vals []classad.Value, row []byte) {
 	if t.count() < t.k {
 		t.vals = append(t.vals, vals...)
 		t.rows = append(t.rows, append([]byte(nil), row...))
@@ -127,39 +122,6 @@ func (t *topKWireKeep) ordered() [][]byte {
 		out[i] = t.rows[j]
 	}
 	return out
-}
-
-// numValueOfNode reads a node's numeric value without building a classad.Value.
-//
-// It is numValueOf's wire-side twin and must agree with it: a row this rejects is a row the
-// reference drops, and a difference between them is a row that ranks on one rung and vanishes on
-// the other. wire.NumberValue accepts the same int/real/bool set, through the same unary-minus
-// folding the evaluator applies.
-func numValueOfNode(node []byte) (NumValue, bool) {
-	if lit, ok := wire.NumberValue(node); ok {
-		switch lit.Kind {
-		case wire.LitInt:
-			return NumValue{F: float64(lit.Int), I: lit.Int, Kind: NumInt}, true
-		case wire.LitReal:
-			return NumValue{F: lit.Real, I: int64(lit.Real), Kind: NumReal}, true
-		}
-		return NumValue{}, false
-	}
-	// A BOOLEAN RANKS. numValueOf takes one (false below true), so the reference ranks a
-	// boolean order column and this must too -- but wire.NumberValue reads only ints and
-	// reals, so asking it alone drops every such row, and drops them as a GROUP rather than
-	// as an error. The string test first keeps LiteralValue off the one node kind whose
-	// decoding would allocate.
-	if _, isStr := wire.StringLiteralValue(node); isStr {
-		return NumValue{}, false
-	}
-	if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitBool {
-		if lit.Bool {
-			return NumValue{F: 1, I: 1, Kind: NumBool}, true
-		}
-		return NumValue{F: 0, I: 0, Kind: NumBool}, true
-	}
-	return NumValue{}, false
 }
 
 // TopKRowsPerGroupWire is TopKRowsPerGroup with the rows left in wire form. See the note above
@@ -260,34 +222,15 @@ func topKRowsPerGroupWire(src TopKRowsSource, constraint string, spec TopKRowsSp
 	if n := len(spec.GroupCols); n > 0 {
 		nodes = make([][]byte, n)
 	}
-	ovals := make([]NumValue, len(spec.OrderBy)) // reused: the keep copies what it keeps
+	ovals := make([]classad.Value, len(spec.OrderBy)) // reused: the keep copies what it keeps
 	for row := range seq {
 		r := wireRow{ad: wire.Ad(row)}
-		ranked := true
 		for i, t := range spec.OrderBy {
-			onode, found := r.ad.LookupByName(t.Attr)
-			if !found {
-				ranked = false
-				break
-			}
-			ov, ok := numValueOfNode(onode)
-			if !ok {
-				// Not a literal number. Either it is an expression over the row's
-				// siblings -- which the reference evaluates, so this must too -- or it
-				// is genuinely unrankable, which numValueOf will say in the same breath.
-				if wire.IsLiteralNode(onode) {
-					ranked = false // a literal, and not a number: nothing to rank it by
-					break
-				}
-				if ov, ok = numValueOf(r.eval(t.Attr)); !ok {
-					ranked = false
-					break
-				}
-			}
-			ovals[i] = ov
-		}
-		if !ranked {
-			continue
+			// An ABSENT ordering attribute looks up as a nil node, which value reads as
+			// undefined -- a value with a place in the order, not a reason to drop the
+			// row. The reference reaches the same value through the same call.
+			onode, _ := r.ad.LookupByName(t.Attr)
+			ovals[i] = r.value(onode, t.Attr)
 		}
 		// Length-delimited so no concatenation of one group's values can spell another's:
 		// without it the pair ("a","bc") and the pair ("ab","c") share a key.
