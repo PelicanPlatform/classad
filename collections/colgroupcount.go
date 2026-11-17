@@ -665,26 +665,6 @@ func (c *Collection) shapeGroupStats(ga *groupAccum, groupIDs []uint32, aggIDs [
 	return out, true
 }
 
-// groupRank buckets a group value by type for ordering. The buckets are tested in the order a value is
-// classified for RENDERING -- undefined and error before bool, bool before string, string before number
-// -- so two values that sort into one bucket are exactly the two a caller will render comparably, and
-// the order cannot drift from the labels.
-func groupRank(v classad.Value) int {
-	switch {
-	case v.IsUndefined():
-		return 3
-	case v.IsError():
-		return 4
-	case v.IsBool():
-		return 2
-	case v.IsString():
-		return 1
-	case v.IsInteger(), v.IsReal():
-		return 0
-	}
-	return 5
-}
-
 // groupTupleLess orders two groups by their component tuples, left to right -- the order a reader
 // expects from `GROUP BY a, b`, and the one a two-column result needs for its order to be
 // deterministic at all.
@@ -703,46 +683,15 @@ func groupTupleLess(a, b []classad.Value) bool {
 	return len(a) < len(b)
 }
 
-// groupValueLess orders one component by value, ints before reals only when they are equal, so ORDER
-// BY on the group column gets the order it expects without the caller re-deriving it.
+// groupValueLess orders one component by value, so ORDER BY on the group column gets the order it
+// expects without the caller re-deriving it.
 //
-// A group set is no longer necessarily all numbers: a string column groups by text, and a record missing
-// the attribute groups as `undefined`. Mixed sets are ordered by type first -- numbers, then strings,
-// then booleans, then undefined and error -- because there is no meaningful order ACROSS those and an
-// arbitrary-but-total one at least keeps the answer deterministic between runs.
+// A group set is no longer necessarily all numbers: a string column groups by text, and a record
+// missing the attribute groups as `undefined`. CompareValues settles both the within-type order and
+// the order ACROSS types, which has no meaning but has to be decided for the answer to be the same
+// between runs.
 func groupValueLess(a, b classad.Value) bool {
-	ar, br := groupRank(a), groupRank(b)
-	if ar != br {
-		return ar < br
-	}
-	switch ar {
-	case 0:
-		af, _ := a.NumberValue() //nolint:errcheck // guarded by the type check above
-		bf, _ := b.NumberValue() //nolint:errcheck // guarded by the type check above
-		// NaN sorts last rather than comparing false against everything, which would leave it
-		// anywhere and stop equal values from landing next to each other.
-		if an, bn := af != af, bf != bf; an || bn {
-			return !an && bn
-		}
-		return af < bf
-	case 1:
-		as, _ := a.StringValue() //nolint:errcheck // guarded by the type check above
-		bs, _ := b.StringValue() //nolint:errcheck // guarded by the type check above
-		// The evaluator's own case-insensitive comparison, which is also the order the block
-		// dictionaries are sorted in, with a byte tiebreak so values that fold equal -- distinct
-		// groups, since the scan groups by exact text -- still have a stable place.
-		if c := classad.CompareStringsFold(as, bs); c != 0 {
-			return c < 0
-		}
-		return as < bs
-	case 2:
-		ab, _ := a.BoolValue() //nolint:errcheck // guarded by the type check above
-		bb, _ := b.BoolValue() //nolint:errcheck // guarded by the type check above
-		return !ab && bb
-	case 5:
-		return a.String() < b.String()
-	}
-	return false // undefined and error are one group each: nothing to order within
+	return CompareValues(a, b) < 0
 }
 
 // schemaScanGroupStats buckets the group column for every record satisfying preds -- one narrowing pass
