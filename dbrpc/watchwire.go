@@ -3,7 +3,6 @@ package dbrpc
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
@@ -62,20 +61,14 @@ func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte
 	if err != nil {
 		return nil, nil, err
 	}
-	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			_, _, _ = c.callCtx(context.Background(), func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) }) //nolint:errcheck // best effort: a server that never hears the stop drops the watch when the connection goes
-		})
-	}
+	stop := c.watchStop(id, frames)
 	// A server too old to know the opcode rejects the request rather than streaming, so the
 	// rejection arrives as the first frame. Read it here, before handing back a channel, so
 	// the caller learns it needs the text watch synchronously instead of seeing a stream
 	// that simply never produces anything.
 	select {
 	case <-ctx.Done():
-		stop()
-		drain(frames)
+		stop() // drains frames too; see watchStop
 		return nil, nil, ctx.Err()
 	case first, ok := <-frames:
 		if !ok {
@@ -83,8 +76,7 @@ func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte
 		}
 		_, status, body, hok := respHeader(first)
 		if !hok {
-			stop()
-			drain(frames)
+			stop() // drains frames too; see watchStop
 			return nil, nil, errShort
 		}
 		switch status {
@@ -100,7 +92,7 @@ func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte
 			defer close(events)
 			// The frame already read is the stream's first event; deliver it, then continue.
 			if status == stStream {
-				if !deliverWireWatch(ctx, events, body, stop, frames) {
+				if !deliverWireWatch(ctx, events, body, stop) {
 					return
 				}
 			}
@@ -108,7 +100,6 @@ func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte
 				select {
 				case <-ctx.Done():
 					stop()
-					drain(frames)
 					return
 				case frame, ok := <-frames:
 					if !ok {
@@ -118,7 +109,7 @@ func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte
 					if !ok || st != stStream {
 						continue
 					}
-					if !deliverWireWatch(ctx, events, b, stop, frames) {
+					if !deliverWireWatch(ctx, events, b, stop) {
 						return
 					}
 				}
@@ -129,7 +120,7 @@ func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte
 }
 
 // deliverWireWatch parses one event frame and sends it, reporting whether to keep going.
-func deliverWireWatch(ctx context.Context, events chan<- WireWatchEvent, body *reader, stop func(), frames <-chan []byte) bool {
+func deliverWireWatch(ctx context.Context, events chan<- WireWatchEvent, body *reader, stop func()) bool {
 	ev := WireWatchEvent{Kind: body.u8()}
 	ev.Key = body.str()
 	ev.Ad = append([]byte(nil), body.bytesRef()...)
@@ -138,8 +129,7 @@ func deliverWireWatch(ctx context.Context, events chan<- WireWatchEvent, body *r
 	case events <- ev:
 		return true
 	case <-ctx.Done():
-		stop()
-		drain(frames)
+		stop() // drains frames too; see watchStop
 		return false
 	}
 }
