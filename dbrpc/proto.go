@@ -616,6 +616,20 @@ const (
 	// is not an attribute name: COUNT(*) is a legal header and cannot be an attribute.
 	// [target][source][constraint][nGroup i32]{[attr][width u64]}[nAgg i32]{[func u8][arg][filter][name]}[nNames i32]{[name]} -> [count u64]; mutating
 	opInsertSelect op = 86
+
+	// opInsertRows copies rows from one table into another, server-side: INSERT ... SELECT
+	// with no GROUP BY.
+	//
+	// Separate from opInsertSelect because the two bound differently, not because the
+	// request differs by a flag. A roll-up's result is one row per group and a copy's is one
+	// row per source row, so this one is the one that can be asked to hold an entire table;
+	// it streams and refuses past a budget, where the roll-up simply materialises.
+	//
+	// nCols 0 means SELECT *: copy each ad whole, every attribute under its own name.
+	// Otherwise each pair is a source attribute and the target attribute it is written
+	// under, which is how a projection renames.
+	// [target][source][constraint][nCols i32]{[attr][name]} -> [count u64]; mutating
+	opInsertRows op = 87
 )
 
 // joinLayout names a join request body: which spelling it uses, and whether it carries
@@ -785,6 +799,8 @@ func (o op) String() string {
 		return "SetPrimaryKey"
 	case opInsertSelect:
 		return "InsertSelect"
+	case opInsertRows:
+		return "InsertRows"
 	case opAdmin:
 		return "Admin"
 	case opCreateTable:

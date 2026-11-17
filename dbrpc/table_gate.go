@@ -53,7 +53,7 @@ func (sc *serverConn) tableWriteTarget(o op, body *reader) (table, what string, 
 		// a table owned by another writer is a write to that table.
 		table = r.str()
 		return table, o.String(), r.err == nil
-	case opInsertSelect:
+	case opInsertSelect, opInsertRows:
 		// Gated on the TARGET, which is the table this writes. The source is read, and a
 		// read is authorized as a read -- so the first string is the one that matters and
 		// the second is deliberately not consulted here.

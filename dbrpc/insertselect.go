@@ -240,9 +240,18 @@ func (s *Server) reduceForInsert(ctx context.Context, reqID uint64, source, cons
 	case kindTable, kindView:
 		var rows []db.AggRow
 		var err error
-		if includePrivate {
+		switch {
+		case ref.seals() && ref.view != nil:
+			// A continuous aggregate that has sealed holds half its rows in the backing
+			// table and half in an archive, and reducing one half is not a reduction of the
+			// view. The view reduces the union in one pass, which is also the only correct
+			// way to do it -- AVG and COUNT(DISTINCT) cannot be combined from per-half
+			// results. A view is built with no key for every reader, so its rows serve a
+			// privileged and an unprivileged caller alike.
+			rows, err = ref.view.AggregateColsStats(constraint, groups, aggs, nil, stop)
+		case includePrivate:
 			rows, err = ref.db.AggregateColsStats(constraint, groups, aggs, nil, stop)
-		} else {
+		default:
 			rows, err = ref.db.AggregateColsStatsRedacted(constraint, groups, aggs, nil, stop)
 		}
 		if err != nil {

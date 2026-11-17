@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 8
+const ProtocolVersion = 9
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -216,6 +216,15 @@ const (
 	// declaration is useful on its own -- it is what makes a table's row identity explicit
 	// for anything that writes to it -- and a build could carry it without the roll-up.
 	FeatInsertSelect Feature = "insertselect"
+
+	// FeatInsertRows is the server-side row copy: INSERT ... SELECT with no GROUP BY, which
+	// moves rows rather than summarising them. Postdates advertisement, so silence is a no.
+	//
+	// Separate from FeatInsertSelect because they are separate opcodes bounding separate
+	// risks, and a client has to know which one it may send: a server carrying the roll-up
+	// need not carry the copy, and a client that assumed otherwise would have its statement
+	// refused as malformed rather than as unimplemented.
+	FeatInsertRows Feature = "insertrows"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -257,6 +266,7 @@ var serverFeatures = []Feature{
 	FeatJoinStats,
 	FeatPrimaryKey,
 	FeatInsertSelect,
+	FeatInsertRows,
 	FeatJoinBand,
 }
 
