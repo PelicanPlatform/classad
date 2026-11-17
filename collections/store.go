@@ -658,6 +658,10 @@ type Collection struct {
 	lastDictVerify atomic.Int64
 	// lastDictReplica is when the dictionary replica census last ran, paced the same way.
 	lastDictReplica atomic.Int64
+	// dictMismatch tallies, during recovery only, the segments whose recorded dictionary
+	// fingerprint disagrees with the dictionary loaded for them. Drained and reported once
+	// per dictionary when every shard is in; nil at every other time.
+	dictMismatch map[uint32]*dictMismatchTally
 	// dictReplicaMu serializes the replica census. Two passes that overlap each take
 	// their own count, each sees the level unmet, and each writes -- so the store ends up
 	// over the target by however many passes raced. The census is infrequent and off any

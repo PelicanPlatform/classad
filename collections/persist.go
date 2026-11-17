@@ -636,6 +636,9 @@ func Open(opts Options) (*Collection, error) {
 			return sh.allocNamed(id, size, codec, "seg")
 		}
 	}
+	// Every shard is in, so what recovery found about the dictionaries can be said once per
+	// dictionary rather than once per segment. See reportDictMismatches.
+	c.reportDictMismatches()
 	// Never reissue a seq the previous process issued, even if its record is gone from disk
 	// (Truncate, or a shard emptied by Rotate): a resumed cursor would skip the new record.
 	for i, hw := range watchHW {
@@ -897,13 +900,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			c.dicts.mu.Unlock()
 			if checkSegFingerprint(trailer, sf.dictID, pin) {
 				dictFingerprintMismatches.Add(1)
-				if c.onDictFault != nil {
-					c.onDictFault(&DictFault{
-						ID: sf.dictID, Kind: DictFaultMismatch,
-						Path: filepath.Join(c.dir, "dicts", fmt.Sprintf("%d.zst", sf.dictID)),
-						From: filepath.Join(shardDir, sf.name),
-					})
-				}
+				c.noteDictMismatch(sf.dictID, filepath.Join(shardDir, sf.name))
 			}
 		}
 		// Everything between here and the end of loadShard that touches this mapping --
