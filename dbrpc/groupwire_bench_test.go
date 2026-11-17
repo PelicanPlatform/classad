@@ -96,7 +96,7 @@ func benchGroupWire(b *testing.B, groups, rows int) {
 				if !ok {
 					return true
 				}
-				sv, ok := wire.StringNodeBytes(node)
+				sv, ok := wire.StringLiteralValue(node)
 				if !ok {
 					return true
 				}
