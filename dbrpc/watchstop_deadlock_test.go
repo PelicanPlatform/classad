@@ -37,12 +37,12 @@ func TestWatchStopDoesNotDeadlockTheReadLoop(t *testing.T) {
 	const rows = 600
 	for i := range rows {
 		k := fmt.Sprintf("j%d", i)
-		if err := tx.NewClassAd(ctx, k, fmt.Sprintf("Name = %q", k)); err != nil {
-			t.Fatal(err)
+		if addErr := tx.NewClassAd(ctx, k, fmt.Sprintf("Name = %q", k)); addErr != nil {
+			t.Fatal(addErr)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// Deliberately never read events.
