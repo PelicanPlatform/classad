@@ -45,6 +45,16 @@ const (
 	// that swap names stay indistinguishable by construction; this change ends that for
 	// new dictionaries, not retroactively.
 	legacyDictID = 1
+	// dictStampBase is added to a registry id before it is written into the dictionary,
+	// and it is not decoration.
+	//
+	// Registry ids start at 1, and legacyDictID IS 1. Without a bias the first dictionary
+	// of every store -- and every store has one -- would be stamped with the very value
+	// that means "this says nothing about which dictionary I am", so exactly one
+	// dictionary per store would silently keep the old behaviour. Biasing puts every
+	// stamped id above anything a pre-stamping dictionary can carry, which makes "is this
+	// stamped" a question about the value rather than a guess.
+	dictStampBase = 1 << 24
 )
 
 // dictsUnverifiable counts dictionaries loaded that still carry legacyDictID, and so
@@ -57,7 +67,7 @@ var dictsUnverifiable atomic.Int64
 // their own, process-wide since start. See legacyDictID.
 func DictsUnverifiable() int64 { return dictsUnverifiable.Load() }
 
-// dictIDOf reads a dictionary's own Dictionary_ID. ok is false when b is not a ZSTD
+// dictIDOf reads a dictionary's own Dictionary_ID, raw. ok is false when b is not a ZSTD
 // dictionary at all -- a separate question, which fsckDictFile asks directly and
 // NewZSTDCodec answers by failing.
 func dictIDOf(b []byte) (uint32, bool) {
@@ -65,6 +75,17 @@ func dictIDOf(b []byte) (uint32, bool) {
 		return 0, false
 	}
 	return binary.LittleEndian.Uint32(b[dictIDOff:]), true
+}
+
+// dictSlotOf returns the registry id a dictionary names. ok is false when it names none:
+// it is not a dictionary, or it predates stamping and carries legacyDictID, which says
+// nothing about which slot it belongs in.
+func dictSlotOf(b []byte) (uint32, bool) {
+	raw, ok := dictIDOf(b)
+	if !ok || raw < dictStampBase {
+		return 0, false
+	}
+	return raw - dictStampBase, true
 }
 
 // stampDictID returns a copy of dict carrying id as its Dictionary_ID, so the dictionary
@@ -83,12 +104,15 @@ func stampDictID(dict []byte, id uint32) ([]byte, error) {
 	if id == 0 {
 		return nil, errors.New("collections: dictionary id 0 is the base codec, which has no dictionary")
 	}
+	if id > ^uint32(0)-dictStampBase {
+		return nil, fmt.Errorf("collections: dictionary id %d is too large to stamp", id)
+	}
 	if _, ok := dictIDOf(dict); !ok {
 		return nil, errors.New("collections: not a ZSTD dictionary")
 	}
 	out := make([]byte, len(dict))
 	copy(out, dict)
-	binary.LittleEndian.PutUint32(out[dictIDOff:], id)
+	binary.LittleEndian.PutUint32(out[dictIDOff:], dictStampBase+id)
 	return out, nil
 }
 

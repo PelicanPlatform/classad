@@ -52,12 +52,12 @@ func TestRegisteredDictionaryNamesItsSlot(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, ok := dictIDOf(b)
+		got, ok := dictSlotOf(b)
 		if !ok {
-			t.Fatalf("dicts/%d.zst is not a ZSTD dictionary", id)
+			t.Fatalf("dicts/%d.zst names no slot at all", id)
 		}
 		if got != id {
-			t.Errorf("dicts/%d.zst carries Dictionary_ID %d; want %d", id, got, id)
+			t.Errorf("dicts/%d.zst names slot %d; want %d", id, got, id)
 		}
 	}
 
@@ -196,8 +196,23 @@ func TestStampDictID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stamping a valid dictionary: %v", err)
 	}
-	if id, ok := dictIDOf(out); !ok || id != 9 {
-		t.Errorf("stamped dictionary reads back as (%d, %v); want (9, true)", id, ok)
+	if slot, ok := dictSlotOf(out); !ok || slot != 9 {
+		t.Errorf("stamped dictionary names slot (%d, %v); want (9, true)", slot, ok)
+	}
+	// Registry ids start at 1 and legacyDictID IS 1, so the bias is what keeps the first
+	// dictionary of every store from being stamped with the value that means "unstamped".
+	one, err := stampDictID(good, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := dictIDOf(one); raw == legacyDictID {
+		t.Error("dictionary 1 was stamped with the pre-stamping sentinel")
+	}
+	if slot, ok := dictSlotOf(one); !ok || slot != 1 {
+		t.Errorf("dictionary 1 names slot (%d, %v); want (1, true)", slot, ok)
+	}
+	if slot, ok := dictSlotOf(good); ok {
+		t.Errorf("an unstamped dictionary names slot %d; want no answer at all", slot)
 	}
 	if id, _ := dictIDOf(good); id != legacyDictID {
 		t.Error("stampDictID wrote through to the caller's slice")
@@ -212,6 +227,7 @@ func TestStampDictID(t *testing.T) {
 		id   uint32
 	}{
 		{"id zero", good, 0},
+		{"id past what can be stamped", good, ^uint32(0)},
 		{"not a dictionary", []byte("this is not a zstd dictionary"), 3},
 		{"too short", []byte{0x37, 0xA4}, 3},
 		{"empty", nil, 3},

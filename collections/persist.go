@@ -439,12 +439,13 @@ func (c *Collection) loadDicts(dictsDir string) (latest uint32, err error) {
 		// silently decoding to nothing. A dictionary still carrying legacyDictID says
 		// nothing about where it belongs and is accepted; one that is not a dictionary at
 		// all falls through to NewZSTDCodec, which reports it properly.
-		switch fileID, ok := dictIDOf(dict); {
-		case !ok:
-		case fileID == legacyDictID:
+		switch slot, named := dictSlotOf(dict); {
+		case !named:
+			// Not stamped: a dictionary written before stamping existed, which says
+			// nothing about where it belongs and is taken at its name.
 			dictsUnverifiable.Add(1)
-		case fileID != id:
-			return 0, &DictIDMismatchError{Slot: id, Found: fileID, Path: path}
+		case slot != id:
+			return 0, &DictIDMismatchError{Slot: id, Found: slot, Path: path}
 		}
 		codec, err := NewZSTDCodec(dict)
 		if err != nil {
