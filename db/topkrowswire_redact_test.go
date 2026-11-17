@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -85,5 +86,61 @@ func TestTopKRowsWireRedactsPrivateAttributes(t *testing.T) {
 	// And it still answers the question that was asked.
 	if !carries(red, "p3") {
 		t.Error("redaction dropped the attribute the caller asked for")
+	}
+}
+
+// TestTopKRowsValueRungRedacts is the same question of the value rung. Its answer is VALUES,
+// not bytes, so the leak would read as the private attribute's value sitting in a cell the
+// caller asked for -- which is narrower (nothing unnamed comes back) and just as readable.
+func TestTopKRowsValueRungRedacts(t *testing.T) {
+	d, err := OpenConfig(Config{Dir: t.TempDir(), SegmentSize: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	tx := d.Begin()
+	for i := 0; i < 20; i++ {
+		ad := classad.New()
+		ad.InsertAttrString("Owner", fmt.Sprintf("o%d", i%2))
+		ad.InsertAttr("QDate", int64(1700000000+i))
+		ad.InsertAttrString("ClaimId", fmt.Sprintf("secret-claim-%d", i))
+		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	spec := TopKRowsSpec{
+		GroupCols: []GroupCol{{Attr: "Owner"}},
+		OrderBy:   OrderOne("QDate", true),
+		K:         2,
+		Attrs:     []string{"ClaimId"},
+	}
+	holds := func(groups []TopKRowsGroup) bool {
+		for _, g := range groups {
+			for _, row := range g.Rows {
+				if s, serr := row[0].StringValue(); serr == nil && strings.HasPrefix(s, "secret-claim-") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	plain, err := d.TopKRowsPerGroup("true", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Control, as above: without it a redacted rung that returned no groups at all would pass.
+	if !holds(plain) {
+		t.Fatal("unredacted value rung does not hold ClaimId, so this test cannot detect a leak")
+	}
+	red, err := d.TopKRowsPerGroupRedacted("true", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(red) != len(plain) {
+		t.Fatalf("redacted rung returned %d groups, unredacted %d", len(red), len(plain))
+	}
+	if holds(red) {
+		t.Error("redacted value rung still returns ClaimId")
 	}
 }

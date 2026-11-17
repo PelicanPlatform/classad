@@ -85,6 +85,7 @@ func OrderOne(attr string, desc bool) []TopKOrderTerm {
 // answer it was the bigger gap of the two.
 type TopKRowsSource interface {
 	QueryProjectStats(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error)
+	QueryProjectStatsRedacted(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error)
 	QueryRawWireRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error)
 }
 
@@ -227,25 +228,53 @@ func (t *topKRowKeep) ordered() [][]classad.Value {
 // are ordered by the order attribute, best first. A group with fewer than K ranked rows returns
 // all of them.
 func (db *DB) TopKRowsPerGroup(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
-	return topKRowsPerGroup(db, constraint, spec, nil)
+	return topKRowsPerGroup(db, constraint, spec, false, nil)
 }
 
 // TopKRowsPerGroupStats is TopKRowsPerGroup filling stats (may be nil) with the scan's work.
 func (db *DB) TopKRowsPerGroupStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
-	return topKRowsPerGroup(db, constraint, spec, stats)
+	return topKRowsPerGroup(db, constraint, spec, false, stats)
+}
+
+// TopKRowsPerGroupRedacted is TopKRowsPerGroup with private attributes stripped at the source,
+// for serving a reader not entitled to them.
+//
+// This rung's exposure is NARROWER than the wire rung's: it returns one value per attribute the
+// caller NAMED and nothing else, so a server can also refuse a private name up front, as the
+// aggregate handler does. The pair exists anyway, because the two rungs answer the same
+// question and a reviewer comparing them should not find one that can redact and one that
+// cannot -- and because the caller that reaches for the value rung next will not be looking for
+// a gap this one left.
+func (db *DB) TopKRowsPerGroupRedacted(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(db, constraint, spec, true, nil)
+}
+
+// TopKRowsPerGroupRedactedStats is TopKRowsPerGroupRedacted filling stats (may be nil).
+func (db *DB) TopKRowsPerGroupRedactedStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(db, constraint, spec, true, stats)
 }
 
 // TopKRowsPerGroup is DB.TopKRowsPerGroup over a history table.
 func (t *ArchiveTable) TopKRowsPerGroup(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
-	return topKRowsPerGroup(t, constraint, spec, nil)
+	return topKRowsPerGroup(t, constraint, spec, false, nil)
 }
 
 // TopKRowsPerGroupStats is ArchiveTable.TopKRowsPerGroup filling stats (may be nil).
 func (t *ArchiveTable) TopKRowsPerGroupStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
-	return topKRowsPerGroup(t, constraint, spec, stats)
+	return topKRowsPerGroup(t, constraint, spec, false, stats)
 }
 
-func topKRowsPerGroup(src TopKRowsSource, constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
+// TopKRowsPerGroupRedacted is DB.TopKRowsPerGroupRedacted over a history table.
+func (t *ArchiveTable) TopKRowsPerGroupRedacted(constraint string, spec TopKRowsSpec) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(t, constraint, spec, true, nil)
+}
+
+// TopKRowsPerGroupRedactedStats is ArchiveTable.TopKRowsPerGroupRedacted filling stats.
+func (t *ArchiveTable) TopKRowsPerGroupRedactedStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
+	return topKRowsPerGroup(t, constraint, spec, true, stats)
+}
+
+func topKRowsPerGroup(src TopKRowsSource, constraint string, spec TopKRowsSpec, redact bool, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
@@ -276,7 +305,11 @@ func topKRowsPerGroup(src TopKRowsSource, constraint string, spec TopKRowsSpec, 
 	}
 	keep := len(spec.Attrs)
 
-	seq, err := src.QueryProjectStats(constraint, attrs, stats)
+	project := src.QueryProjectStats
+	if redact {
+		project = src.QueryProjectStatsRedacted
+	}
+	seq, err := project(constraint, attrs, stats)
 	if err != nil {
 		return nil, err
 	}
