@@ -630,6 +630,37 @@ const (
 	// under, which is how a projection renames.
 	// [target][source][constraint][nCols i32]{[attr][name]} -> [count u64]; mutating
 	opInsertRows op = 87
+
+	// opTopKRows returns the K best rows of EACH GROUP -- what a ranking window asks for,
+	// ROW_NUMBER() OVER (PARTITION BY Owner ORDER BY QDate DESC) with a QUALIFY -- done at
+	// the store, so only the rows that survive the ranking cross the wire. A client doing it
+	// itself takes every matching row and ranks them: over 100 owners holding a thousand jobs
+	// each that is 100,000 rows to keep 500.
+	//
+	// The rows come back in WIRE FORM, as opJoinWire's do and for the same reason: the server
+	// would otherwise render every one to old-ClassAd text and the consumer parse it back,
+	// which is most of what such a read costs and neither half depends on the transport.
+	//
+	// THE ORDERING IS A LIST OF TERMS, because "the top K" is only a well-defined SET of rows
+	// when the ordering is total over them. Where it ties across the K-th place, which rows
+	// come back is a choice, and the server makes a different one than a client sorting the
+	// same rows does. A caller that needs the answer determined sends an ordering that cannot
+	// tie; a caller that does not care sends one term.
+	//
+	// Group columns are not bucketed here. Rounding is what makes two distinct values one
+	// group, and the rung behind this cannot do it from the stored bytes; a bucketed grouping
+	// goes through the aggregate opcodes, which can.
+	//
+	// [table][constraint][redact u8][nGroup i32]{[attr]}[nOrder i32]{[attr][desc u8]}[k i32][nAttrs i32]{[attr]}
+	//   -> stream of [nItems i32]{[kind u8] ...}, then stStreamEnd
+	//
+	// An item is either a GROUP header (kind topKItemGroup, followed by
+	// [nGroupVals i32]{tagged value}) or a ROW (kind topKItemRow, followed by [len u32][wire
+	// ad]). Items arrive in order and a group's rows follow its header, so a group whose rows
+	// do not fit one frame simply CONTINUES in the next with no header repeated -- which is
+	// what keeps a frame inside MaxMessageSize however large K is, where one frame per group
+	// would not.
+	opTopKRows op = 88
 )
 
 // joinLayout names a join request body: which spelling it uses, and whether it carries
@@ -1077,4 +1108,10 @@ const (
 	// add as an opcode: a newer client asking for something this server cannot do finds out
 	// immediately instead of receiving rows that silently lack it.
 	wireFlagsKnown = wireFlagRefs
+)
+
+// The item kinds of an opTopKRows reply stream. See that opcode for the framing.
+const (
+	topKItemGroup uint8 = 0
+	topKItemRow   uint8 = 1
 )
