@@ -204,11 +204,7 @@ func (c *Collection) topUpDictReplica(id uint32, cen *dictCensus, st *DictReplic
 		st.Err = fmt.Errorf("collections: dictionary %d has no file to copy", id)
 		return
 	}
-	dict, err := pin.read()
-	if err != nil {
-		st.Err = err
-		return
-	}
+	dict := pin.loaded()
 
 	// Two rounds: shards with no copy yet, then anywhere. The first spreads the copies
 	// across the failure domains the store has; the second is what a single-shard store

@@ -31,7 +31,6 @@ package collections
 // a large store holds thousands of them; see newMmapSegment.)
 
 import (
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -85,6 +84,11 @@ type DictFault struct {
 	// records were never at risk while this process lived; the next one would have lost
 	// them.
 	Repaired bool
+	// Preserved is where the dictionary this store loaded can still be found, after a
+	// fault showed the file at its own path is no longer it. It may be a copy this check
+	// wrote (dicts/backup/) or one it found already there -- the attic, or a segment
+	// carrying a replica. Empty when nothing was preserved and nothing needed to be.
+	Preserved string
 	// From is the segment file a repaired copy came out of, when the dictionary was not
 	// rewritten from the open descriptor but found in a segment trailer at Open. Empty
 	// otherwise.
@@ -103,8 +107,10 @@ func (f *DictFault) Error() string {
 		return fmt.Sprintf("collections: dictionary file %s has been removed and could not be rewritten (%v); every segment naming dictionary %d becomes unreadable at the next open", f.Path, f.Err, f.ID)
 	case f.Err != nil:
 		return fmt.Sprintf("collections: dictionary file %s: %s: %v", f.Path, f.Kind, f.Err)
+	case f.Preserved != "":
+		return fmt.Sprintf("collections: dictionary file %s was %s underneath this store; it is no longer the dictionary %d was loaded from, which is kept at %s", f.Path, f.Kind, f.ID, f.Preserved)
 	default:
-		return fmt.Sprintf("collections: dictionary file %s was %s underneath this store; it is no longer the dictionary %d was loaded from", f.Path, f.Kind, f.ID)
+		return fmt.Sprintf("collections: dictionary file %s was %s underneath this store; it is no longer the dictionary %d was loaded from, and this process holds the only copy", f.Path, f.Kind, f.ID)
 	}
 }
 
@@ -135,10 +141,24 @@ func DictFilesChanged() int64 { return dictFilesChanged.Load() }
 // store still held open.
 func DictFilesRestored() int64 { return dictFilesRestored.Load() }
 
-// dictPin is the open descriptor and fingerprint of the file a dictionary was loaded from.
+// dictPin is what the store keeps of the file a dictionary was loaded from: the bytes, the
+// open descriptor, and a fingerprint.
+//
+// The BYTES are the authoritative copy, and holding them is not redundant with holding the
+// descriptor. A descriptor survives an unlink, so it still reads the dictionary when the
+// directory entry is removed -- but a file rewritten IN PLACE keeps its inode, and the
+// descriptor then reads the new contents like everybody else. That is the one case where
+// the dictionary is genuinely gone from disk, and it is exactly the case where having it
+// still in hand decides whether it can be put somewhere safe. The cost is ~112 KB per live
+// dictionary, single digits of them.
+//
+// The descriptor still earns its place: fstat gives a stable identity for what was loaded,
+// which is what tells a file that was REPLACED from one that was merely changed.
 type dictPin struct {
-	path   string
-	f      *os.File
+	path string
+	f    *os.File
+	// dict is the dictionary as loaded. Never written to after pinDictFile returns.
+	dict   []byte
 	ino    uint64
 	hasIno bool
 	size   int64
@@ -165,7 +185,7 @@ func pinDictFile(path string) (*dictPin, []byte, error) {
 	}
 	ino, hasIno := fileIno(fi)
 	return &dictPin{
-		path: path, f: f, ino: ino, hasIno: hasIno,
+		path: path, f: f, dict: b, ino: ino, hasIno: hasIno,
 		size: fi.Size(), crc: crc32.Checksum(b, crcTable),
 	}, b, nil
 }
@@ -176,20 +196,21 @@ func (p *dictPin) close() {
 	}
 }
 
-// read returns the pinned bytes, through the descriptor rather than the path, and refuses
-// to hand back anything that does not match the fingerprint taken when it was opened.
-// That check is what makes the descriptor worth holding: it is the difference between
-// "these are the dictionary's bytes" and "these are whatever is behind this descriptor
-// now".
-func (p *dictPin) read() ([]byte, error) {
+// loaded returns the dictionary as this store loaded it. No I/O, and no failure mode:
+// whatever has happened to the file, these are the bytes the running codecs were built
+// from.
+func (p *dictPin) loaded() []byte { return p.dict }
+
+// fileMatches reports whether the file behind the descriptor still holds what was loaded
+// from it. It reads through the DESCRIPTOR rather than the path, which is sound only
+// because the caller has just confirmed the inode still matches -- same inode, same bytes,
+// and no second open to race against.
+func (p *dictPin) fileMatches() (bool, error) {
 	b := make([]byte, p.size)
 	if _, err := p.f.ReadAt(b, 0); err != nil && len(b) > 0 {
-		return nil, err
+		return false, err
 	}
-	if crc32.Checksum(b, crcTable) != p.crc {
-		return nil, errors.New("the open descriptor no longer reads the dictionary it was opened on")
-	}
-	return b, nil
+	return crc32.Checksum(b, crcTable) == p.crc, nil
 }
 
 // verify compares the path against what was pinned. ok is false when nothing is wrong.
@@ -219,8 +240,12 @@ func (p *dictPin) verify() (DictFault, bool) {
 		fault.Kind = DictFaultChanged
 		return fault, true
 	}
-	if _, err := p.read(); err != nil {
+	switch same, err := p.fileMatches(); {
+	case err != nil:
 		fault.Kind, fault.Err = DictFaultChanged, err
+		return fault, true
+	case !same:
+		fault.Kind = DictFaultChanged
 		return fault, true
 	}
 	return DictFault{}, false
@@ -254,10 +279,19 @@ func (r *dictReg) verifyFiles() []DictFault {
 		case DictFaultMissing:
 			dictFilesMissing.Add(1)
 			r.restorePin(ids[i], p, &fault)
+			if !fault.Repaired {
+				// The rewrite did not happen, so the dictionary is still only in this
+				// process. Preserving may not work either -- a read-only filesystem
+				// fails both -- but it may also find the bytes already safe somewhere,
+				// which turns "you have until the next restart" into "it is in segment X".
+				r.preserveDict(ids[i], p, &fault)
+			}
 		case DictFaultReplaced:
 			dictFilesReplaced.Add(1)
+			r.preserveDict(ids[i], p, &fault)
 		case DictFaultChanged:
 			dictFilesChanged.Add(1)
+			r.preserveDict(ids[i], p, &fault)
 		}
 		faults = append(faults, fault)
 	}
@@ -272,12 +306,7 @@ func (r *dictReg) verifyFiles() []DictFault {
 // the dictionary, which is the thing worth keeping; the worst it costs is a spurious
 // fault next time.
 func (r *dictReg) restorePin(id uint32, p *dictPin, fault *DictFault) {
-	b, err := p.read()
-	if err != nil {
-		fault.Err = err
-		return
-	}
-	if werr := writeDictFile(p.path, b); werr != nil {
+	if werr := writeDictFile(p.path, p.loaded()); werr != nil {
 		fault.Err = werr
 		return
 	}
