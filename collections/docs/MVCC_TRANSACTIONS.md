@@ -27,10 +27,10 @@ independently — a read of ad A never feeds a write to ad B (no `B.x = A.y`); t
 common shapes are read-modify-write on one ad (increment a counter, set JobStatus)
 and blind sets. Cross-ad invariants that would need serializability do not occur.
 
-## Per-ad independent commit (not all-or-nothing)
+## Per-ad independent commit, and the opt-in all-or-nothing mode
 
 Because ads are independent, a large transaction (a constraint query selecting many
-ads, then editing each) is treated as a **batch of independent single-ad
+ads, then editing each) is by default treated as a **batch of independent single-ad
 transactions**. Commit applies each write on its own:
 
 - writes whose key is unchanged since `S0` commit;
@@ -38,10 +38,40 @@ transactions**. Commit applies each write on its own:
 - there is **no rollback of the successful writes** — the caller gets the set of
   conflicted keys and retries just those (re-read, re-apply, re-commit).
 
-This is how `Txn.Commit` always behaves, matching how the schedd actually uses large
-transactions; there is no all-or-nothing mode. `CommitResult` reports retryable
-`Conflicts` separately from `Unapplied` writes (a patch whose base can never be
-composed), which a retry cannot fix.
+This is the default, and it matches how the schedd actually uses large transactions:
+one key losing a race must not cost the progress of the rest, which is what a bulk
+load wants. `CommitResult` reports retryable `Conflicts` separately from `Unapplied`
+writes (a patch whose base can never be composed), which a retry cannot fix.
+
+`Txn.SetAtomic(true)` selects the other mode, for a caller holding an invariant
+across several keys, where half a batch is worse than none of it. The commit then
+applies **everything or nothing**:
+
+- Each shard runs a check pass that applies nothing, then an apply pass over writes
+  already cleared, both under one uninterrupted hold of that shard's write lock, so
+  no writer can slip between the decision and the application.
+- A transaction spanning shards takes every touched shard's write lock up front, in
+  **ascending shard index**. That total order is what stops two concurrent atomic
+  commits deadlocking on each other.
+- An aborted commit reports `Committed == 0` and names **every** conflicting key, not
+  just the first one found, so a caller refreshes its whole working set in one retry.
+  A shard on the single-writer fast path hides nothing: its `commitSeq` still equalling
+  the snapshot is itself proof that none of its keys changed.
+- An `Unapplied` write aborts the commit and is reported in `Unapplied`, never in
+  `Conflicts`. Applying the rest while silently dropping it is the partial application
+  the mode exists to prevent, and keeping it out of `Conflicts` is what stops a
+  conflict-retry loop spinning on something no retry can fix. The abort happens before
+  any lock is taken.
+
+The guarantee is atomicity of **application against concurrent writers**, not crash
+atomicity. A multi-shard commit syncs its shards in parallel, so a crash mid-sync can
+leave one shard durable and another not — see the `gcFloor` and durability discussion
+below, which already notes that durability does not provide atomicity across keys for
+a commit that was not yet durable.
+
+The mode costs the default path nothing measurable: the check pass is skipped
+entirely when it is off, and the refactor adds three non-inlined calls and one
+predictable branch per commit, which is below the noise floor of a one-key commit.
 
 ## How it maps onto the existing store
 
@@ -140,9 +170,12 @@ a compaction. The single-writer fast path is unaffected: compaction does not bum
   and chains them). That is surgery on the compaction rebuild and is the deliberate
   next step; the conservative watermark ships first because it is correct and does
   not touch the battle-tested reclaim path.
-- **Cross-shard atomicity.** Independent per-ad commit needs none. A future
-  serializable mode spanning shards would need a global sequence or 2-phase commit;
-  out of scope.
+- **Cross-shard consistent reads.** `SetAtomic` makes a commit atomic across shards,
+  but it does nothing for reads, and cannot from the write side. `snapOf` captures the
+  snapshot lazily, **per shard, on first touch**, so a transaction reading two keys in
+  two shards takes its two snapshots at two different instants and can straddle a
+  commit between them. A genuinely serializable mode would need a global sequence
+  taken once at `Begin`; out of scope.
 - **Group-commit coalescing.** A transaction commits under its own `sh.mu` apply
   (serialized with `Put`), bypassing the `Put` group-commit coalescer. Since the
   durability sync is currently a no-op, this is a wash; coalescing txn commits is a

@@ -55,7 +55,8 @@ operations (`LogNewClassAd`, `LogDestroyClassAd`, `LogSetAttribute`,
   The C++ layer may still serialize if it wants, but the library does not require it.
 - **Per-ad partial commit.** A large transaction (a constraint scan that edits many
   ads) commits each ad independently — matching how the schedd actually uses large
-  transactions. No all-or-nothing rollback.
+  transactions. No all-or-nothing rollback at this layer: the collections engine
+  beneath offers one (`collections.Txn.SetAtomic`), and `db.Txn` does not surface it.
 
 ### C surface (capi/, cgo)
 

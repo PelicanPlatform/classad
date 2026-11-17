@@ -1858,10 +1858,16 @@ res := tx.Commit()              // {Committed, Conflicts, Unapplied, UnappliedRe
 - **Write-write conflicts only.** Reads are not tracked, so scans and constraint queries
   impose no bookkeeping. At commit, each buffered write applies only if its key was not
   modified by another committer since the snapshot.
-- **Per-ad commit, not all-or-nothing.** HTCondor transactions treat each ad
-  independently, so writes commit per key. Unaffected keys succeed even if others
-  conflict. The caller retries just the `Conflicts`. A commit is not atomic across keys
-  or shards.
+- **Per-ad commit by default; all-or-nothing on request.** HTCondor transactions treat
+  each ad independently, so by default writes commit per key: unaffected keys succeed
+  even if others conflict, and the caller retries just the `Conflicts`. That is what a
+  bulk load wants, and it is the default. `Txn.SetAtomic(true)` selects the other
+  behaviour, for a caller holding an invariant across several keys: a check pass that
+  applies nothing runs first, under the same uninterrupted hold of each shard's write
+  lock as the apply pass that follows, and any conflict aborts the whole commit with
+  `Committed == 0` and every conflicting key named. Shards are locked in ascending
+  index order so two concurrent atomic commits cannot deadlock. The guarantee is
+  atomicity of application against concurrent writers, not crash atomicity.
 - **Conflicts versus Unapplied.** A *conflict* is retryable. An *unapplied* write is not:
   it is a patch whose base can never be composed, for example a delta chain that no
   longer materializes. It is reported separately, with a reason, so a retrying caller
@@ -2385,8 +2391,11 @@ and reintroduce write contention. This per-shard level is the engine's consisten
 contract, and every other reader is defined relative to it:
 
 - **Transactions** take each shard's snapshot lazily, on first touch (Chapter 15).
-  Commits are per key: a transaction is not atomic across keys, and so not across
-  shards.
+  Commits are per key by default, and atomic across keys and shards under
+  `SetAtomic`. Reads are the asymmetry: because the snapshot is taken per shard on
+  first touch, a transaction reading two keys in two shards takes its snapshots at two
+  different instants and can straddle a commit. An atomic commit does not change that,
+  and cannot from the write side.
 - **Point-in-time queries** resolve a wall-clock time to a per-shard sequence vector
   through checkpoints. They are consistent per shard, and across shards only to within
   one `CheckpointInterval`.
@@ -2607,9 +2616,12 @@ Five ideas recur; the engine is largely their consequences.
 3. **Consistency is the product.** The MVCC `seq ≤ S0 < supersededBySeq` interval is the
    single invariant under exactly-once scans, safe parallelism, safe compaction and
    rewrites, transactions, time travel, and deterministic recovery. Where a stronger
-   guarantee (a global snapshot, a fully MVCC ordered index, all-or-nothing multi-key
-   commits) would cost contention or the wrong access pattern, the weaker guarantee is
-   chosen *explicitly* and its boundary documented (Chapter 21), not left implicit.
+   guarantee (a global snapshot, a fully MVCC ordered index) would cost contention or
+   the wrong access pattern, the weaker guarantee is chosen *explicitly* and its
+   boundary documented (Chapter 21), not left implicit. Where a stronger guarantee can
+   be had without taxing the path that does not want it — all-or-nothing multi-key
+   commits, which cost the default path nothing because the check pass is simply
+   skipped — it is offered as an opt-in rather than imposed.
 4. **Derived state is disposable; authoritative state is framed with the data.**
    Indexes, key indexes, zone maps, sidecar columnar copies, directory snapshots and
    demand counters are *persisted*, because rebuilding them made restarts of large
