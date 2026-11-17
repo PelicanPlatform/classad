@@ -167,25 +167,51 @@ func numValueOfNode(node []byte) (NumValue, bool) {
 // what comes back -- the rows are bytes, and they carry the group and order attributes whether or
 // not the caller's Attrs named them.
 func (db *DB) TopKRowsPerGroupWire(constraint string, spec TopKRowsSpec) ([]TopKRowsWireGroup, error) {
-	return topKRowsPerGroupWire(db, constraint, spec, nil)
+	return topKRowsPerGroupWire(db, constraint, spec, false, nil)
 }
 
 // TopKRowsPerGroupWireStats is TopKRowsPerGroupWire filling stats (may be nil) with the scan's work.
 func (db *DB) TopKRowsPerGroupWireStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
-	return topKRowsPerGroupWire(db, constraint, spec, stats)
+	return topKRowsPerGroupWire(db, constraint, spec, false, stats)
+}
+
+// TopKRowsPerGroupWireRedacted is TopKRowsPerGroupWire with private attributes stripped at the
+// source, for serving a reader not entitled to them.
+//
+// IT IS NOT OPTIONAL FOR AN UNPRIVILEGED CALLER. The rows this rung returns are the stored
+// bytes, so an unredacted row carries every private attribute the projection happened to pull
+// in -- including ones the caller never named, since the scan chases references. The aggregate
+// path has the same pair for the same reason.
+func (db *DB) TopKRowsPerGroupWireRedacted(constraint string, spec TopKRowsSpec) ([]TopKRowsWireGroup, error) {
+	return topKRowsPerGroupWire(db, constraint, spec, true, nil)
+}
+
+// TopKRowsPerGroupWireRedactedStats is TopKRowsPerGroupWireRedacted filling stats (may be nil).
+func (db *DB) TopKRowsPerGroupWireRedactedStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
+	return topKRowsPerGroupWire(db, constraint, spec, true, stats)
 }
 
 // TopKRowsPerGroupWire is DB.TopKRowsPerGroupWire over a history table.
 func (t *ArchiveTable) TopKRowsPerGroupWire(constraint string, spec TopKRowsSpec) ([]TopKRowsWireGroup, error) {
-	return topKRowsPerGroupWire(t, constraint, spec, nil)
+	return topKRowsPerGroupWire(t, constraint, spec, false, nil)
 }
 
 // TopKRowsPerGroupWireStats is ArchiveTable.TopKRowsPerGroupWire filling stats (may be nil).
 func (t *ArchiveTable) TopKRowsPerGroupWireStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
-	return topKRowsPerGroupWire(t, constraint, spec, stats)
+	return topKRowsPerGroupWire(t, constraint, spec, false, stats)
 }
 
-func topKRowsPerGroupWire(src TopKRowsSource, constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
+// TopKRowsPerGroupWireRedacted is DB.TopKRowsPerGroupWireRedacted over a history table.
+func (t *ArchiveTable) TopKRowsPerGroupWireRedacted(constraint string, spec TopKRowsSpec) ([]TopKRowsWireGroup, error) {
+	return topKRowsPerGroupWire(t, constraint, spec, true, nil)
+}
+
+// TopKRowsPerGroupWireRedactedStats is ArchiveTable.TopKRowsPerGroupWireRedacted filling stats.
+func (t *ArchiveTable) TopKRowsPerGroupWireRedactedStats(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
+	return topKRowsPerGroupWire(t, constraint, spec, true, stats)
+}
+
+func topKRowsPerGroupWire(src TopKRowsSource, constraint string, spec TopKRowsSpec, redact bool, stats *collections.ScanStats) ([]TopKRowsWireGroup, error) {
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
@@ -218,7 +244,7 @@ func topKRowsPerGroupWire(src TopKRowsSource, constraint string, spec TopKRowsSp
 		need(t.Attr)
 	}
 
-	seq, err := src.QueryRawWireRefsStats(constraint, attrs, false, stats)
+	seq, err := src.QueryRawWireRefsStats(constraint, attrs, redact, stats)
 	if err != nil {
 		return nil, err
 	}
