@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 9
+const ProtocolVersion = 10
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -187,6 +187,11 @@ const (
 	// recognisable failure.
 	FeatJoinBand Feature = "joinband"
 
+	// FeatTopKRows is the server-side "K best rows per group" read (opTopKRows), the
+	// pushdown for a ranking window. It postdates advertisement, so a peer that says
+	// nothing does not have it.
+	FeatTopKRows Feature = "topkrows"
+
 	// FeatJoinStats is the join's EXECUTION statistics, returned as a trailer on the join
 	// opcodes when the request asks for them (db.JoinStats: which access path each step
 	// took and why, what the planner priced the orientations at, and how much work it did).
@@ -268,6 +273,7 @@ var serverFeatures = []Feature{
 	FeatInsertSelect,
 	FeatInsertRows,
 	FeatJoinBand,
+	FeatTopKRows,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar
