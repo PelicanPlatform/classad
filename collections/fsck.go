@@ -60,6 +60,9 @@ type FsckSegment struct {
 	Path   string
 	Size   int
 	DictID uint32 // the dictionary named in the file name
+	// probed and probeFailures are how many sample records were decoded with the
+	// dictionary named above, and how many refused. See dictprobe.go.
+	probed, probeFailures int
 	// DictUnusable is set when DictID names a compression dictionary this store cannot
 	// supply -- no file in dicts/, or a file that does not load. The segment's framing and
 	// checksums are still checked and Records still counts what verified, because that is
@@ -166,6 +169,28 @@ type FsckDictFile struct {
 	Why  string
 }
 
+// FsckDictLabel is a dictionary file filed under an id that is not the one it names,
+// which only became a detectable condition once a dictionary carried its own id.
+type FsckDictLabel struct {
+	Path    string
+	FiledAs uint32 // the id in the file name
+	Names   uint32 // the id the dictionary itself carries
+}
+
+// FsckTrailer is damage in one segment's trailer. Exactly one of Why and Sections is set:
+// a trailer whose directory will not read is lost whole, while a trailer that reads loses
+// only the sections whose own checksum failed.
+type FsckTrailer struct {
+	Path string
+	// Why says the trailer cannot be read at all. The segment's records are unaffected --
+	// the trailer lives past them -- but nothing it carried can be recovered, and nothing
+	// may be written to that tail again, since its extent is no longer knowable.
+	Why string
+	// Sections are the ids of sections whose body failed its own checksum. The rest of
+	// the trailer is intact and still readable.
+	Sections []uint16
+}
+
 // FsckReport is the whole collection's census.
 type FsckReport struct {
 	Dir      string
@@ -182,6 +207,29 @@ type FsckReport struct {
 	// telling an operator to restore a dictionary that will not open is worse than
 	// saying nothing.
 	DictsInAttic []uint32
+	// DictsInSegments are missing dictionaries a copy of which is carried in a segment
+	// trailer. Those segments are recoverable too, and more cheaply than from the attic:
+	// Open restores such a copy by itself. A file here that does not load is not offered,
+	// for the same reason as the attic.
+	DictsInSegments []uint32
+	// DictReplicas counts, per dictionary id, how many segment trailers carry a copy. It
+	// is the answer to "how close is this store to losing a dictionary for good": a
+	// dictionary present in dicts/ and nowhere else is one deletion away.
+	DictReplicas map[uint32]int
+	// DictsMislabelled are dictionary files stored under an id that is not the one they
+	// carry -- two files that swapped names, or one restored into the wrong slot. They
+	// are not damaged and nothing is lost; they are in the wrong places, and Repair puts
+	// them right by re-filing each under the id it names.
+	DictsMislabelled []FsckDictLabel
+	// DictChecks are the segments where the dictionary recorded in the trailer and the
+	// records themselves disagree about which dictionary this is, or where one of the two
+	// could not be had. Checking twice is what separates a wrong dictionary from damaged
+	// records; see dictprobe.go. Segments where both checks are content are not listed.
+	DictChecks []FsckDictCheck
+	// Trailers is damage in the segment trailers: one whose directory will not read at
+	// all, or sections inside one that failed their own checksum. A trailer that was
+	// never written is not damage and is not reported here.
+	Trailers []FsckTrailer
 	// DictsDamaged are dictionary files that exist but cannot be used -- empty, truncated,
 	// or not a zstd dictionary at all. They are NOT in DictsPresent: a file that does not
 	// load is not a dictionary the store has, and Open fails on it exactly as it does on
@@ -365,7 +413,43 @@ func (r *FsckReport) String() string {
 	for _, d := range r.DictsDamaged {
 		fmt.Fprintf(&b, "  DAMAGED dictionary %d: %s -- %s\n", d.ID, d.Path, d.Why)
 	}
+	for _, c := range r.DictChecks {
+		fmt.Fprintf(&b, "  DICTIONARY MISMATCH %s: %s\n", filepath.Base(c.Path), c.Verdict())
+	}
+	for _, m := range r.DictsMislabelled {
+		fmt.Fprintf(&b, "  MISLABELLED %s: it carries dictionary id %d, not %d -- "+
+			"the segments naming %d would decode to nothing\n",
+			m.Path, m.Names, m.FiledAs, m.FiledAs)
+	}
+	for _, tr := range r.Trailers {
+		if tr.Why != "" {
+			fmt.Fprintf(&b, "  DAMAGED trailer %s: %s (the segment's records are unaffected)\n",
+				filepath.Base(tr.Path), tr.Why)
+			continue
+		}
+		fmt.Fprintf(&b, "  DAMAGED trailer section(s) %v in %s (the rest of the trailer is intact)\n",
+			tr.Sections, filepath.Base(tr.Path))
+	}
+	inSeg := make(map[uint32]bool, len(r.DictsInSegments))
+	for _, id := range r.DictsInSegments {
+		inSeg[id] = true
+	}
+	// Every dictionary the store HAS, not just those a copy was found for: a dictionary
+	// carried nowhere is the one worth saying something about, and it is absent from the
+	// replica map entirely.
+	for _, id := range r.DictsPresent {
+		if n := r.DictReplicas[id]; n < dictReplicaTarget {
+			fmt.Fprintf(&b, "  THIN dictionary %d: %d of %d segment copies -- "+
+				"losing dicts/%d.zst would take the segments naming it\n",
+				id, n, dictReplicaTarget, id)
+		}
+	}
 	for _, id := range r.DictsMissing {
+		if inSeg[id] {
+			fmt.Fprintf(&b, "  RECOVERABLE dictionary %d: a copy is carried in a segment -- "+
+				"reopening the store restores it\n", id)
+			continue
+		}
 		if attic[id] {
 			fmt.Fprintf(&b, "  RECOVERABLE dictionary %d: in dicts/attic/%d.zst -- "+
 				"move it back to dicts/ to read those segments\n", id, id)
@@ -393,6 +477,9 @@ func Fsck(dir string) (*FsckReport, error) {
 		have[id] = true
 	}
 	have[0] = true // id 0 is the base codec, reconstructed from Options, never a file
+	// One codec per usable dictionary, so each segment's probe costs a decode rather than
+	// a dictionary load. See dictprobe.go.
+	kits := newDictProbeKits(filepath.Join(dir, "dicts"), present)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -429,7 +516,7 @@ func Fsck(dir string) (*FsckReport, error) {
 						"dictionary it needs may be pruned at the next open"})
 				continue
 			}
-			seg, segErr := fsckSegment(path, dictID)
+			seg, segErr := fsckSegment(path, dictID, kits[dictID])
 			if segErr != nil {
 				r.Strays = append(r.Strays, FsckStray{path, segErr.Error()})
 				continue
@@ -437,6 +524,11 @@ func Fsck(dir string) (*FsckReport, error) {
 			if !have[dictID] {
 				missing[dictID] = true
 				seg.DictUnusable = true
+			}
+			if dictID != 0 {
+				if chk := checkSegDict(path, dictID, kits[dictID], seg.probed, seg.probeFailures); !chk.agrees() {
+					r.DictChecks = append(r.DictChecks, chk)
+				}
 			}
 			r.Segments = append(r.Segments, *seg)
 		}
@@ -452,12 +544,27 @@ func Fsck(dir string) (*FsckReport, error) {
 	for _, id := range inAttic {
 		retired[id] = true
 	}
+	// What the segments themselves carry. This is both the redundancy level for every
+	// dictionary and, for a missing one, a recovery that costs nothing to offer.
+	r.DictReplicas, r.Trailers = surveyTrailers(dir)
+	r.DictsMislabelled = fsckDictLabels(filepath.Join(dir, "dicts"))
+	inSegments := map[uint32]bool{}
+	if len(missing) > 0 {
+		for id, rep := range sweepDictReplicas(dir, countShardDirs(dir), missing) {
+			_ = rep
+			inSegments[id] = true
+		}
+	}
 	for id := range missing {
 		r.DictsMissing = append(r.DictsMissing, id)
 		if retired[id] {
 			r.DictsInAttic = append(r.DictsInAttic, id)
 		}
+		if inSegments[id] {
+			r.DictsInSegments = append(r.DictsInSegments, id)
+		}
 	}
+	sort.Slice(r.DictsInSegments, func(i, j int) bool { return r.DictsInSegments[i] < r.DictsInSegments[j] })
 	sort.Slice(r.DictsInAttic, func(i, j int) bool { return r.DictsInAttic[i] < r.DictsInAttic[j] })
 	sort.Slice(r.DictsMissing, func(i, j int) bool { return r.DictsMissing[i] < r.DictsMissing[j] })
 
@@ -567,7 +674,7 @@ func fsckDictFile(path string) string {
 
 // fsckSegment walks one segment file, resyncing past damage instead of stopping at
 // it, and reports every readable record and every unreadable run.
-func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
+func fsckSegment(path string, dictID uint32, kit *dictProbeKit) (*FsckSegment, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read: %w", err)
@@ -602,6 +709,8 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 	// the rest of the file. Only when the framing itself is unusable do we fall back to
 	// scanning for the next offset that verifies.
 	var run *FsckDamage
+	// probes are the largest compressed ads seen, kept for the dictionary probe below.
+	var probes [][]byte
 	// starts records each framed record's start for the columnar offset check: true for a
 	// keyed record that verified, false for a record that did not.
 	starts := map[int]bool{}
@@ -624,6 +733,10 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			dictVerified = dictVerified || recIsDict(data, uint32(off))
 			if !recIsMarker(data, uint32(off)) {
 				starts[off] = true
+				// Keep the largest compressed ads as probe samples. Largest first
+				// because a record that compressed well is one that leaned on the
+				// dictionary, and an incompressible record decodes under any of them.
+				probes = keepLargestProbe(probes, recAd(data, uint32(off)))
 			}
 			off += total
 			continue
@@ -706,6 +819,7 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			}
 		}
 	}
+	s.probed, s.probeFailures = runDictProbe(kit, probes)
 	return s, nil
 }
 

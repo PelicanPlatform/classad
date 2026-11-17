@@ -82,10 +82,12 @@ func TestReleaseEncodersExceptKeepsCurrent(t *testing.T) {
 		return c.(*zstdCodec)
 	}
 	a, b := mk(), mk()
-	if _, err := reg.register(a, []byte("dict-a")); err != nil { // dir=="" so no file is written
+	// dir=="" so no file is written. The codecs under test are built with no dictionary;
+	// the bytes handed to register exist only to be stamped and registered.
+	if _, _, err := reg.register(testDictHeader("dict-a"), func([]byte) (Codec, error) { return a, nil }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.register(b, []byte("dict-b")); err != nil {
+	if _, _, err := reg.register(testDictHeader("dict-b"), func([]byte) (Codec, error) { return b, nil }); err != nil {
 		t.Fatal(err)
 	}
 	payload := bytes.Repeat([]byte("dictionary codec warm-up payload; "), 32)

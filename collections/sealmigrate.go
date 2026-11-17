@@ -327,13 +327,11 @@ func (c *Collection) rotateDictForSeal() (codec Codec, retiredBelow uint32, rota
 	retiredBelow = c.dicts.next
 	c.dicts.mu.Unlock()
 	if dict, err := TrainDict(c.sealedSamples(sealRotateSamples)); err == nil {
-		if fresh, err := NewZSTDCodec(dict); err == nil {
-			if _, err := c.dicts.register(fresh, dict); err == nil {
-				c.codec.Store(&codecHolder{fresh})
-				c.lastDictBytes.Store(int64(len(dict)))
-				c.lastRetrainUnix.Store(time.Now().UnixNano())
-				return fresh, retiredBelow, true
-			}
+		if _, fresh, err := c.dicts.register(dict, NewZSTDCodec); err == nil {
+			c.codec.Store(&codecHolder{fresh})
+			c.lastDictBytes.Store(int64(len(dict)))
+			c.lastRetrainUnix.Store(time.Now().UnixNano())
+			return fresh, retiredBelow, true
 		}
 	}
 	base, _ := c.dicts.codecFor(0)

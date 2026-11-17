@@ -35,6 +35,11 @@ type dictReg struct {
 	byID map[uint32]Codec // dictionary id -> codec
 	idOf map[Codec]uint32 // codec -> dictionary id
 	next uint32           // next id to assign
+	// pins holds each persisted dictionary's file open, with a fingerprint of what was
+	// read from it, so the bytes survive an unlink and a file that changed underneath the
+	// store can be told from one that did not. Empty for an in-memory collection, which
+	// has no files. See dictpin.go.
+	pins map[uint32]*dictPin
 }
 
 // newDictReg creates a registry with base registered as dictionary id 0.
@@ -43,6 +48,7 @@ func newDictReg(base Codec) *dictReg {
 		byID: map[uint32]Codec{0: base},
 		idOf: map[Codec]uint32{base: 0},
 		next: 1,
+		pins: map[uint32]*dictPin{},
 	}
 }
 
@@ -62,10 +68,16 @@ func (r *dictReg) codecFor(id uint32) (Codec, bool) {
 	return c, ok
 }
 
-// register assigns the next id to codec, whose compression dictionary is dict, and
-// (for a persistent collection) writes the dictionary bytes durably to
-// <dir>/dicts/<id>.zst so recovery can reconstruct the codec. Returns the id.
-func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
+// register assigns the next id to the compression dictionary dict, stamps that id into
+// the dictionary, builds the codec from the stamped bytes, and (for a persistent
+// collection) writes them durably to <dir>/dicts/<id>.zst so recovery can reconstruct the
+// codec. Returns the id and the codec.
+//
+// The codec is built HERE rather than by the caller because it must be built from the
+// stamped bytes: the encoder copies the dictionary's own id into every frame it writes,
+// which is what lets a decoder say "this is not my dictionary" instead of handing back a
+// checksum failure that reads as an ordinary bad record. See dictid.go.
+func (r *dictReg) register(dict []byte, build func(dict []byte) (Codec, error)) (uint32, Codec, error) {
 	// Reserve the id under the lock (so concurrent registers never collide), but do
 	// NOT register the codec in byID/idOf yet: for a persistent collection we must
 	// persist the dictionary bytes FIRST, so a failed write never leaves a codec
@@ -77,16 +89,48 @@ func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
 	r.next++
 	dir := r.dir
 	r.mu.Unlock()
+	stamped, err := stampDictID(dict, id)
+	if err != nil {
+		return 0, nil, err
+	}
+	codec, err := build(stamped)
+	if err != nil {
+		return 0, nil, err
+	}
 	if dir != "" {
-		if err := writeDictFile(filepath.Join(dir, fmt.Sprintf("%d.zst", id)), dict); err != nil {
-			return 0, err
+		path := filepath.Join(dir, fmt.Sprintf("%d.zst", id))
+		if err := writeDictFile(path, stamped); err != nil {
+			return 0, nil, err
+		}
+		// Hold the file open from here on. A failure to pin is not a failure to register:
+		// the dictionary is on disk and the codec is sound, and all that is lost is the
+		// ability to notice later that the file went away.
+		if pin, _, err := pinDictFile(path); err == nil {
+			r.setPin(id, pin)
 		}
 	}
 	r.mu.Lock()
 	r.byID[id] = codec
 	r.idOf[codec] = id
 	r.mu.Unlock()
-	return id, nil
+	return id, codec, nil
+}
+
+// install registers a codec under a dictionary id that is already decided -- recovery
+// reading dicts/, or a copy restored from a segment trailer -- rather than assigning a new
+// one the way register does. pin may be nil when the file could not be held open, which
+// costs the later file check and nothing else.
+func (r *dictReg) install(id uint32, codec Codec, pin *dictPin) {
+	if pin != nil {
+		r.setPin(id, pin)
+	}
+	r.mu.Lock()
+	r.byID[id] = codec
+	r.idOf[codec] = id
+	if id >= r.next {
+		r.next = id + 1
+	}
+	r.mu.Unlock()
 }
 
 // prune removes every registered dictionary except id 0 (the base codec) and those
@@ -111,6 +155,10 @@ func (r *dictReg) prune(keep func(id uint32, c Codec) bool) []uint32 {
 	dir := r.dir
 	r.mu.Unlock()
 	for _, id := range removed {
+		// Drop the pin FIRST. A retired dictionary is supposed to leave dicts/, and a pin
+		// left behind would read that departure as a file something deleted and put it
+		// straight back -- undoing the retire and leaking a descriptor per pass.
+		r.dropPin(id)
 		if dir != "" {
 			retireDictFile(dir, id)
 		}
@@ -415,21 +463,32 @@ func (c *Collection) loadDicts(dictsDir string) (latest uint32, err error) {
 		if _, err := fmt.Sscanf(e.Name(), "%d.zst", &id); err != nil || id == 0 {
 			continue
 		}
-		dict, err := os.ReadFile(filepath.Join(dictsDir, e.Name()))
+		path := filepath.Join(dictsDir, e.Name())
+		// One open serves both: the bytes this load needs, and the descriptor the store
+		// keeps for the life of the dictionary (see dictpin.go).
+		pin, dict, err := pinDictFile(path)
 		if err != nil {
 			return 0, err
 		}
+		// A dictionary stamped by this build names its own slot, so a file that is not the
+		// one its name claims is caught here rather than by every segment that needed it
+		// silently decoding to nothing. A dictionary still carrying legacyDictID says
+		// nothing about where it belongs and is accepted; one that is not a dictionary at
+		// all falls through to NewZSTDCodec, which reports it properly.
+		switch slot, named := dictSlotOf(dict); {
+		case !named:
+			// Not stamped: a dictionary written before stamping existed, which says
+			// nothing about where it belongs and is taken at its name.
+			dictsUnverifiable.Add(1)
+		case slot != id:
+			return 0, &DictIDMismatchError{Slot: id, Found: slot, Path: path}
+		}
 		codec, err := NewZSTDCodec(dict)
 		if err != nil {
+			pin.close()
 			return 0, fmt.Errorf("rebuild codec for dict %d: %w", id, err)
 		}
-		c.dicts.mu.Lock()
-		c.dicts.byID[id] = codec
-		c.dicts.idOf[codec] = id
-		if id >= c.dicts.next {
-			c.dicts.next = id + 1
-		}
-		c.dicts.mu.Unlock()
+		c.dicts.install(id, codec, pin)
 		if id > latest {
 			latest = id
 		}
@@ -513,7 +572,17 @@ func Open(opts Options) (*Collection, error) {
 	// to. Checking here, against the file names, reports every missing id at once instead
 	// of failing at whichever segment recovery reached first.
 	if coverErr := verifyDictCoverage(opts.Dir, len(c.shards), c.dicts); coverErr != nil {
-		return nil, coverErr
+		// Before refusing, ask the segments. Copies of each dictionary ride in segment
+		// trailers precisely so that losing dicts/ is survivable, and a copy restored here
+		// is the dictionary -- it names its own id and a codec is built from it before
+		// anything is written. Only what cannot be found this way is fatal.
+		var mde *MissingDictionaryError
+		if errors.As(coverErr, &mde) && c.restoreDictsFromSegments(opts.Dir, mde.IDs) > 0 {
+			coverErr = verifyDictCoverage(opts.Dir, len(c.shards), c.dicts)
+		}
+		if coverErr != nil {
+			return nil, coverErr
+		}
 	}
 	if latest != 0 {
 		if codec, ok := c.dicts.codecFor(latest); ok {
@@ -796,10 +865,46 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			f.Close()
 			return 0, err
 		}
-		seg, err := openMmapSegment(uint32(len(loaded)), codec, f, int(st.Size()))
+		// The trailer, if any, sits past the arena and is read before the mapping is made,
+		// because it decides how much of the file to map: the mapping must cover exactly
+		// the arena, as it did before trailers existed. A file with no trailer -- every
+		// segment written before this, and every non-carrier -- maps whole.
+		// A trailer that will not read leaves the arena's end unknowable, so the mapping
+		// stays at the file's size: the records are untouched either way, and anything
+		// that would write to the tail refuses such a segment outright (ErrDamagedTrailer)
+		// rather than guessing where it ends.
+		mapSize := st.Size()
+		trailer, trailerState := readSegTrailerAt(f, st.Size())
+		hasTrailer := trailerState == segTrailerOK
+		if hasTrailer {
+			mapSize -= int64(trailer.bytes)
+		}
+		seg, err := openMmapSegment(uint32(len(loaded)), codec, f, int(mapSize))
 		if err != nil {
 			f.Close()
 			return 0, err
+		}
+		if hasTrailer {
+			seg.carriedDicts = trailer.dictReplicaIDs()
+			_, _, _, seg.fingerprinted = trailer.dictFingerprint()
+			// The trailer is already read, so asking whether the dictionary this store
+			// just loaded is the one these records were written with costs a comparison.
+			// Open does not REFUSE on it -- one signal is not enough to keep a daemon
+			// down -- but it must not be silent either: the alternative is serving this
+			// segment as if it were empty.
+			c.dicts.mu.Lock()
+			pin := c.dicts.pins[sf.dictID]
+			c.dicts.mu.Unlock()
+			if checkSegFingerprint(trailer, sf.dictID, pin) {
+				dictFingerprintMismatches.Add(1)
+				if c.onDictFault != nil {
+					c.onDictFault(&DictFault{
+						ID: sf.dictID, Kind: DictFaultMismatch,
+						Path: filepath.Join(c.dir, "dicts", fmt.Sprintf("%d.zst", sf.dictID)),
+						From: filepath.Join(shardDir, sf.name),
+					})
+				}
+			}
 		}
 		// Everything between here and the end of loadShard that touches this mapping --
 		// the extent walk below, rebuildDir, a zone recompute -- reads it front to back,
@@ -1785,6 +1890,10 @@ func (c *Collection) teardown(discard bool) error {
 		}
 		c.persistWatchEpoch(watchSeqs, watchStamp)
 	}
+	// Release the dictionary files' descriptors. They are held for the life of the
+	// collection so a vanished dictionary can be noticed and rewritten (see dictpin.go);
+	// past here nothing will read them again.
+	c.dicts.closePins()
 	// The columnar-block cache is NOT closed here: c.colCache is the process-wide cache for this
 	// collection's kind, shared with every other open collection of that kind, and it lives for the
 	// life of the process. This collection's entries are not evicted either. Block ids are

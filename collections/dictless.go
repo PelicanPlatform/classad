@@ -54,9 +54,12 @@ type DictlessReport struct {
 	DryRun  bool
 	Moved   []DictlessSegment
 	Missing []uint32 // the dictionary ids involved, ascending
-	// Recoverable are missing dictionaries whose file is in dicts/attic/. Unless Force
-	// was set, the pass does nothing while this is non-empty.
+	// Recoverable are missing dictionaries that can be had back without setting any
+	// records aside. Unless Force was set, the pass does nothing while this is non-empty.
 	Recoverable []uint32
+	// RecoverableFrom says where each recoverable dictionary is: dicts/attic/, or the
+	// segment file carrying a copy of it.
+	RecoverableFrom map[uint32]string
 	// DroppedSnapshots lists the shard directory snapshots removed. They record record
 	// OFFSETS for segments that are no longer there, and they rebuild on the next open;
 	// leaving a stale one is how a readable store becomes a wrong one.
@@ -76,9 +79,13 @@ func (r *DictlessReport) String() string {
 		add("  REFUSED: dictionar%s %v %s in dicts/attic/\n",
 			plural2(len(r.Recoverable), "y", "ies"), r.Recoverable,
 			plural2(len(r.Recoverable), "is", "are"))
-		add("    Move the file(s) back into dicts/ and reopen: every record in the\n")
-		add("    segments naming them comes back. Quarantining would set those records\n")
-		add("    aside instead. Pass Force to quarantine anyway.\n")
+		for _, id := range r.Recoverable {
+			add("    dictionary %d: %s\n", id, r.RecoverableFrom[id])
+		}
+		add("    Restore the file(s) into dicts/ and reopen -- a copy carried in a segment\n")
+		add("    is restored by reopening alone. Every record in the segments naming them\n")
+		add("    comes back. Quarantining would set those records aside instead. Pass Force\n")
+		add("    to quarantine anyway.\n")
 		return string(b)
 	}
 	add("  %d segment(s) naming missing dictionar%s %v\n",
@@ -137,6 +144,7 @@ func QuarantineDictless(dir string, opts DictlessOptions) (*DictlessReport, erro
 
 	missing := map[uint32]bool{}
 	recoverable := map[uint32]bool{}
+	r.RecoverableFrom = map[uint32]string{}
 	type candidate struct {
 		shardDir string
 		name     string
@@ -159,9 +167,17 @@ func QuarantineDictless(dir string, opts DictlessOptions) (*DictlessReport, erro
 			missing[id] = true
 			if attic[id] {
 				recoverable[id] = true
+				r.RecoverableFrom[id] = filepath.Join(dir, "dicts", "attic", fmt.Sprintf("%d.zst", id))
 			}
 			cands = append(cands, candidate{shardDir, e.Name(), id})
 		}
+	}
+	// A copy carried in a segment is the best recovery of all: reopening the store
+	// restores it with no operator action at all, so quarantining instead would set aside
+	// records that were never actually lost.
+	for id, rep := range sweepDictReplicas(dir, len(shardDirs), missing) {
+		recoverable[id] = true
+		r.RecoverableFrom[id] = rep.from
 	}
 	r.Missing = sortedDictIDs(missing)
 	r.Recoverable = sortedDictIDs(recoverable)

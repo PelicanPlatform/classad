@@ -161,6 +161,9 @@ type ArchiveOptions struct {
 	// the archive under Retention.MaxBytes between maintenance passes (see
 	// Options.OnHighMarkError). nil discards it.
 	OnHighMarkError func(error)
+	// OnDictFault reports a compression dictionary's file found missing, replaced, or
+	// changed underneath the archive (see Options.OnDictFault). nil discards it.
+	OnDictFault func(error)
 	// IndexBackfillBytes bounds how far back Reindex carries an index configuration change
 	// (see Options.IndexBackfillBytes). 0 carries it across the whole archive.
 	IndexBackfillBytes int64
@@ -251,6 +254,7 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		Retention:                 opts.Retention,
 		ProfileBucketBytes:        opts.ProfileBucketBytes,
 		OnHighMarkError:           opts.OnHighMarkError,
+		OnDictFault:               opts.OnDictFault,
 		InternAtSeal:              opts.InternAtSeal, // intern each segment eagerly at seal
 		IndexBackfillBytes:        opts.IndexBackfillBytes,
 		RowGroupBytes:             opts.RowGroupBytes,
@@ -1240,3 +1244,12 @@ func (a *Archive) ScanColumns(q *vm.Query, attrs []string, fn func(*Batch) bool)
 func (a *Archive) ScanColumnsRedacted(q *vm.Query, attrs []string, fn func(*Batch) bool) (ColumnScanStats, bool) {
 	return a.c.ScanColumnsRedacted(q, attrs, fn)
 }
+
+// VerifyDictFiles checks every compression dictionary file against what the archive
+// loaded, rewrites any whose directory entry has gone, and reports what it found. An empty
+// result is the healthy answer. See Collection.VerifyDictFiles.
+func (a *Archive) VerifyDictFiles() []DictFault { return a.c.VerifyDictFiles() }
+
+// EnsureDictReplicas brings every compression dictionary's copy count in segment trailers
+// up to the target and reports where each one stands. See Collection.EnsureDictReplicas.
+func (a *Archive) EnsureDictReplicas() []DictReplicaState { return a.c.EnsureDictReplicas() }

@@ -42,11 +42,7 @@ func TestPruneRetiresDictionaryInsteadOfDeleting(t *testing.T) {
 		if err != nil {
 			t.Skipf("dictionary training unavailable: %v", err)
 		}
-		codec, err := NewZSTDCodec(dict)
-		if err != nil {
-			t.Fatal(err)
-		}
-		id, err := reg.register(codec, dict)
+		id, codec, err := reg.register(dict, NewZSTDCodec)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,13 +96,9 @@ func TestAtticDictionaryStillDecodes(t *testing.T) {
 	if err != nil {
 		t.Skipf("dictionary training unavailable: %v", err)
 	}
-	codec, err := NewZSTDCodec(dict)
-	if err != nil {
-		t.Fatal(err)
-	}
 	reg := newDictReg(identityCodec{})
 	reg.dir = dictsDir
-	id, err := reg.register(codec, dict)
+	id, codec, err := reg.register(dict, NewZSTDCodec)
 	if err != nil {
 		t.Fatal(err)
 	}
