@@ -57,6 +57,9 @@ func TestTopKTieBreakingAgainstAClientRanking(t *testing.T) {
 			ad := classad.New()
 			ad.InsertAttrString("Owner", fmt.Sprintf("o%d", o))
 			ad.InsertAttr("QDate", int64(1700000000+r%8))
+			// Unique across the whole table, so QDate then Rowid is a TOTAL ordering and
+			// the tie that makes the single-term case a choice cannot arise.
+			ad.InsertAttr("Rowid", int64(n))
 			ad.InsertAttrString("Payload", fmt.Sprintf("o%d-r%d", o, r))
 			tx.NewClassAd(fmt.Sprintf("k%d", n), ad)
 			n++
@@ -71,9 +74,9 @@ func TestTopKTieBreakingAgainstAClientRanking(t *testing.T) {
 	// first K. This is what htcondordb's execSelectWindow does today.
 	type row struct {
 		owner, payload string
-		qdate          int64
+		qdate, rowid   int64
 	}
-	seq, err := d.QueryProject("true", []string{"Owner", "QDate", "Payload"})
+	seq, err := d.QueryProject("true", []string{"Owner", "QDate", "Payload", "Rowid"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,30 +85,46 @@ func TestTopKTieBreakingAgainstAClientRanking(t *testing.T) {
 		owner, oerr := vals[0].StringValue()
 		q, qerr := vals[1].IntValue()
 		p, perr := vals[2].StringValue()
-		if oerr != nil || qerr != nil || perr != nil {
-			t.Fatalf("projected row did not decode: %v %v %v", oerr, qerr, perr)
+		id, ierr := vals[3].IntValue()
+		if oerr != nil || qerr != nil || perr != nil || ierr != nil {
+			t.Fatalf("projected row did not decode: %v %v %v %v", oerr, qerr, perr, ierr)
 		}
-		parts[owner] = append(parts[owner], row{owner: owner, payload: p, qdate: q})
+		parts[owner] = append(parts[owner], row{owner: owner, payload: p, qdate: q, rowid: id})
 	}
 	if len(parts) != owners {
 		t.Fatalf("client saw %d partitions, want %d", len(parts), owners)
 	}
-	clientTop := map[string][]string{}
-	for owner, rows := range parts {
-		idx := make([]int, len(rows))
-		for i := range idx {
-			idx[i] = i
+	// clientRank is htcondordb's ranking: stable-sort each partition in scan order by the
+	// given ordering, take the first K.
+	clientRank := func(total bool) map[string][]string {
+		out := map[string][]string{}
+		for owner, rows := range parts {
+			idx := make([]int, len(rows))
+			for i := range idx {
+				idx[i] = i
+			}
+			sort.SliceStable(idx, func(a, b int) bool {
+				ra, rb := rows[idx[a]], rows[idx[b]]
+				if ra.qdate != rb.qdate {
+					return ra.qdate > rb.qdate
+				}
+				if total {
+					return ra.rowid < rb.rowid
+				}
+				return false
+			})
+			var got []string
+			for i := 0; i < k && i < len(idx); i++ {
+				got = append(got, rows[idx[i]].payload)
+			}
+			out[owner] = got
 		}
-		sort.SliceStable(idx, func(a, b int) bool { return rows[idx[a]].qdate > rows[idx[b]].qdate })
-		var got []string
-		for i := 0; i < k && i < len(idx); i++ {
-			got = append(got, rows[idx[i]].payload)
-		}
-		clientTop[owner] = got
+		return out
 	}
+	clientTop := clientRank(false)
 
 	server, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
-		GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: k,
+		GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: k,
 		Attrs: []string{"Payload", "QDate"},
 	})
 	if err != nil {
@@ -164,4 +183,74 @@ func TestTopKTieBreakingAgainstAClientRanking(t *testing.T) {
 	t.Logf("tie-breaking: %d of %d partitions chose the same rows as a client ranking, %d chose "+
 		"different ones; all %d agreed on the order values",
 		sameRows, len(server), differing, sameOrderValues)
+
+	// THE SECOND HALF, AND THE POINT OF THE FIRST. Order by QDate then Rowid, which is unique
+	// across the table, so the ordering is TOTAL and no tie remains to be broken differently.
+	// Both sides must now name the same rows in every partition -- that is what a caller buys
+	// by writing an ordering that cannot tie, and it is the recommendation the single-term
+	// behaviour above is documented with.
+	wantTotal := clientRank(true)
+	totalServer, err := d.TopKRowsPerGroup("true", TopKRowsSpec{
+		GroupCols: []GroupCol{{Attr: "Owner"}},
+		OrderBy: []TopKOrderTerm{
+			{Attr: "QDate", Desc: true},
+			{Attr: "Rowid", Desc: false},
+		},
+		K:     k,
+		Attrs: []string{"Payload", "QDate", "Rowid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(totalServer) != owners {
+		t.Fatalf("total ordering returned %d partitions, want %d", len(totalServer), owners)
+	}
+	for _, g := range totalServer {
+		owner, verr := g.Values[0].StringValue()
+		if verr != nil {
+			t.Fatal(verr)
+		}
+		var got []string
+		for _, r := range g.Rows {
+			p, perr := r[0].StringValue()
+			if perr != nil {
+				t.Fatal(perr)
+			}
+			got = append(got, p)
+		}
+		if strings.Join(got, ",") != strings.Join(wantTotal[owner], ",") {
+			t.Errorf("owner %s under a TOTAL ordering: server %v, client %v -- a total "+
+				"ordering leaves no tie to break, so these must agree",
+				owner, got, wantTotal[owner])
+		}
+	}
+
+	// And the wire rung must agree with the value rung under the same total ordering.
+	wireTotal, err := d.TopKRowsPerGroupWire("true", TopKRowsSpec{
+		GroupCols: []GroupCol{{Attr: "Owner"}},
+		OrderBy: []TopKOrderTerm{
+			{Attr: "QDate", Desc: true},
+			{Attr: "Rowid", Desc: false},
+		},
+		K:     k,
+		Attrs: []string{"Payload", "QDate", "Rowid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range wireTotal {
+		owner, verr := g.Values[0].StringValue()
+		if verr != nil {
+			t.Fatal(verr)
+		}
+		rows := decodeWireRows(t, g.Rows, []string{"Payload"})
+		var got []string
+		for _, r := range rows {
+			got = append(got, strings.Trim(r, "\""))
+		}
+		if strings.Join(got, ",") != strings.Join(wantTotal[owner], ",") {
+			t.Errorf("owner %s, wire rung under a TOTAL ordering: %v, want %v",
+				owner, got, wantTotal[owner])
+		}
+	}
 }

@@ -66,32 +66,45 @@ type TopKRowsWireGroup struct {
 // scan would otherwise allocate once per improvement, and improvements are common when the scan
 // order correlates with the order attribute -- which for a job table ordered by QDate it does.
 type topKWireKeep struct {
-	vals []NumValue
-	rows [][]byte
-	k    int
-	desc bool
+	// vals holds every kept row's ordering values end to end, stride terms long, exactly as
+	// topKRowKeep does.
+	vals  []NumValue
+	rows  [][]byte
+	k     int
+	terms []TopKOrderTerm
 }
 
-func (t *topKWireKeep) offer(v NumValue, row []byte) {
-	if v.Kind == NumReal && math.IsNaN(v.F) {
-		return // never evicted, so it would hold a slot against every real row
+func (t *topKWireKeep) stride() int { return len(t.terms) }
+
+func (t *topKWireKeep) at(i int) []NumValue {
+	n := t.stride()
+	return t.vals[i*n : (i+1)*n]
+}
+
+func (t *topKWireKeep) count() int { return len(t.vals) / t.stride() }
+
+func (t *topKWireKeep) offer(vals []NumValue, row []byte) {
+	for _, v := range vals {
+		if v.Kind == NumReal && math.IsNaN(v.F) {
+			return // never evicted, so it would hold a slot against every real row
+		}
 	}
-	if len(t.vals) < t.k {
-		t.vals = append(t.vals, v)
+	if t.count() < t.k {
+		t.vals = append(t.vals, vals...)
 		t.rows = append(t.rows, append([]byte(nil), row...))
 		return
 	}
 	wi := t.worstIdx()
-	if topKWorse(t.vals[wi], v, t.desc) {
-		t.vals[wi] = v
+	if topKWorseRow(t.at(wi), vals, t.terms) {
+		copy(t.at(wi), vals)
 		t.rows[wi] = append(t.rows[wi][:0], row...)
 	}
 }
 
 func (t *topKWireKeep) worstIdx() int {
 	wi := 0
-	for i := 1; i < len(t.vals); i++ {
-		if topKWorse(t.vals[i], t.vals[wi], t.desc) {
+	for i := 1; i < t.count(); i++ {
+		if topKWorseRow(t.at(i), t.at(wi), t.terms) {
 			wi = i
 		}
 	}
@@ -107,7 +120,7 @@ func (t *topKWireKeep) ordered() [][]byte {
 		idx[i] = i
 	}
 	sort.SliceStable(idx, func(a, b int) bool {
-		return topKWorse(t.vals[idx[b]], t.vals[idx[a]], t.desc)
+		return topKWorseRow(t.at(idx[b]), t.at(idx[a]), t.terms)
 	})
 	out := make([][]byte, len(idx))
 	for i, j := range idx {
@@ -191,7 +204,9 @@ func (db *DB) topKRowsPerGroupWire(constraint string, spec TopKRowsSpec, stats *
 	for _, g := range spec.GroupCols {
 		need(g.Attr)
 	}
-	need(spec.OrderAttr)
+	for _, t := range spec.OrderBy {
+		need(t.Attr)
+	}
 
 	seq, err := db.QueryRawWireRefsStats(constraint, attrs, false, stats)
 	if err != nil {
@@ -209,24 +224,34 @@ func (db *DB) topKRowsPerGroupWire(constraint string, spec TopKRowsSpec, stats *
 	if n := len(spec.GroupCols); n > 0 {
 		nodes = make([][]byte, n)
 	}
+	ovals := make([]NumValue, len(spec.OrderBy)) // reused: the keep copies what it keeps
 	for row := range seq {
 		r := wireRow{ad: wire.Ad(row)}
-		onode, found := r.ad.LookupByName(spec.OrderAttr)
-		if !found {
-			continue
-		}
-		ov, ok := numValueOfNode(onode)
-		if !ok {
-			// Not a literal number. Either it is an expression over the row's siblings --
-			// which the reference evaluates, so this must too -- or it is genuinely
-			// unrankable, which numValueOf will say in the same breath.
-			if wire.IsLiteralNode(onode) {
-				continue // a literal, and not a number: nothing to rank it by
+		ranked := true
+		for i, t := range spec.OrderBy {
+			onode, found := r.ad.LookupByName(t.Attr)
+			if !found {
+				ranked = false
+				break
 			}
-			ov, ok = numValueOf(r.eval(spec.OrderAttr))
+			ov, ok := numValueOfNode(onode)
 			if !ok {
-				continue
+				// Not a literal number. Either it is an expression over the row's
+				// siblings -- which the reference evaluates, so this must too -- or it
+				// is genuinely unrankable, which numValueOf will say in the same breath.
+				if wire.IsLiteralNode(onode) {
+					ranked = false // a literal, and not a number: nothing to rank it by
+					break
+				}
+				if ov, ok = numValueOf(r.eval(t.Attr)); !ok {
+					ranked = false
+					break
+				}
 			}
+			ovals[i] = ov
+		}
+		if !ranked {
+			continue
 		}
 		// Length-delimited so no concatenation of one group's values can spell another's:
 		// without it the pair ("a","bc") and the pair ("ab","c") share a key.
@@ -258,10 +283,10 @@ func (db *DB) topKRowsPerGroupWire(constraint string, spec TopKRowsSpec, stats *
 			}
 			groups = append(groups, &groupEntry{
 				values: values,
-				keep:   &topKWireKeep{k: spec.K, desc: spec.Desc},
+				keep:   &topKWireKeep{k: spec.K, terms: spec.OrderBy},
 			})
 		}
-		groups[i].keep.offer(ov, row)
+		groups[i].keep.offer(ovals, row)
 	}
 
 	out := make([]TopKRowsWireGroup, len(groups))

@@ -45,7 +45,7 @@ func benchTopKRungs(b *testing.B, width int) {
 		b.Fatal(err)
 	}
 	spec := TopKRowsSpec{
-		GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 5,
+		GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 5,
 		Attrs: attrs,
 	}
 	b.Run("values", func(b *testing.B) {

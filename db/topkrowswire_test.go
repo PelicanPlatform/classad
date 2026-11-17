@@ -230,36 +230,57 @@ func TestTopKWireAgreesWithValueRung(t *testing.T) {
 		spec TopKRowsSpec
 	}{
 		{"one string group", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 5,
+			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 5,
 			Attrs: []string{"Payload", "QDate"}}},
 		{"ascending", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: false, K: 3,
+			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", false), K: 3,
 			Attrs: []string{"Payload", "QDate"}}},
 		{"k larger than any group", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 10000,
+			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 10000,
 			Attrs: []string{"Payload"}}},
 		{"k of one", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 1,
+			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 1,
 			Attrs: []string{"Payload", "QDate"}}},
 		{"numeric group column", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Site"}}, OrderAttr: "QDate", Desc: true, K: 4,
+			GroupCols: []GroupCol{{Attr: "Site"}}, OrderBy: OrderOne("QDate", true), K: 4,
 			Attrs: []string{"Payload"}}},
 		{"two numeric group columns", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "A"}, {Attr: "B"}}, OrderAttr: "QDate", Desc: true, K: 3,
+			GroupCols: []GroupCol{{Attr: "A"}, {Attr: "B"}}, OrderBy: OrderOne("QDate", true), K: 3,
 			Attrs: []string{"Payload"}}},
 		{"two group columns", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}, {Attr: "Site"}}, OrderAttr: "QDate", Desc: true, K: 3,
+			GroupCols: []GroupCol{{Attr: "Owner"}, {Attr: "Site"}}, OrderBy: OrderOne("QDate", true), K: 3,
 			Attrs: []string{"Payload", "QDate"}}},
 		{"no group columns", "true", TopKRowsSpec{
-			OrderAttr: "QDate", Desc: true, K: 7, Attrs: []string{"Payload"}}},
+			OrderBy: OrderOne("QDate", true), K: 7, Attrs: []string{"Payload"}}},
 		{"constrained", "Site == 1", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 4,
+			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 4,
 			Attrs: []string{"Payload", "QDate"}}},
 		{"order attribute not projected", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 3,
+			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 3,
 			Attrs: []string{"Payload"}}},
+		{"two ordering terms", "true", TopKRowsSpec{
+			GroupCols: []GroupCol{{Attr: "Owner"}},
+			OrderBy: []TopKOrderTerm{
+				{Attr: "QDate", Desc: true},
+				{Attr: "Site", Desc: false},
+			},
+			K: 4, Attrs: []string{"Payload", "QDate", "Site"}}},
+		{"two ordering terms, both descending", "true", TopKRowsSpec{
+			GroupCols: []GroupCol{{Attr: "Owner"}},
+			OrderBy: []TopKOrderTerm{
+				{Attr: "Site", Desc: true},
+				{Attr: "QDate", Desc: true},
+			},
+			K: 3, Attrs: []string{"Payload"}}},
+		{"ordering terms not projected", "true", TopKRowsSpec{
+			GroupCols: []GroupCol{{Attr: "Owner"}},
+			OrderBy: []TopKOrderTerm{
+				{Attr: "QDate", Desc: true},
+				{Attr: "Site", Desc: false},
+			},
+			K: 3, Attrs: []string{"Payload"}}},
 		{"group column also projected", "true", TopKRowsSpec{
-			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 3,
+			GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 3,
 			Attrs: []string{"Owner", "Payload"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -279,7 +300,7 @@ func TestTopKWireRejectsBucketing(t *testing.T) {
 	defer d.Close()
 	spec := TopKRowsSpec{
 		GroupCols: []GroupCol{{Attr: "QDate", BucketWidth: 3600}},
-		OrderAttr: "QDate", Desc: true, K: 2, Attrs: []string{"Payload"},
+		OrderBy:   OrderOne("QDate", true), K: 2, Attrs: []string{"Payload"},
 	}
 	if _, err := d.TopKRowsPerGroupWire("true", spec); err == nil {
 		t.Fatal("wire rung accepted a bucketed group column")
@@ -299,13 +320,16 @@ func TestTopKWireSpecValidationMatches(t *testing.T) {
 	}
 	defer d.Close()
 	for _, spec := range []TopKRowsSpec{
-		{OrderAttr: "QDate", K: 0},
-		{OrderAttr: "QDate", K: -1},
-		{OrderAttr: "", K: 3},
-		{OrderAttr: "*", K: 3},
-		{OrderAttr: "QDate", K: 3, GroupCols: []GroupCol{{Attr: ""}}},
-		{OrderAttr: "QDate", K: 3, GroupCols: []GroupCol{{Attr: "*"}}},
-		{OrderAttr: "QDate", K: 3, GroupCols: []GroupCol{{Attr: "Owner", BucketWidth: -1}}},
+		{OrderBy: OrderOne("QDate", true), K: 0},
+		{OrderBy: OrderOne("QDate", true), K: -1},
+		{K: 3},
+		{OrderBy: []TopKOrderTerm{}, K: 3},
+		{OrderBy: OrderOne("", true), K: 3},
+		{OrderBy: OrderOne("*", true), K: 3},
+		{OrderBy: []TopKOrderTerm{{Attr: "QDate", Desc: true}, {Attr: "*"}}, K: 3},
+		{OrderBy: OrderOne("QDate", true), K: 3, GroupCols: []GroupCol{{Attr: ""}}},
+		{OrderBy: OrderOne("QDate", true), K: 3, GroupCols: []GroupCol{{Attr: "*"}}},
+		{OrderBy: OrderOne("QDate", true), K: 3, GroupCols: []GroupCol{{Attr: "Owner", BucketWidth: -1}}},
 	} {
 		_, verr := d.TopKRowsPerGroup("true", spec)
 		_, werr := d.TopKRowsPerGroupWire("true", spec)
@@ -337,7 +361,7 @@ func TestTopKWireRowsAreOwned(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := d.TopKRowsPerGroupWire("true", TopKRowsSpec{
-		GroupCols: []GroupCol{{Attr: "Owner"}}, OrderAttr: "QDate", Desc: true, K: 3,
+		GroupCols: []GroupCol{{Attr: "Owner"}}, OrderBy: OrderOne("QDate", true), K: 3,
 		Attrs: []string{"Payload", "QDate"},
 	})
 	if err != nil {
