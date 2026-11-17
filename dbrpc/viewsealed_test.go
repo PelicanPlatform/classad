@@ -93,6 +93,24 @@ func newSealedFixture(t *testing.T) *sealedFixture {
 
 func (f *sealedFixture) close() { f.c.Close(); f.s.Close(); f.cat.Close() }
 
+// target makes a write target with a declared primary key, idempotently: a path func runs
+// twice against one fixture (before the seal and after), and the second run must land on
+// the same table so that it REPLACES the first run's rows rather than reporting a fresh
+// count from an empty one.
+func (f *sealedFixture) target(t *testing.T, name, key string) {
+	t.Helper()
+	d, ok := f.cat.Table(name)
+	if !ok {
+		var err error
+		if d, err = f.cat.CreateTable(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.SetPrimaryKey([]string{key}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // sealAll seals every bucket, which is what the daemon's tick does on its own within half a
 // bucket width. Forcing it makes the race deterministic.
 func (f *sealedFixture) sealAll() {
@@ -128,6 +146,31 @@ func TestViewSealedHistoryIsReadable(t *testing.T) {
 				t.Fatal(err)
 			}
 			return len(rows)
+		}},
+		// A row copy OUT of the view. It writes one row per view row, so the count it
+		// reports is the count it read -- which makes it a read path for this purpose and
+		// the one where a dropped sealed half would be hardest to notice afterwards: the
+		// target table would simply be short, with nothing to compare it against.
+		{"opInsertRows", func(t *testing.T, f *sealedFixture) int {
+			f.target(t, "copy_target", "time")
+			n, err := f.c.InsertRows(ctx, "copy_target", sealView, "true", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}},
+		// A roll-up out of the view, grouped by the bucket it already carries, so one row
+		// per view row again.
+		{"opInsertSelect", func(t *testing.T, f *sealedFixture) int {
+			f.target(t, "rollup_target", "time")
+			n, err := f.c.InsertSelect(ctx, "rollup_target", sealView, "true",
+				[]db.GroupCol{{Attr: "time"}},
+				[]db.AggSpec{{Func: db.AggCount, Arg: "*"}},
+				[]string{"time", "n"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return n
 		}},
 	}
 
