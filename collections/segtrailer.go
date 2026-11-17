@@ -194,44 +194,77 @@ func parseSegTrailer(b []byte) (segTrailer, bool) {
 	return t, true
 }
 
+// segTrailerState says what a segment file's tail turned out to be. "No trailer" and
+// "a trailer that will not read" answer the same question for a reader -- neither gives
+// anything usable -- but they are opposite facts for anyone asking after the store's
+// health, and a reader that cannot tell them apart reports damage as absence.
+type segTrailerState int
+
+const (
+	// segTrailerNone: the file ends in records and zero fill, as every segment written
+	// before trailers existed does, and as every non-carrier does now.
+	segTrailerNone segTrailerState = iota
+	// segTrailerDamaged: the magic is there, so a trailer was written, and the directory
+	// does not verify. Nothing in it can be located. This is the one state in which the
+	// arena's end is unknowable, because the length that says where it is lives in the
+	// foot that just failed its own checksum.
+	segTrailerDamaged
+	// segTrailerOK: the directory verified. Individual sections may still be damaged;
+	// segTrailer.damaged names them.
+	segTrailerOK
+)
+
 // readSegTrailerAt reads the trailer of a segment file of the given size. It is two short
 // ReadAts -- the foot, then the region it describes -- rather than a mapping, because it
 // runs before the segment is mapped and decides how much of the file to map.
-func readSegTrailerAt(f *os.File, size int64) (segTrailer, bool) {
+func readSegTrailerAt(f *os.File, size int64) (segTrailer, segTrailerState) {
 	if size < segTrailerFootLen {
-		return segTrailer{}, false
+		return segTrailer{}, segTrailerNone
 	}
 	var foot [segTrailerFootLen]byte
 	if _, err := f.ReadAt(foot[:], size-segTrailerFootLen); err != nil {
-		return segTrailer{}, false
+		return segTrailer{}, segTrailerNone
 	}
+	// The magic is the discriminator. Past here a trailer was written, so anything that
+	// does not add up is damage rather than absence.
 	if binary.LittleEndian.Uint32(foot[16:]) != segTrailerMagic {
-		return segTrailer{}, false
+		return segTrailer{}, segTrailerNone
 	}
 	total := binary.LittleEndian.Uint64(foot[0:])
 	if total < segTrailerFootLen || total > segTrailerMaxBytes || total > uint64(size) {
-		return segTrailer{}, false
+		return segTrailer{}, segTrailerDamaged
 	}
 	b := make([]byte, total)
 	if _, err := f.ReadAt(b, size-int64(total)); err != nil {
-		return segTrailer{}, false
+		return segTrailer{}, segTrailerDamaged
 	}
-	return parseSegTrailer(b)
+	t, ok := parseSegTrailer(b)
+	if !ok {
+		return segTrailer{}, segTrailerDamaged
+	}
+	return t, segTrailerOK
 }
 
-// readSegTrailerFile opens path and reads its trailer. ok is false when the file has none,
-// which is not an error.
-func readSegTrailerFile(path string) (segTrailer, bool) {
+// readSegTrailerState opens path and reads its trailer, saying which of the three states
+// it is in.
+func readSegTrailerState(path string) (segTrailer, segTrailerState) {
 	f, err := os.Open(path)
 	if err != nil {
-		return segTrailer{}, false
+		return segTrailer{}, segTrailerNone
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return segTrailer{}, false
+		return segTrailer{}, segTrailerNone
 	}
 	return readSegTrailerAt(f, st.Size())
+}
+
+// readSegTrailerFile is readSegTrailerState for the readers that only want what they can
+// use. A damaged trailer gives them nothing, same as none.
+func readSegTrailerFile(path string) (segTrailer, bool) {
+	t, state := readSegTrailerState(path)
+	return t, state == segTrailerOK
 }
 
 // writeSegTrailer replaces a segment file's trailer with sections, in place, and makes it
@@ -269,14 +302,27 @@ func writeSegTrailer(path string, arenaEnd int64, sections []segTrailerSection) 
 	return f.Close()
 }
 
+// ErrDamagedTrailer is returned for a segment whose trailer was written and will not
+// read. Its arena's end is genuinely unknowable: the length that says where the trailer
+// begins lives in the foot that just failed its own checksum.
+//
+// Nothing may be written to such a segment's tail. Treating the damage as "no trailer"
+// would put the arena's end at the file's end -- past the damaged trailer -- and append a
+// second one after it, so every pass that tried would grow the file by another trailer and
+// fold the last one into what recovery maps as the arena.
+var ErrDamagedTrailer = errors.New("collections: segment trailer is damaged and its extent cannot be determined")
+
 // segArenaEnd returns where a segment file's arena ends -- its size, less any trailer.
 func segArenaEnd(path string) (int64, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return 0, err
 	}
-	if t, ok := readSegTrailerFile(path); ok {
+	switch t, state := readSegTrailerState(path); state {
+	case segTrailerOK:
 		return st.Size() - int64(t.bytes), nil
+	case segTrailerDamaged:
+		return 0, fmt.Errorf("%w: %s", ErrDamagedTrailer, path)
 	}
 	return st.Size(), nil
 }

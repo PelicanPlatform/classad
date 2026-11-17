@@ -167,26 +167,57 @@ func countShardDirs(dir string) int {
 	}
 }
 
-// countDictReplicas counts, per dictionary id, how many segment trailers carry a copy.
-// Unlike sweepDictReplicas it reads no dictionary bytes -- only each replica section's
-// four-byte id -- so a whole-store census is a trailer read per segment and nothing more.
-func countDictReplicas(dir string) map[uint32]int {
-	out := map[uint32]int{}
+// surveyTrailers walks every segment file's trailer, counting the dictionary copies each
+// carries and collecting the damage it finds. One pass answers both, because both questions
+// are asked of the same two short reads per segment.
+//
+// It reads only each replica section's four-byte id, never the dictionaries themselves, so
+// a whole-store census costs a trailer read per segment and nothing more.
+func surveyTrailers(dir string) (map[uint32]int, []FsckTrailer) {
+	counts := map[uint32]int{}
+	var damage []FsckTrailer
 	for s := 0; ; s++ {
 		shardDir := filepath.Join(dir, fmt.Sprintf("%d", s))
 		entries, err := os.ReadDir(shardDir)
 		if err != nil {
-			return out
+			return counts, damage
 		}
 		for _, e := range entries {
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".dat") {
 				continue
 			}
-			if tr, ok := readSegTrailerFile(filepath.Join(shardDir, e.Name())); ok {
-				for _, id := range tr.dictReplicaIDs() {
-					out[id]++
-				}
+			path := filepath.Join(shardDir, e.Name())
+			tr, state := readSegTrailerState(path)
+			switch state {
+			case segTrailerNone:
+				continue
+			case segTrailerDamaged:
+				damage = append(damage, FsckTrailer{
+					Path: path,
+					Why:  "a trailer was written and its directory does not verify",
+				})
+				continue
+			}
+			if len(tr.damaged) > 0 {
+				damage = append(damage, FsckTrailer{Path: path, Sections: tr.damaged})
+			}
+			for _, id := range tr.dictReplicaIDs() {
+				counts[id]++
 			}
 		}
 	}
+}
+
+// fsckDictLabels lists the dictionary files stored under an id they do not name. A file
+// still carrying legacyDictID says nothing about where it belongs and is never reported:
+// every dictionary written before stamping carries it, so calling those mislabelled would
+// flag every store that predates it.
+func fsckDictLabels(dictsDir string) []FsckDictLabel {
+	var out []FsckDictLabel
+	for _, f := range readDictFileFacts(dictsDir) {
+		if f.mislabelled() {
+			out = append(out, FsckDictLabel{Path: f.path, FiledAs: f.filedAs, Names: f.names})
+		}
+	}
+	return out
 }

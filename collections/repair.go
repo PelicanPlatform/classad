@@ -90,6 +90,9 @@ type RepairReport struct {
 	// DictDamaged lists damaged segments left alone because their attribute dictionary
 	// record is damaged (FsckSegment.DictDamaged). They are not counted in Untouched.
 	DictDamaged []string
+	// Dicts lists the compression dictionary files this run put right: re-filed under
+	// the id they name, or restored from a surviving copy. See dictrepair.go.
+	Dicts []RepairDict
 }
 
 // Totals sums the records kept and dropped across every rewritten segment.
@@ -122,8 +125,24 @@ func (r *RepairReport) String() string {
 		fmt.Fprintf(&b, "  LEFT ALONE %s: its attribute dictionary record is damaged, and every record "+
 			"in it needs that dictionary; a rewrite without it could not be read\n", filepath.Base(p))
 	}
+	for _, d := range r.Dicts {
+		switch {
+		case r.DryRun && d.Action == "re-filed":
+			fmt.Fprintf(&b, "  WOULD RE-FILE %s as dictionary %d, which is the id it carries\n",
+				filepath.Base(d.From), d.ID)
+		case d.Action == "re-filed":
+			fmt.Fprintf(&b, "  RE-FILED %s as %s: it carries dictionary id %d\n",
+				filepath.Base(d.From), filepath.Base(d.Path), d.ID)
+		case r.DryRun:
+			fmt.Fprintf(&b, "  WOULD RESTORE dictionary %d from %s\n", d.ID, d.From)
+		default:
+			fmt.Fprintf(&b, "  RESTORED dictionary %d from %s\n", d.ID, d.From)
+		}
+	}
 	if len(r.Segments) == 0 {
-		fmt.Fprintf(&b, "  nothing to do (%d segment(s) need no repair)\n", r.Untouched)
+		if len(r.Dicts) == 0 {
+			fmt.Fprintf(&b, "  nothing to do (%d segment(s) need no repair)\n", r.Untouched)
+		}
 		return b.String()
 	}
 	fmt.Fprintf(&b, "  %d segment(s) rewritten, %d left alone\n", len(r.Segments), r.Untouched)
@@ -147,6 +166,10 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 		return nil, err
 	}
 	rep := &RepairReport{Dir: dir, DryRun: opts.DryRun}
+	// The dictionaries first. A segment rewrite neither needs nor touches them, but a
+	// store whose dictionaries are in the wrong places is one an operator cannot open to
+	// check the rewrite, and the fix costs a rename.
+	repairDicts(dir, opts, rep)
 
 	for i := range scan.Segments {
 		seg := &scan.Segments[i]

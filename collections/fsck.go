@@ -166,6 +166,28 @@ type FsckDictFile struct {
 	Why  string
 }
 
+// FsckDictLabel is a dictionary file filed under an id that is not the one it names,
+// which only became a detectable condition once a dictionary carried its own id.
+type FsckDictLabel struct {
+	Path    string
+	FiledAs uint32 // the id in the file name
+	Names   uint32 // the id the dictionary itself carries
+}
+
+// FsckTrailer is damage in one segment's trailer. Exactly one of Why and Sections is set:
+// a trailer whose directory will not read is lost whole, while a trailer that reads loses
+// only the sections whose own checksum failed.
+type FsckTrailer struct {
+	Path string
+	// Why says the trailer cannot be read at all. The segment's records are unaffected --
+	// the trailer lives past them -- but nothing it carried can be recovered, and nothing
+	// may be written to that tail again, since its extent is no longer knowable.
+	Why string
+	// Sections are the ids of sections whose body failed its own checksum. The rest of
+	// the trailer is intact and still readable.
+	Sections []uint16
+}
+
 // FsckReport is the whole collection's census.
 type FsckReport struct {
 	Dir      string
@@ -191,6 +213,15 @@ type FsckReport struct {
 	// is the answer to "how close is this store to losing a dictionary for good": a
 	// dictionary present in dicts/ and nowhere else is one deletion away.
 	DictReplicas map[uint32]int
+	// DictsMislabelled are dictionary files stored under an id that is not the one they
+	// carry -- two files that swapped names, or one restored into the wrong slot. They
+	// are not damaged and nothing is lost; they are in the wrong places, and Repair puts
+	// them right by re-filing each under the id it names.
+	DictsMislabelled []FsckDictLabel
+	// Trailers is damage in the segment trailers: one whose directory will not read at
+	// all, or sections inside one that failed their own checksum. A trailer that was
+	// never written is not damage and is not reported here.
+	Trailers []FsckTrailer
 	// DictsDamaged are dictionary files that exist but cannot be used -- empty, truncated,
 	// or not a zstd dictionary at all. They are NOT in DictsPresent: a file that does not
 	// load is not a dictionary the store has, and Open fails on it exactly as it does on
@@ -374,6 +405,20 @@ func (r *FsckReport) String() string {
 	for _, d := range r.DictsDamaged {
 		fmt.Fprintf(&b, "  DAMAGED dictionary %d: %s -- %s\n", d.ID, d.Path, d.Why)
 	}
+	for _, m := range r.DictsMislabelled {
+		fmt.Fprintf(&b, "  MISLABELLED %s: it carries dictionary id %d, not %d -- "+
+			"the segments naming %d would decode to nothing\n",
+			m.Path, m.Names, m.FiledAs, m.FiledAs)
+	}
+	for _, tr := range r.Trailers {
+		if tr.Why != "" {
+			fmt.Fprintf(&b, "  DAMAGED trailer %s: %s (the segment's records are unaffected)\n",
+				filepath.Base(tr.Path), tr.Why)
+			continue
+		}
+		fmt.Fprintf(&b, "  DAMAGED trailer section(s) %v in %s (the rest of the trailer is intact)\n",
+			tr.Sections, filepath.Base(tr.Path))
+	}
 	inSeg := make(map[uint32]bool, len(r.DictsInSegments))
 	for _, id := range r.DictsInSegments {
 		inSeg[id] = true
@@ -482,7 +527,8 @@ func Fsck(dir string) (*FsckReport, error) {
 	}
 	// What the segments themselves carry. This is both the redundancy level for every
 	// dictionary and, for a missing one, a recovery that costs nothing to offer.
-	r.DictReplicas = countDictReplicas(dir)
+	r.DictReplicas, r.Trailers = surveyTrailers(dir)
+	r.DictsMislabelled = fsckDictLabels(filepath.Join(dir, "dicts"))
 	inSegments := map[uint32]bool{}
 	if len(missing) > 0 {
 		for id, rep := range sweepDictReplicas(dir, countShardDirs(dir), missing) {

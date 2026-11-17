@@ -869,8 +869,13 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		// because it decides how much of the file to map: the mapping must cover exactly
 		// the arena, as it did before trailers existed. A file with no trailer -- every
 		// segment written before this, and every non-carrier -- maps whole.
+		// A trailer that will not read leaves the arena's end unknowable, so the mapping
+		// stays at the file's size: the records are untouched either way, and anything
+		// that would write to the tail refuses such a segment outright (ErrDamagedTrailer)
+		// rather than guessing where it ends.
 		mapSize := st.Size()
-		trailer, hasTrailer := readSegTrailerAt(f, st.Size())
+		trailer, trailerState := readSegTrailerAt(f, st.Size())
+		hasTrailer := trailerState == segTrailerOK
 		if hasTrailer {
 			mapSize -= int64(trailer.bytes)
 		}
