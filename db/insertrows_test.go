@@ -358,3 +358,58 @@ func TestCopyLimitsDefaults(t *testing.T) {
 		t.Fatalf("limits = %+v, want MaxRows 7 and the default MaxBytes", got)
 	}
 }
+
+// An attribute stored as the literal `undefined` is dropped, because in a ClassAd an absent
+// attribute IS undefined -- keeping it would create a column where the reader found no
+// value. An expression that merely EVALUATES to undefined is not the same thing and is
+// kept: `Missing` and `B > 1` both evaluate undefined here, and both are real expressions
+// the source held.
+func TestCopyDropsUndefinedButKeepsExpressions(t *testing.T) {
+	src, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = src.Close() })
+	tx := src.Begin()
+	tx.NewClassAd("r1", mustAd(t, "Jid = 1\nGone = undefined\nRef = Missing\nCmp = Jid > 0"))
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
+	}
+	dst, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dst.Close() })
+	if err := dst.SetPrimaryKey([]string{"Jid"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		spec CopySpec
+	}{
+		{"star", CopySpec{}},
+		{"projection", CopySpec{
+			Attrs: []string{"Jid", "Gone", "Ref", "Cmp"},
+			Names: []string{"Jid", "Gone", "Ref", "Cmp"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := dst.CopyRowsInto(rowScan(t, src, "true"), tc.spec, CopyLimits{}, nil); err != nil {
+				t.Fatal(err)
+			}
+			ad, ok := dst.LookupClassAd("1")
+			if !ok {
+				t.Fatalf("no row at key 1, keys are %v", dst.Keys())
+			}
+			if _, present := ad.Lookup("Gone"); present {
+				t.Errorf("the undefined literal was copied: %s", ad.String())
+			}
+			for _, keep := range []string{"Ref", "Cmp"} {
+				if _, present := ad.Lookup(keep); !present {
+					t.Errorf("%s was dropped; it evaluates to undefined but is a real "+
+						"expression the source held: %s", keep, ad.String())
+				}
+			}
+		})
+	}
+}

@@ -229,22 +229,73 @@ func (db *DB) CopyRowsInto(rows iter.Seq[*classad.ClassAd], spec CopySpec, limit
 // rewrote `Requirements = Memory > 1024` as `false` would be corruption that reported
 // itself as success.
 //
-// An attribute the source does not carry is left out rather than written as undefined, for
-// the reason setInsertAttr leaves one out: in a ClassAd an absent attribute IS undefined,
-// and writing the keyword instead creates an attribute where the source had none.
+// An attribute the source does not carry is left out, and so is one it carries as the
+// literal `undefined` -- see dropUndefined.
 func projectRow(src *classad.ClassAd, spec CopySpec) *classad.ClassAd {
 	if spec.Whole() {
-		return src
+		return dropUndefined(src)
 	}
 	out := classad.New()
 	for i, a := range spec.Attrs {
 		expr, ok := src.Lookup(a)
-		if !ok {
+		if !ok || isUndefinedExpr(expr) {
 			continue
 		}
 		out.InsertExpr(spec.Names[i], expr)
 	}
 	return out
+}
+
+// dropUndefined returns src without the attributes stored as the literal `undefined`,
+// or src itself when there are none.
+//
+// This is setInsertAttr's rule applied to the copy, and it is the same reasoning: in a
+// ClassAd an ABSENT attribute IS undefined, so writing `X = undefined` does not record the
+// same thing -- it creates an attribute where the reader found no value, and every later
+// `is undefined` test and every projection then sees a different shape from the source.
+//
+// It is not a hypothetical. A REDACTED read is the ordinary way to meet one: a caller not
+// entitled to a sealed value reads that attribute as undefined, present rather than
+// missing, so an unprivileged copy that kept it would write a column of `undefined` into
+// the target and report the rows as copied.
+//
+// src is returned unchanged when nothing is undefined, which is the common case, so a copy
+// of ordinary rows allocates nothing here.
+func dropUndefined(src *classad.ClassAd) *classad.ClassAd {
+	names := src.GetAttributes()
+	first := -1
+	for i, name := range names {
+		if expr, ok := src.Lookup(name); ok && isUndefinedExpr(expr) {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return src
+	}
+	// Rebuild from the names already in hand, carrying over everything before the first
+	// undefined unconditionally -- those were just checked.
+	out := classad.New()
+	for i, name := range names {
+		expr, ok := src.Lookup(name)
+		if !ok || (i >= first && isUndefinedExpr(expr)) {
+			continue
+		}
+		out.InsertExpr(name, expr)
+	}
+	return out
+}
+
+// isUndefinedExpr reports whether a stored expression IS the undefined literal.
+//
+// It asks about the stored expression, not about what the attribute evaluates to: an
+// expression that happens to evaluate to undefined for this row (a reference to a column
+// the projection dropped) is still a real expression the source held, and a copy keeps it.
+func isUndefinedExpr(expr *classad.Expr) bool {
+	if expr == nil {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(expr.String()), "undefined")
 }
 
 // checkKeyCovered reports whether every declared key column is among the written column
