@@ -159,3 +159,56 @@ func TestGroupValueNamesTheSameGroupAsItsText(t *testing.T) {
 		t.Errorf("1 and 1.0 are one group but canonicalize to %v and %v", a.Type(), b.Type())
 	}
 }
+
+// TestAppendGroupValueTextMatches holds AppendGroupValueText to GroupValueText over every kind
+// of group value. The two are one relation written twice -- one allocating its answer, one
+// appending it -- and a scan that keys with the append form while the aggregate engine labels
+// with the other would split a group in two, or merge two, with both halves looking right.
+//
+// The numeric cases are the ones with their own code rather than a fallback, and the ones where
+// the relation is not the obvious one: 2.0 groups with 2, and only an integral float in int64's
+// range does, so the boundaries belong here too.
+func TestAppendGroupValueTextMatches(t *testing.T) {
+	for _, text := range []string{
+		`"ap1.example.org"`, `""`, `"4"`, `"he said \"hi\""`, `"back\\slash"`,
+		`42`, `-7`, `0`, `9007199254740993`, `-9223372036854775808`, `9223372036854775807`,
+		`1.5`, `-0.25`, `2.0`, `-0.0`, `1e300`, `-1e300`, `1e-300`,
+		`9223372036854775807.0`, `-9223372036854775808.0`, `1.8446744073709552e19`,
+		`true`, `false`, `undefined`, `error`,
+		`{ 1,2 }`, `{  }`, `{ "a","b" }`, `{ 1,2.5,true }`, `{ { 1 },2 }`,
+		`[a = 1]`, `[]`, `[a = 1; b = "x"]`,
+	} {
+		v := ParseGroupValue(text)
+		want := GroupValueText(v)
+		if got := string(AppendGroupValueText(nil, v)); got != want {
+			t.Errorf("AppendGroupValueText(%s) = %q, GroupValueText = %q", text, got, want)
+		}
+		// Appending onto a non-empty buffer must add exactly the same bytes and touch
+		// nothing before them -- the whole point is a buffer reused across a scan.
+		prefix := []byte("\x00prefix\x00")
+		got := AppendGroupValueText(append([]byte(nil), prefix...), v)
+		if string(got[:len(prefix)]) != string(prefix) {
+			t.Errorf("AppendGroupValueText(%s) overwrote the buffer it appended to", text)
+		}
+		if string(got[len(prefix):]) != want {
+			t.Errorf("AppendGroupValueText(%s) onto a buffer appended %q, want %q",
+				text, got[len(prefix):], want)
+		}
+	}
+}
+
+// TestAppendGroupValueTextIsAllocationFreeForNumbers pins the reason the append form exists. If
+// a number's rendering starts allocating again, the per-record key costs what it cost before and
+// the scan quietly gives back what this bought.
+func TestAppendGroupValueTextIsAllocationFreeForNumbers(t *testing.T) {
+	buf := make([]byte, 0, 64)
+	for _, text := range []string{`42`, `-7`, `1.5`, `2.0`, `1e300`} {
+		v := ParseGroupValue(text)
+		n := testing.AllocsPerRun(100, func() {
+			buf = AppendGroupValueText(buf[:0], v)
+		})
+		if n != 0 {
+			t.Errorf("AppendGroupValueText(%s) allocated %.1f times per call, want 0", text, n)
+		}
+	}
+}
