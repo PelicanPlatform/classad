@@ -83,17 +83,17 @@ func TestIsLiteralNodeMatchesDecoding(t *testing.T) {
 	t.Logf("agreed on %d node shapes", len(nodes))
 }
 
-// TestStringNodeBytesMatchesLiteralValue pins the other half: the bytes handed back are the ones
+// TestStringLiteralValueMatchesLiteralValue pins the other half: the bytes handed back are the ones
 // LiteralValue would have copied.
-func TestStringNodeBytesMatchesLiteralValue(t *testing.T) {
+func TestStringLiteralValueMatchesLiteralValue(t *testing.T) {
 	for _, s := range []string{"", "a", "owner@example.com", "o999", string(make([]byte, 300))} {
 		b := make([]byte, 1, len(s)+11)
 		b[0] = nString
 		b = binary.AppendUvarint(b, uint64(len(s)))
 		b = append(b, s...)
-		got, ok := StringNodeBytes(b)
+		got, ok := StringLiteralValue(b)
 		if !ok {
-			t.Fatalf("StringNodeBytes refused a well-formed %d-byte string", len(s))
+			t.Fatalf("StringLiteralValue refused a well-formed %d-byte string", len(s))
 		}
 		lit, lok := LiteralValue(b)
 		if !lok || lit.Kind != LitString {
@@ -104,7 +104,7 @@ func TestStringNodeBytesMatchesLiteralValue(t *testing.T) {
 		}
 	}
 	// A non-string node is refused rather than misread.
-	if _, ok := StringNodeBytes([]byte{nInt, 2}); ok {
-		t.Error("StringNodeBytes accepted an int node")
+	if _, ok := StringLiteralValue([]byte{nInt, 2}); ok {
+		t.Error("StringLiteralValue accepted an int node")
 	}
 }

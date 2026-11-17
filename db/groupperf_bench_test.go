@@ -36,6 +36,9 @@ func groupPerfDB(b *testing.B, groups, rows int) *DB {
 		for r := 0; r < rows; r++ {
 			ad := classad.New()
 			ad.InsertAttrString("Owner", fmt.Sprintf("o%d", g))
+			// OwnerID is Owner as a number: same cardinality, same record, different type.
+			// It is what BenchmarkGroupByColumnKind groups by to isolate the column's type.
+			ad.InsertAttr("OwnerID", int64(g))
 			ad.InsertAttr("Cpus", int64(r%16))
 			ad.InsertAttr("QDate", int64(g*1_000_000+r))
 			tx.NewClassAd(fmt.Sprintf("k%d", n), ad)
@@ -146,17 +149,37 @@ func BenchmarkGroupServerVsClient(b *testing.B) {
 	}
 }
 
-// BenchmarkGroupByColumnKind asks whether the group column's TYPE decides which path runs: a
-// numeric column against a string one, same rows, same question.
+// BenchmarkGroupByColumnKind asks whether the group column's TYPE decides the cost: a numeric
+// column against a string one, same rows, same question.
+//
+// The arms group by OwnerID and Owner, which hold the same value in the same records and differ
+// only in type. An earlier version grouped by Cpus and Owner -- and Cpus has 16 distinct values
+// where Owner has 100, so it compared two different queries and read the difference as the
+// column type's. At equal cardinality the apparent 1.7x penalty on the string column is gone:
+// the two arms land within the run-to-run spread, which on the machine this was written on is
+// wider than the gap it was supposed to show. Hence the group-count assertion below, which the
+// Cpus version would have failed.
+//
+// Read the ALLOCATION column, not the time. Allocations are stable across runs and still differ
+// -- a string column interns each distinct value it meets -- where ns/op here has swung 5x
+// between runs of unchanged code. A timing conclusion drawn from one run of this benchmark is
+// not a conclusion.
 func BenchmarkGroupByColumnKind(b *testing.B) {
-	d := groupPerfDB(b, 100, 4000)
-	for _, attr := range []string{"Cpus", "Owner"} {
+	const groups = 100
+	d := groupPerfDB(b, groups, 4000)
+	for _, attr := range []string{"OwnerID", "Owner"} {
 		b.Run(attr, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				if _, err := d.AggregateColsStats("true", []GroupCol{{Attr: attr}},
-					[]AggSpec{{Func: AggCount, Arg: "*"}}, nil, nil); err != nil {
+				rows, err := d.AggregateColsStats("true", []GroupCol{{Attr: attr}},
+					[]AggSpec{{Func: AggCount, Arg: "*"}}, nil, nil)
+				if err != nil {
 					b.Fatal(err)
+				}
+				// Both arms must ask the same question. Without this the two differ in group
+				// cardinality and the benchmark silently measures that instead of the type.
+				if len(rows) != groups {
+					b.Fatalf("groups = %d, want %d", len(rows), groups)
 				}
 			}
 		})

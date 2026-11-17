@@ -359,8 +359,8 @@ func litGroupComp(node []byte, acc *groupAccum) (groupComp, bool) {
 	// A STRING is grouped from its bytes, never from a Go string built for the occasion. This is
 	// the per-record path, so LiteralValue's copy here was one allocation per record that the
 	// intern table then made redundant -- it keeps one copy per distinct value, and this record's
-	// copy was discarded as soon as its id came back. See wire.StringNodeBytes.
-	if b, ok := wire.StringNodeBytes(node); ok {
+	// copy was discarded as soon as its id came back. See wire.StringLiteralValue.
+	if b, ok := wire.StringLiteralValue(node); ok {
 		return groupComp{raw: acc.internBytes(b), kind: gkString}, true
 	}
 	lit, ok := scalarValue(node)
