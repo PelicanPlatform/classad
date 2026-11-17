@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -187,7 +188,7 @@ func TestAppendGroupValueTextMatches(t *testing.T) {
 		// nothing before them -- the whole point is a buffer reused across a scan.
 		prefix := []byte("\x00prefix\x00")
 		got := AppendGroupValueText(append([]byte(nil), prefix...), v)
-		if string(got[:len(prefix)]) != string(prefix) {
+		if !bytes.Equal(got[:len(prefix)], prefix) {
 			t.Errorf("AppendGroupValueText(%s) overwrote the buffer it appended to", text)
 		}
 		if string(got[len(prefix):]) != want {

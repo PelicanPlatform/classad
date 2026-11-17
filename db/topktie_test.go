@@ -65,7 +65,7 @@ func TestTopKTieBreakingAgainstAClientRanking(t *testing.T) {
 			n++
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	d.EnableSchemaScan(1000, 8)

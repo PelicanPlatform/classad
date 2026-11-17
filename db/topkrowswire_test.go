@@ -159,7 +159,7 @@ func TestTopKWireAgreesWithValueRung(t *testing.T) {
 		// TIES on the order attribute, deliberately: a small QDate space means most groups
 		// hold several rows with the same rank, which is where a sort that is not stable, or
 		// a comparison that is not shared, shows up.
-		add(fmt.Sprintf("Owner = \"%s\"\nSite = %d\nQDate = %d\nPayload = \"p%d\"",
+		add(fmt.Sprintf("Owner = %q\nSite = %d\nQDate = %d\nPayload = \"p%d\"",
 			owner, rng.Intn(4), 1700000000+rng.Intn(40), i))
 	}
 	// A group column stored as an INTEGER in some ads and a REAL in others. The reference
@@ -219,7 +219,7 @@ func TestTopKWireAgreesWithValueRung(t *testing.T) {
 		tx.NewClassAd(fmt.Sprintf("k%d", n), ad)
 		n++
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	d.EnableSchemaScan(1000, 8)
@@ -357,7 +357,7 @@ func TestTopKWireRowsAreOwned(t *testing.T) {
 		}
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.TopKRowsPerGroupWire("true", TopKRowsSpec{

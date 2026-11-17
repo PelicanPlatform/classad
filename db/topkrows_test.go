@@ -31,7 +31,7 @@ func topKRowsFixture(t *testing.T, owners, rows int) *DB {
 			n++
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	return d
@@ -417,7 +417,7 @@ func TestTopKRowsNeedsEveryOrderingTerm(t *testing.T) {
 	add("Owner = \"o\"\nQDate = 1800000000\nPayload = \"no-second-term\"")
 	add("Owner = \"o\"\nQDate = 1800000001\nTie = \"text\"\nPayload = \"second-term-string\"")
 	add("Owner = \"o\"\nQDate = 1800000002\nTie = undefined\nPayload = \"second-term-undefined\"")
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
