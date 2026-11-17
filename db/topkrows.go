@@ -3,7 +3,6 @@ package db
 import (
 	"fmt"
 	"iter"
-	"math"
 	"sort"
 	"strings"
 
@@ -45,11 +44,12 @@ type TopKOrderTerm struct {
 
 // TopKRowsSpec is one "k rows per group" request.
 //
-// Every ordering attribute must be numeric in the rows that are to be ranked. A row where ANY of
-// them is absent, non-numeric or a NaN is NOT ranked and does not appear -- the same rule the
-// numeric aggregates follow, and the only one under which "the newest five" means anything. Such
-// a row still belongs to its group for any other purpose; this call simply has nothing to order
-// it by.
+// EVERY ROW RANKS. The ordering attributes do not have to be numeric, or present: rows are ordered
+// by collections.CompareValues, the total order a GROUP BY result is sorted by, so a string orders
+// against a string and a row missing the attribute orders as undefined -- after every number and
+// string, but ranked. This is the order a caller sorting the same rows itself would use, which is
+// the point: a pushdown that silently dropped the rows it could not read numerically would answer
+// a different question than the client code it replaces, and would look fast doing it.
 //
 // WHY THE ORDERING IS A LIST. "The top 5" is only a well-defined SET of rows when the ordering is
 // total over them. Where it ties across the K-th place, which rows come back is a choice, and
@@ -127,7 +127,7 @@ func (s TopKRowsSpec) validate() error {
 type topKRowKeep struct {
 	// vals holds every kept row's ordering values end to end, stride terms long, so one keep
 	// is two allocations however many terms the ordering has.
-	vals  []NumValue
+	vals  []classad.Value
 	rows  [][]classad.Value
 	k     int
 	terms []TopKOrderTerm
@@ -135,7 +135,7 @@ type topKRowKeep struct {
 
 func (t *topKRowKeep) stride() int { return len(t.terms) }
 
-func (t *topKRowKeep) at(i int) []NumValue {
+func (t *topKRowKeep) at(i int) []classad.Value {
 	n := t.stride()
 	return t.vals[i*n : (i+1)*n]
 }
@@ -145,27 +145,22 @@ func (t *topKRowKeep) count() int { return len(t.vals) / t.stride() }
 // topKWorse reports whether a is the value a better one would evict: the smallest when keeping the
 // largest k (desc), the largest when keeping the smallest k (asc).
 //
-// Two integers compare as integers. Past 2^53 a NumInt's F has lost digits, so comparing the
-// floats would call two different job ids equal and keep the wrong one; I is exact and is what a
-// pair of integers is ordered by. Anything else compares as floats, which is what a mixed int/real
-// column means by order anyway.
-func topKWorse(a, b NumValue, desc bool) bool {
-	if a.Kind == NumInt && b.Kind == NumInt {
-		if desc {
-			return a.I < b.I
-		}
-		return a.I > b.I
-	}
+// The order is collections.CompareValues -- the one a GROUP BY result is sorted by -- so a row is
+// ranked whatever its ordering attribute holds, and ranked the same way a caller sorting the same
+// rows itself would rank it. Two integers compare as integers there, which matters here: past 2^53
+// the float conversion calls two different job ids equal and the keep holds the wrong one.
+func topKWorse(a, b classad.Value, desc bool) bool {
+	c := collections.CompareValues(a, b)
 	if desc {
-		return a.F < b.F
+		return c < 0
 	}
-	return a.F > b.F
+	return c > 0
 }
 
 // topKWorseRow is topKWorse over a whole ordering: the first term that separates a from b
 // decides, and an ordering whose every term ties reports false, so neither row evicts the other
 // and the one already held stays.
-func topKWorseRow(a, b []NumValue, terms []TopKOrderTerm) bool {
+func topKWorseRow(a, b []classad.Value, terms []TopKOrderTerm) bool {
 	for i, t := range terms {
 		if topKWorse(a[i], b[i], t.Desc) {
 			return true
@@ -177,12 +172,7 @@ func topKWorseRow(a, b []NumValue, terms []TopKOrderTerm) bool {
 	return false
 }
 
-func (t *topKRowKeep) offer(vals []NumValue, row []classad.Value) {
-	for _, v := range vals {
-		if v.Kind == NumReal && math.IsNaN(v.F) {
-			return // never evicted, so it would hold a slot against every real row
-		}
-	}
+func (t *topKRowKeep) offer(vals, row []classad.Value) {
 	if t.count() < t.k {
 		t.vals = append(t.vals, vals...)
 		t.rows = append(t.rows, row)
@@ -321,19 +311,10 @@ func topKRowsPerGroup(src TopKRowsSource, constraint string, spec TopKRowsSpec, 
 	at := map[string]int{}
 	var groups []*groupEntry
 	var label strings.Builder
-	ovals := make([]NumValue, len(spec.OrderBy)) // reused: the keep copies what it keeps
+	ovals := make([]classad.Value, len(spec.OrderBy)) // reused: the keep copies what it keeps
 	for row := range seq {
-		ranked := true
 		for i, at := range orderAt {
-			v, ok := numValueOf(row[at])
-			if !ok {
-				ranked = false // nothing to rank it by; see TopKRowsSpec
-				break
-			}
-			ovals[i] = v
-		}
-		if !ranked {
-			continue
+			ovals[i] = row[at]
 		}
 		// Keyed on the same rendering a GROUP BY groups by, so two rows fall together here
 		// exactly when the aggregate engine would have put them in one group.

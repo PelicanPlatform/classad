@@ -20,8 +20,10 @@ import (
 //	which group a row is in   the reference renders the group value to text; this keys on the
 //	                          group columns' NODE BYTES, and two encodings of one value would
 //	                          be two groups here and one there
-//	whether a row ranks       the reference reads a classad.Value and asks numValueOf; this
-//	                          reads the node and asks wire.NumberValue
+//	what a row ranks BY       both read the node through wireRow.value, but the reference
+//	                          reaches the same attribute through the projected value row, and
+//	                          an expression attribute is evaluated on one side only if they
+//	                          disagree about what is a literal
 //	which rows win, in order  shared code (topKWorse, a stable sort), so this one should hold
 //	                          by construction -- which is worth confirming rather than assuming
 //
@@ -192,9 +194,9 @@ func TestTopKWireAgreesWithValueRung(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		add(fmt.Sprintf("Owner = \"expr\"\nSite = 1\nBase = %d\nQDate = Base + 1\nPayload = \"e%d\"", i, i))
 	}
-	// A BOOLEAN order attribute. numValueOf ranks booleans (false < true), so the reference
-	// does, and a wire rung that read only ints and reals would drop this whole group while
-	// every other case still agreed.
+	// A BOOLEAN order attribute. CompareValues ranks booleans (false below true), so both
+	// rungs do, and a wire rung that read only ints and reals would order this whole group
+	// differently while every other case still agreed.
 	for i := 0; i < 20; i++ {
 		add(fmt.Sprintf("Owner = \"bool\"\nSite = 1\nQDate = %t\nPayload = \"t%d\"", i%2 == 0, i))
 	}
