@@ -61,6 +61,27 @@ type TopKRowsGroup struct {
 	Rows   [][]classad.Value
 }
 
+// validate rejects a spec no rung can serve. Both rungs call it, so a spec accepted by one is
+// accepted by the other -- a request that errored on the value rung and quietly returned
+// something on the wire rung would be the worst kind of divergence between them.
+func (s TopKRowsSpec) validate() error {
+	if s.K <= 0 {
+		return fmt.Errorf("classad-db: top-k rows needs a positive K")
+	}
+	if s.OrderAttr == "" || s.OrderAttr == "*" {
+		return fmt.Errorf("classad-db: top-k rows needs an attribute to order by")
+	}
+	for _, g := range s.GroupCols {
+		if g.Attr == "" || g.Attr == "*" {
+			return fmt.Errorf("classad-db: a group column must name an attribute")
+		}
+		if g.BucketWidth < 0 {
+			return fmt.Errorf("classad-db: a group column's bucket width cannot be negative")
+		}
+	}
+	return nil
+}
+
 // topKRowKeep holds one group's best k rows. vals is unordered and at most k long, so offer is
 // O(k) and the state is bounded by the REQUEST rather than by the group -- which is what makes
 // this safe to point at a history table where a group holds millions of rows.
@@ -148,19 +169,8 @@ func (db *DB) TopKRowsPerGroupStats(constraint string, spec TopKRowsSpec, stats 
 }
 
 func (db *DB) topKRowsPerGroup(constraint string, spec TopKRowsSpec, stats *collections.ScanStats) ([]TopKRowsGroup, error) {
-	if spec.K <= 0 {
-		return nil, fmt.Errorf("classad-db: top-k rows needs a positive K")
-	}
-	if spec.OrderAttr == "" || spec.OrderAttr == "*" {
-		return nil, fmt.Errorf("classad-db: top-k rows needs an attribute to order by")
-	}
-	for _, g := range spec.GroupCols {
-		if g.Attr == "" || g.Attr == "*" {
-			return nil, fmt.Errorf("classad-db: a group column must name an attribute")
-		}
-		if g.BucketWidth < 0 {
-			return nil, fmt.Errorf("classad-db: a group column's bucket width cannot be negative")
-		}
+	if err := spec.validate(); err != nil {
+		return nil, err
 	}
 
 	// One projection carrying what the caller asked for, then the group columns and the order
