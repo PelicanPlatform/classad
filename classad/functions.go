@@ -176,6 +176,39 @@ func classadReal(r float64) string {
 	}
 }
 
+// classadRealOld renders a real the way the reference unparser does when it
+// is in OLD-ClassAd mode (ClassAdUnParser::UnparseReal with oldClassAd set).
+//
+// The two modes differ in the non-finite, non-zero case only: new ClassAd
+// writes %1.15E, old ClassAd writes %.16G and then tacks on ".0" when the
+// result holds none of '.', 'E' or 'e', so that a value never reads back as
+// an integer. 0.1 is "0.1" rather than "1.000000000000000E-01", and 2.0 is
+// "2.0" rather than "2".
+//
+// It matters wherever old-format text is handed to HTCondor and read back by
+// it: job_queue.log entries, and the body of a job transform, which the
+// schedd re-parses out of a string attribute. Measured against condor_submit
+// for .1, 1.5, 2.0, 0.0, -0.1, 0.5, 1.0, 1e-5, 1e15, 1e16, 1e300, 1e-20,
+// 100000.0, 3.14159265358979 and 123456789012345678.0.
+func classadRealOld(r float64) string {
+	switch {
+	case math.IsNaN(r):
+		return `real("NaN")`
+	case math.IsInf(r, -1):
+		return `real("-INF")`
+	case math.IsInf(r, 1):
+		return `real("INF")`
+	case r == 0:
+		return fmt.Sprintf("%.1f", r)
+	default:
+		s := fmt.Sprintf("%.16G", r)
+		if !strings.ContainsAny(s, ".Ee") {
+			s += ".0"
+		}
+		return s
+	}
+}
+
 // unparseString renders a string in the reference sink form: wrapped in double
 // quotes with control characters escaped and non-printable bytes written as
 // octal (ClassAdUnParser::UnparseString). Used for string elements nested

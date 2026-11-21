@@ -54,7 +54,7 @@ func unparseExpr(b *strings.Builder, e ast.Expr, old bool) {
 	case *ast.IntegerLiteral:
 		b.WriteString(strconv.FormatInt(v.Value, 10))
 	case *ast.RealLiteral:
-		b.WriteString(classadReal(v.Value))
+		b.WriteString(realLiteralText(v.Value, old))
 	case *ast.StringLiteral:
 		if old {
 			b.Write(ast.AppendQuoteStringOld(nil, v.Value))
@@ -167,7 +167,7 @@ func unparseUnary(b *strings.Builder, v *ast.UnaryOp, old bool) {
 				return
 			}
 		case *ast.RealLiteral:
-			b.WriteString(classadReal(-lit.Value))
+			b.WriteString(realLiteralText(-lit.Value, old))
 			return
 		}
 	}
@@ -187,4 +187,15 @@ func unparseRecord(b *strings.Builder, ad *ast.ClassAd, old bool) {
 		unparseExpr(b, attr.Value, old)
 	}
 	b.WriteString(" ]")
+}
+
+// realLiteralText renders a real literal in whichever of the two unparser
+// modes is in force. They disagree on every finite non-zero value, so a real
+// written into old-format text has to go through this rather than straight to
+// classadReal.
+func realLiteralText(r float64, old bool) string {
+	if old {
+		return classadRealOld(r)
+	}
+	return classadReal(r)
 }
