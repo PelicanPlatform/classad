@@ -64,7 +64,8 @@ func computedAd(i, excEvery int) string {
 	}
 	s := fmt.Sprintf(`[ ClusterId = %d; ProcId = %d; Owner = "user%d"; Site = "site%d"; QDate = %d; JobStatus = %d;
 		RssBase = %d; BigBase = %d; MemUse = %s; Label = %s; Big = %s; Ratio = %s; Flag = Rss > 2000000;
-		Age = time() - QDate; Loop = %s`,
+		Age = time() - QDate; Loop = %s;
+		Req = ifThenElse(MemUse isnt undefined, max({2048, (3 * MemUse) / 2}), 2048)`,
 		i, i%10, i%7, i%4, 1700000000+i, 1+i%5, i*3, 9007199254740993+int64(i), mem, label, big, ratio, loop)
 	if rss != "" {
 		s += "; Rss = " + rss
@@ -97,6 +98,8 @@ var computedQueries = []string{
 	"Age > 0",
 	"Loop > 3",
 	"Loop is undefined",
+	"Req > 2048",
+	"Req == 2048",
 	"Rss is undefined",
 }
 
@@ -251,7 +254,7 @@ func checkComputedFixture(t *testing.T, c *Collection, label string) {
 		}
 	}
 	all := parse("ProcId >= 0")
-	for _, attr := range []string{"MemUse", "Big", "Ratio", "Loop"} {
+	for _, attr := range []string{"MemUse", "Big", "Ratio", "Loop", "Req"} {
 		want := computedRefStats(ads, attr)
 		st, ok := c.NumStatsQuery(all, attr)
 		if !ok {
@@ -454,7 +457,21 @@ func TestComputedCellPurity(t *testing.T) {
 		{"ifThenElse(Rss > 10, Rss, 0)", "4096"},
 		{"Rss > 10 && Memory > 1", "true"},
 		{"Rss ?: 7", "4096"},
+		// A list literal reduced to a scalar. `max({floor, formula})` is how a submit file puts a
+		// floor under a request computed from a usage figure, so the whole shape has to qualify.
+		{"max({2048, (3 * Rss) / 2})", "6144"},
+		{"ifThenElse(Rss isnt undefined, max({2048, (3 * Rss) / 2}), 2048)", "6144"},
+		{"min({2048, Rss})", "2048"},
+		{"sum({Rss, 4})", "4100"},
+		{"max({RssExpr, Rss})", "8192"},
 		{"TARGET.Memory / 2", ""},
+		// A list is admissible on the way to a scalar and no other way: the list itself, a
+		// subscript of one, and an element the record cannot supply are all left to the row path.
+		{"{1, 2}", ""},
+		{"max({Rss, Missing})", ""},
+		{"max({Rss, TARGET.Memory})", ""},
+		{"max({Rss, time()})", ""},
+		{"max({Rss, Secret})", ""},
 		{"ifThenElse(isUndefined(TARGET.Memory), 1, 2)", ""},
 		{"isUndefined(Missing)", ""},
 		{"Missing + 1", ""},
@@ -509,6 +526,33 @@ func TestComputedCellPurity(t *testing.T) {
 		if alone, against := solo.String(), matched.EvaluateAttr("Field").String(); alone != got || against != got {
 			t.Errorf("Field = %s: computed %s, but evaluates to %s alone and %s against a target", tc.expr, got, alone, against)
 		}
+	}
+}
+
+// TestComputedCellsCoverARequestComputedFromUsage is a PATH test, not an answer test. Req is the shape
+// a submit file writes to retry a job with more memory -- a request floored with max() over a usage
+// figure that is itself an expression over a third attribute -- and the fixture holds it in nearly every
+// record. Correctness cannot show that it is served from the columns, because the per-record fallback
+// returns exactly the same numbers; it just reads every record to get them. So this scores the path:
+// the reader must not give the query back, and must not evaluate its way through the table.
+func TestComputedCellsCoverARequestComputedFromUsage(t *testing.T) {
+	c := buildComputedFixture(t, t.TempDir(), 2000, 0, false)
+	q, err := vm.Parse("ProcId >= 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := heldExceptionEvals.Load()
+	st, ok := c.NumStatsQuery(q, "Req")
+	if !ok {
+		t.Fatal("NumStatsQuery(Req) gave the query back: no computed value engaged for the request idiom")
+	}
+	if st.N == 0 {
+		t.Fatal("NumStatsQuery(Req) counted no values")
+	}
+	// Only the records whose closure the fixture withholds (no Rss, so MemUse is undefined) may be
+	// evaluated one at a time. That is 1 in 53; a tenth leaves room without admitting a row scan.
+	if evals := heldExceptionEvals.Load() - before; evals*10 > int64(st.N) {
+		t.Errorf("Req: %d of %d values evaluated per record, want nearly all read from the column", evals, st.N)
 	}
 }
 

@@ -41,9 +41,11 @@ import (
 //     undefined only when the ad is evaluated alone: under matchmaking it falls through to the target ad
 //     (see the evaluator's resolveAttributeReference). Requiring presence makes the value the same in
 //     every context, rather than correct only for the readers that happen to evaluate alone.
-//   - The closure is built only from literals, operators, conditionals and a short list of deterministic
-//     built-in functions (pureFuncs). Anything else -- time(), random(), eval(), a nested ad, a list, a
-//     select -- leaves the cell alone.
+//   - The closure is built only from literals, operators, conditionals, list literals and a short list
+//     of deterministic built-in functions (pureFuncs). Anything else -- time(), random(), eval(), a
+//     nested ad, a select -- leaves the cell alone. A list is admissible only as a SUBexpression, which
+//     in practice means an argument to min/max/sum/avg: the value rule below still refuses to store one,
+//     so no list ever reaches a column.
 //   - Nothing in the closure is sealed, or would be sealed if it were written now: a value derived from a
 //     sealed attribute would put a function of its plaintext into the column.
 //   - The value is a number, a string or a boolean. UNDEFINED (only reachable through an explicit
@@ -59,6 +61,13 @@ var pureFuncs = map[string]struct{}{
 	"ifthenelse": {}, "isundefined": {}, "iserror": {}, "isstring": {}, "isinteger": {}, "isreal": {},
 	"isboolean": {}, "int": {}, "real": {}, "floor": {}, "ceiling": {}, "ceil": {}, "round": {},
 	"strcat": {}, "tolower": {}, "toupper": {}, "substr": {},
+	// The list aggregations. Each takes one list and is a function of its element VALUES: the
+	// evaluator they are handed is used for nothing but evaluating those elements, in the scope the
+	// list was written in -- here the ad of closure attributes this file builds, which is the scope
+	// the whole expression is evaluated in anyway. They are listed because a submit file that
+	// computes a request from a usage figure writes `max({floor, formula})` to put a floor under it,
+	// and without them that whole shape falls to the row path.
+	"min": {}, "max": {}, "sum": {}, "avg": {},
 }
 
 // pureBinOps are the binary operators a computed value may use: the arithmetic, comparison, bitwise,
@@ -133,6 +142,17 @@ func walkRefs(e ast.Expr, refs []string, scoped bool) ([]string, bool) {
 			return nil, false
 		}
 		return rec(v.Right, left)
+	case *ast.ListLiteral:
+		// A list is as pure as its elements. Nothing here can put one in a column: valueNode stores
+		// only a number, a string or a boolean, so a list-VALUED expression is still refused -- this
+		// admits the list only on the way to a function that reduces it to a scalar.
+		for _, x := range v.Elements {
+			var ok bool
+			if refs, ok = rec(x, refs); !ok {
+				return nil, false
+			}
+		}
+		return refs, true
 	case *ast.FunctionCall:
 		if _, ok := pureFuncs[strings.ToLower(v.Name)]; !ok {
 			return nil, false
