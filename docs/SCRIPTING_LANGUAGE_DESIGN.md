@@ -2771,3 +2771,93 @@ That is evidence for D2a's default, not a proof of it. The binding case is the *
 is live by definition, so there was no coalescing decision to get wrong. The case that still has to
 be decided rather than discovered is the ordinary `Dst = op(A, B)` where `A` is dying: that is where
 a wrong answer is silent.
+
+---
+
+# Writing the ad
+
+Everything the language does today derives a value. `result` is the one output, the subject ad is
+read-only, and the scalar and vector engines agree because neither can change anything. A write
+turns it into a language that transforms a record, which is a different thing with a different set
+of guarantees — and most of the cost below is in the guarantees, not in the opcode.
+
+## The fork that decides the rest
+
+**Is a script that writes allowed where a constraint is evaluated?**
+
+A constraint runs per record inside a scan: potentially over thousands of records, potentially in
+parallel, potentially against a mirror of someone else's data. A `*ClassAd` is explicitly not safe
+to share across goroutines, so a mutating constraint forces exclusive ownership of each record's ad
+for the length of its evaluation, and a scan that mutates what it is scanning has no defined
+meaning at all.
+
+The answer that keeps everything else simple is **no**: a write is legal only in a transform entry
+point, which takes one ad it owns, and a constraint remains a pure function of a record. Then the
+scan paths need no new reasoning — they need one refusal, which they can make at compile time.
+
+Deciding otherwise is not fatal, but it makes every item below harder, and it should be decided
+first rather than discovered.
+
+## Form
+
+```
+MY.RequestMemory = RequestMemory * 2
+```
+
+The left side names a scope explicitly, because a bare name already means a local and that rule is
+settled. `MY.` is the subject ad. `TARGET.` is someone else's ad in a matchmaking context and is
+refused — a script may read it and may not change it.
+
+**Store the value, not the expression.** A ClassAd attribute can hold either, and the unevaluated
+form is the more powerful one: it is how an attribute stays a rule rather than a number. It is also
+where cycles come from — storing an expression that mentions the attribute it is stored in, or two
+that mention each other, is a construction-time cycle the reader meets later and somewhere else. A
+value-storing write cannot do that. The deferred form is worth having and is worth having second.
+
+## What it costs
+
+**1. Reads stop being order-independent.** `MY.X = 1` followed by a read of `X` has to see 1, so a
+reference load is no longer a pure function of the ad for the length of a run. Every optimisation
+that treats `OpLoadRef` as hoistable or common-subexpression-eliminable becomes wrong in the
+presence of a write. The cheap answer is a barrier: a write is a scheduling fence for reference
+loads, conservatively for all attributes rather than just the one written. That gives up some
+optimisation in scripts that write and none in scripts that do not, which is the right trade for a
+first version.
+
+This is the item that is easy to miss, because nothing fails loudly. The wrong answer is a stale
+read, which looks like a plausible result.
+
+**2. The purity gate needs a fourth kind of rule.** A registered script function must not reach the
+ad. `checkPure` refuses a non-empty read set, a scoped reference, an alias load and a delegated
+node — all of them *reads*. A write is none of those, so without a new rule the gate admits a
+mutating function, which would then mutate whatever ad an expression happened to be evaluated
+against. It needs its own rule and its own test.
+
+**3. The vector executor must decline.** A batch has columns, not records with identity; there is no
+ad to write. This is the same shape as the existing loop-jump decline: a flag on the program,
+checked before execution, with a test proving the decline is attributable to the write.
+
+**4. The read set must not grow.** A written attribute is not a column to scan, and a planner told
+otherwise looks for something that is not there. A write contributes whatever its right-hand side
+*reads*, and contributes the written name to nothing.
+
+**5. Failure has to be a value, not a fault.** Writing UNDEFINED or ERROR stores UNDEFINED or ERROR.
+They are values in this language everywhere else, and a write that faulted on them would be a second
+rule for no gain. Writing an attribute that does not exist creates it.
+
+## Scope, in order
+
+1. `MY.Attr = <expr>`, value-storing, top-level attribute of the subject ad. One opcode, the write
+   barrier, the purity rule, the vector decline.
+2. `del MY.Attr`.
+3. The deferred form that stores an expression, with whatever cycle rule that needs.
+4. Nested and subscripted targets — `MY.A.B`, `MY.L[0]` — which need a path expression on the left
+   and are a larger change than the other three together.
+
+Items 3 and 4 are the ones to leave out of a first version. They are not refinements of item 1; each
+is its own design.
+
+## What this does not settle
+
+Whether a transform's output is the mutated ad, a copy, or a record of the changes made. That
+question belongs to whatever calls the transform, and nothing above depends on the answer.
