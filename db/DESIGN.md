@@ -78,7 +78,7 @@ inline-wire format as a stable contract.
 ## Module 2 — client/server DB (planned: `dbrpc/`)
 
 A CEDAR-based client/server so remote processes use the same log. Depends on
-`collections`, `db`, and `github.com/bbockelm/cedar`.
+`collections`, `db`, and `github.com/htcondor/cedar`.
 
 ### Wire protocol (raw bytes, no ClassAd framing)
 

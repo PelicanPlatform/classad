@@ -3,7 +3,7 @@ package dbrpc
 import (
 	"context"
 
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/stream"
 )
 
 // cedarConn adapts a CEDAR stream to MsgConn: each dbrpc message is one CEDAR

@@ -3,10 +3,10 @@ module github.com/PelicanPlatform/classad/dbrpc
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.7.0
+	github.com/PelicanPlatform/classad v0.43.0
 	github.com/PelicanPlatform/classad/collections v0.7.0
 	github.com/PelicanPlatform/classad/db v0.7.1
-	github.com/bbockelm/cedar v0.7.1
+	github.com/htcondor/cedar v0.7.17
 )
 
 require (
