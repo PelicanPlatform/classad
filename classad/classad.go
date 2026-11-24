@@ -287,7 +287,9 @@ func (c *ClassAd) Equal(other *ClassAd) bool {
 	for i := range la {
 		left := la[i]
 		right := ra[i]
-		if normalizeName(left.Name) != normalizeName(right.Name) {
+		// foldCompare, not normalizeName on both sides: equality needs the comparison, not the
+		// lowered strings, and lowering allocated two per attribute pair.
+		if foldCompare(left.Name, right.Name) != 0 {
 			return false
 		}
 		if !exprEqual(left.Value, right.Value) {
@@ -298,9 +300,60 @@ func (c *ClassAd) Equal(other *ClassAd) bool {
 	return true
 }
 
-// normalizeName returns a case-insensitive key for attribute lookups.
+// normalizeName returns a case-insensitive key for attribute lookups. It allocates whenever the
+// name contains an uppercase letter, which for CamelCase ClassAd attributes is essentially always,
+// so it belongs only where the lowered string is KEPT -- as a map key the index stores. Code that
+// merely needs to find a name uses indexSlot, and code that merely needs to order two uses
+// foldCompare.
 func normalizeName(name string) string {
 	return strings.ToLower(name)
+}
+
+// maxFoldStack bounds the stack buffer indexSlot folds into. Attribute names are short ASCII
+// identifiers; a longer or non-ASCII one takes the allocating path, which is correct, just slower.
+const maxFoldStack = 128
+
+// indexSlot finds name in the attribute index and returns the slot its value is stored through,
+// without lowering the name.
+//
+// Attribute names are ASCII identifiers, so the name is case-folded into a stack buffer and the
+// map indexed with string(buf): the compiler special-cases a string([]byte) conversion used only
+// as a map key, so the probe does not allocate. A non-ASCII or over-long name falls back to the
+// allocating normalize, because Unicode lowercasing is not length-preserving (U+0130 lowers to two
+// runes) and cannot be done in place.
+//
+// Both hot paths go through here. Reads are the matchmaking one (an attribute reference resolved
+// per candidate, once per slot in a scan). Writes are the ingest one: a tailer replaying a job
+// queue inserts every attribute of every ad it decodes, and the overwhelmingly common write on a
+// live job NAMES AN ATTRIBUTE THE AD ALREADY HAS -- an update to MemoryUsage or
+// LastJobLeaseRenewal -- so the lowered string was allocated, used for one map probe, and thrown
+// away.
+func (c *ClassAd) indexSlot(name string) (*ast.Expr, bool) {
+	if c.index == nil {
+		return nil, false
+	}
+	if n := len(name); n > 0 && n <= maxFoldStack {
+		var buf [maxFoldStack]byte
+		b := buf[:n]
+		ascii := true
+		for i := 0; i < n; i++ {
+			ch := name[i]
+			if ch >= utf8.RuneSelf {
+				ascii = false
+				break
+			}
+			if 'A' <= ch && ch <= 'Z' {
+				ch += 'a' - 'A'
+			}
+			b[i] = ch
+		}
+		if ascii {
+			ptr, ok := c.index[string(b)]
+			return ptr, ok
+		}
+	}
+	ptr, ok := c.index[normalizeName(name)]
+	return ptr, ok
 }
 
 // foldCompare orders two attribute names exactly as their normalizeName forms compare,
@@ -716,16 +769,17 @@ func (c *ClassAd) marshalOld(includePrivate bool) string {
 // Insert inserts an attribute with an expression into the ClassAd.
 func (c *ClassAd) Insert(name string, expr ast.Expr) {
 	c.own()
-	normalized := normalizeName(name)
-	if ptr, ok := c.index[normalized]; ok {
+	if ptr, ok := c.indexSlot(name); ok {
 		// Replacing an existing attribute's VALUE, in place. The attribute set is
 		// unchanged, so the ad stays sorted. This is the overwhelmingly common write on a
 		// live job: an update to LastJobLeaseRenewal or MemoryUsage names an attribute the
-		// ad already has.
+		// ad already has -- and it needs no lowered name, only the slot.
 		*ptr = expr
 		return
 	}
-	c.insertNew(normalized, &ast.AttributeAssignment{Name: name, Value: expr})
+	// A name the ad does not have. Here the lowered string is KEPT, as the index's key, so
+	// normalizing it is the work and not an overhead.
+	c.insertNew(normalizeName(name), &ast.AttributeAssignment{Name: name, Value: expr})
 }
 
 // insertNew appends an attribute the owned ad c does not have. Appending is what
@@ -872,7 +926,7 @@ func (c *ClassAd) InsertListElement(name string, element *Expr) {
 		astExpr = element.internal()
 	}
 
-	if ptr, ok := c.index[normalizeName(name)]; ok {
+	if ptr, ok := c.indexSlot(name); ok {
 		if list, ok := (*ptr).(*ast.ListLiteral); ok {
 			// Replace the list node rather than append to it: the node may be shared
 			// with another ad (InsertExpr of a Lookup result) or a caller's Expr, and
@@ -920,36 +974,10 @@ func (c *ClassAd) lookupInternal(name string) ast.Expr {
 	if c.index == nil {
 		return c.scan(name)
 	}
-	// Attribute names are ASCII identifiers, so case-fold into a stack buffer and
-	// index the map with string(buf): the compiler special-cases a string([]byte)
-	// map key to avoid a heap allocation, eliminating the strings.ToLower that
-	// normalizeName would make on every lookup. This is the matchmaking read hot
-	// path (EvaluateAttr per Symmetry / rank, once per candidate). A non-ASCII or
-	// over-long name falls back to the allocating normalize.
-	const maxStack = 128
-	if n := len(name); n > 0 && n <= maxStack {
-		var buf [maxStack]byte
-		b := buf[:n]
-		ascii := true
-		for i := 0; i < n; i++ {
-			ch := name[i]
-			if ch >= 0x80 {
-				ascii = false
-				break
-			}
-			if 'A' <= ch && ch <= 'Z' {
-				ch += 'a' - 'A'
-			}
-			b[i] = ch
-		}
-		if ascii {
-			if ptr, ok := c.index[string(b)]; ok {
-				return *ptr
-			}
-			return nil
-		}
+	if ptr, ok := c.indexSlot(name); ok {
+		return *ptr
 	}
-	return c.lookupNorm(normalizeName(name))
+	return nil
 }
 
 // lookupNorm is lookupInternal for an already-normalized (lower-cased) name. Hot
@@ -1106,11 +1134,12 @@ func (c *ClassAd) Delete(name string) bool {
 	}
 	c.own()
 
-	normalized := normalizeName(name)
-	ptr, ok := c.index[normalized]
+	ptr, ok := c.indexSlot(name)
 	if !ok {
 		return false
 	}
+	// Found: the lowered name is now wanted, to drop the index entry by key.
+	normalized := normalizeName(name)
 
 	// Find the matching attribute by pointer equality on Value. Removing an element
 	// leaves the rest of c.ad in order, but a separate sorted copy is now stale.
