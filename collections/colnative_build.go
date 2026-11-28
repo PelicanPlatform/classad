@@ -965,6 +965,7 @@ func (c *Collection) recolumnarizeStale() int {
 		return 0
 	}
 	k := c.newStaleCheck(st)
+	capGen := computedCapability()
 	mp := c.beginMaint(MaintColumnarize, budget)
 	defer mp.finish()
 	total := 0
@@ -974,14 +975,43 @@ func (c *Collection) recolumnarizeStale() int {
 		}
 		sh.mu.Lock()
 		act := sh.act
-		var srcs []*segment
+		var srcs, maybe []*segment
 		for _, seg := range sh.segs {
-			if seg == nil || seg == act || seg.used == 0 || !seg.columnarized() || !k.segStale(seg) {
+			if seg == nil || seg == act || seg.used == 0 || !seg.columnarized() {
 				continue
 			}
-			srcs = append(srcs, seg)
+			if k.segStale(seg) {
+				srcs = append(srcs, seg)
+				continue
+			}
+			// Not stale by schema, hot tier or group set -- but possibly behind on COMPUTED CELLS,
+			// which no cheap comparison can see (computedBehind). Collected here and judged below,
+			// off this lock, because answering costs a read of the segment.
+			if !seg.colDamaged.Load() && seg.computedChecked.Load() != capGen {
+				maybe = append(maybe, seg)
+			}
 		}
 		sh.mu.Unlock()
+		// The computed-cell sweep. Bounded to a budget's worth of CHECKS per pass, separately from
+		// the rewrites: a pass that found nothing would otherwise read every segment of the archive
+		// to say so. Each segment that comes back current is marked against this committed state, so
+		// the archive is swept once per state rather than re-read on every pass; a segment that is
+		// behind is left unmarked and rewritten, here or on a later pass.
+		for checks := 0; checks < len(maybe) && checks < budget; checks++ {
+			if c.maintStopping() {
+				break
+			}
+			seg := maybe[checks]
+			cs := seg.colblk.Load()
+			if cs == nil {
+				continue
+			}
+			if cs.computedBehind() {
+				srcs = append(srcs, seg)
+			} else {
+				seg.computedChecked.Store(capGen)
+			}
+		}
 		for _, src := range srcs {
 			// Between segments, not within one: see ColumnarizeSealed.
 			if total >= budget || c.maintStopping() {

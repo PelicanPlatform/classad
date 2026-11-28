@@ -213,6 +213,13 @@ type segment struct {
 	// no group selection, for one). Without it such a segment reads stale on every maintenance pass
 	// and is rewritten again each time for nothing. Process-local on purpose: a restart retries once.
 	convergeTried atomic.Pointer[schemaScanState]
+	// computedChecked records the computed-cell capability this segment was last checked against
+	// for cells it could now carry but does not (colSegment.computedBehind). Keyed by capability
+	// rather than by committed state, because WIDENING what a computed value may contain changes
+	// neither the schema nor the hot tier nor the group set: keyed by state, a segment checked
+	// before the widening would never be looked at again, which is the whole bug. Process-local
+	// like convergeTried, so a restart sweeps once.
+	computedChecked atomic.Uint64
 	// dictUnusable is set when this segment holds an attribute dictionary record that cannot be
 	// used: it failed its checksum, or recovery stopped at damage before reaching it. Every record
 	// in the segment is keyed by that dictionary, so reads fail rather than resolve ids through

@@ -1127,6 +1127,137 @@ func (b *columnarBlock) heldUncomputed(idx int, id uint32, bc *blockCache) int {
 	return v
 }
 
+// computedCapability is a fingerprint of what this build may put in a computed value: the names a
+// computed expression may call and the operators it may use. It changes exactly when that set does,
+// which is the event a columnarized payload has no other way to notice -- widening it leaves the
+// schema, the hot tier and the group set identical, so no ordinary staleness check moves.
+//
+// Recomputed per maintenance pass rather than cached, so a build that varies the set (a test, or a
+// future runtime policy) is not pinned to whatever it was at init.
+func computedCapability() uint64 {
+	names := make([]string, 0, len(pureFuncs)+len(pureBinOps))
+	for k := range pureFuncs {
+		names = append(names, "f:"+k)
+	}
+	for k := range pureBinOps {
+		names = append(names, "o:"+k)
+	}
+	sort.Strings(names)
+	h := uint64(14695981039346656037) // FNV-1a 64 offset basis
+	for _, n := range names {
+		for i := 0; i < len(n); i++ {
+			h ^= uint64(n[i])
+			h *= 1099511628211
+		}
+		h ^= '\n'
+		h *= 1099511628211
+	}
+	if h == 0 {
+		h = 1 // 0 means "never checked"
+	}
+	return h
+}
+
+// computedBehindPerField and computedBehindTotal bound how many held cells one segment is evaluated
+// at to decide whether it is behind: enough that a field whose whole class of expressions became
+// computable is found at once, few enough that the sweep is a handful of record reads per segment
+// rather than a rewrite's worth. A segment where only a rare cell became computable is missed, and
+// stays missed until something else rewrites it -- the cost of being wrong that way is a slow read,
+// and the cost of the unbounded check is re-reading the archive on every maintenance pass.
+const (
+	computedBehindPerField = 4
+	computedBehindTotal    = 16
+)
+
+// blockAt returns the base block holding segment record index i, and i's offset within it.
+func (cs *colSegment) blockAt(i int) (*columnarBlock, int) {
+	base := 0
+	for _, b := range cs.blocks {
+		if b == nil {
+			return nil, 0
+		}
+		if i < base+b.n {
+			return b, i - base
+		}
+		base += b.n
+	}
+	return nil, 0
+}
+
+// computedBehind reports whether cs holds cells THIS build would compute into its columns but that
+// were left in the records -- the state a payload is in when the build that columnarized it could
+// not compute as much as this one can. Widening what a computed value may contain changes neither
+// the schema nor the hot tier nor the group set, so no ordinary staleness check moves; without this
+// one, such a payload is never rewritten and the widened capability reaches only data written after
+// it.
+//
+// The question is asked exactly as columnarization asks it -- the same cellComputer over the same
+// reassembled record -- so a segment this says is behind becomes not-behind once rewritten, and
+// convergence settles instead of rewriting the same segment forever.
+//
+// Answering costs a record read per cell sampled, which is why this is NOT part of payloadStale:
+// that runs for every segment on a reporting path and has to stay cheap. Convergence asks this
+// instead, for a bounded number of segments per pass.
+func (cs *colSegment) computedBehind() bool {
+	if cs == nil || cs.owner == nil || cs.arena == nil || cs.owner.intern == nil {
+		return false
+	}
+	c, seg := cs.owner, cs.arena
+	s := cs.schema()
+	if s == nil {
+		return false
+	}
+	h := cs.held()
+	if h == nil || !h.ok {
+		return false // the remnants could not be read: assume nothing, rewrite nothing
+	}
+	cc := newCellComputer(c)
+	if cc == nil {
+		return false
+	}
+	total := 0
+	for idx := range s.fields {
+		id := s.fields[idx].id
+		perField := 0
+		for _, gk := range h.recs[id] {
+			if total >= computedBehindTotal || perField >= computedBehindPerField {
+				break
+			}
+			b, k := cs.blockAt(int(gk))
+			if b == nil {
+				break
+			}
+			if cb := b.computedBits(idx); cb != nil && testBit(cb, k) {
+				continue // the slot already holds a computed value
+			}
+			total++
+			perField++
+			iw, err := c.recordWire(seg, cs.offAt(int(gk)))
+			if err != nil {
+				continue
+			}
+			// A persistent collection's records store NAMES; the id-keyed walk cells() does sees
+			// nothing in one, so every ad would look empty and no segment would ever be behind.
+			if c.inline {
+				in, ok := c.recordToInterned(nil, iw)
+				if !ok {
+					continue
+				}
+				iw = in
+			}
+			for _, cell := range cc.cells(iw, s) {
+				if cell.idx == idx {
+					return true
+				}
+			}
+		}
+		if total >= computedBehindTotal {
+			break
+		}
+	}
+	return false
+}
+
 // heldValueNode evaluates schema field fieldID of record k, which holds it in the record uncomputed,
 // returning the value as a literal node when that is exactly the scan's value (see above). The caller
 // has the segment pinned, as for heldAt, and has already decided the record is visible.
