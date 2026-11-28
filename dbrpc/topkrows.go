@@ -83,7 +83,7 @@ func (c *Client) TopKRowsPerGroupTable(ctx context.Context, table, constraint st
 		}
 		return b
 	}
-	_, ch, strm, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return nil, err
 	}

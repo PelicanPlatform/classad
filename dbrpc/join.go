@@ -784,7 +784,7 @@ func (c *Client) joinWire(ctx context.Context, jr JoinRequest, redact bool, yiel
 		return err
 	}
 	wantStats := c.wantJoinStats(rep)
-	_, ch, strm, err := c.callStream(joinFrameOp(jr, o, layout, true, redact, wantStats))
+	_, ch, strm, err := c.callStream(ctx, joinFrameOp(jr, o, layout, true, redact, wantStats))
 	if err != nil {
 		return err
 	}

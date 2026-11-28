@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 10
+const ProtocolVersion = 11
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -230,6 +230,15 @@ const (
 	// need not carry the copy, and a client that assumed otherwise would have its statement
 	// refused as malformed rather than as unimplemented.
 	FeatInsertRows Feature = "insertrows"
+
+	// FeatFrameExt is the request extension block: a server with it reads the op byte's
+	// extension bit and strips the trailer it marks (see frameext.go). Postdates
+	// advertisement, so silence is a no -- and it must be, because an older server reads
+	// a flagged op byte as an opcode it does not know and refuses the request.
+	//
+	// Unlike every other feature here it names no operation. It is what lets a client
+	// attach per-request metadata, such as a trace context, to any of them.
+	FeatFrameExt Feature = "frameext"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -274,6 +283,7 @@ var serverFeatures = []Feature{
 	FeatInsertRows,
 	FeatJoinBand,
 	FeatTopKRows,
+	FeatFrameExt,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar

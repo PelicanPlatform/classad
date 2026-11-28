@@ -407,7 +407,7 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 // ScanStats trailer if the server sends one (opArchiveAggregateStats, or opArchiveAggregateNamed
 // asked for one).
 func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, form aggSpecForm, typed bool, stats *collections.ScanStats) ([]AggRow, error) {
-	_, frames, strm, err := c.callStream(build)
+	_, frames, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return nil, err
 	}

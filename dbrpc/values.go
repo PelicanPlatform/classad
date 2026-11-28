@@ -344,7 +344,7 @@ func (c *Client) QueryValuesStreamOpts(ctx context.Context, table, constraint st
 		}
 		return b
 	}
-	_, ch, strm, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return err
 	}
