@@ -92,7 +92,7 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 		}
 		return putAggSpecs(b, aggs, form)
 	}
-	_, frames, strm, err := c.callStream(build)
+	_, frames, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +175,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 		}
 		return putAggSpecs(b, aggs, form)
 	}
-	_, frames, strm, err := c.callStream(build)
+	_, frames, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return nil, err
 	}

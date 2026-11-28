@@ -364,7 +364,7 @@ func TestQueryValuesRefusesUnknownFlags(t *testing.T) {
 		b = putI32(b, 1)
 		return putStr(b, "ClusterId")
 	}
-	_, ch, _, err := c.callStream(build)
+	_, ch, _, err := c.callStream(context.Background(), build)
 	if err != nil {
 		t.Fatal(err)
 	}

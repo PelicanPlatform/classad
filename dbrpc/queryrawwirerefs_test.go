@@ -388,7 +388,7 @@ func TestQueryRawWireUnknownFlagIsRefused(t *testing.T) {
 			b = putI32(b, 1)            // nattrs
 			return putStr(b, "Req")
 		}
-		_, ch, strm, err := c.callStream(build)
+		_, ch, strm, err := c.callStream(context.Background(), build)
 		if err != nil {
 			return err
 		}

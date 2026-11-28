@@ -904,6 +904,50 @@ func (o op) String() string {
 		return "ArchiveAggregateTyped"
 	case opJoinAgg:
 		return "JoinAggregate"
+	case opAggregateFiltered:
+		return "AggregateFiltered"
+	case opArchiveAggregateFiltered:
+		return "ArchiveAggregateFiltered"
+	case opArchiveAggregateStats:
+		return "ArchiveAggregateStats"
+	case opArchiveAppend:
+		return "ArchiveAppend"
+	case opArchiveCreate:
+		return "ArchiveCreate"
+	case opArchiveList:
+		return "ArchiveList"
+	case opArchiveQuery:
+		return "ArchiveQuery"
+	case opArchiveRotate:
+		return "ArchiveRotate"
+	case opAttrTypes:
+		return "AttrTypes"
+	case opJoinBand:
+		return "JoinBand"
+	case opJoinBandExplain:
+		return "JoinBandExplain"
+	case opJoinBandWire:
+		return "JoinBandWire"
+	case opQueryRawProj:
+		return "QueryRawProj"
+	case opQueryRawProjRefsStats:
+		return "QueryRawProjRefsStats"
+	case opQueryRawProjSeq:
+		return "QueryRawProjSeq"
+	case opRestore:
+		return "Restore"
+	case opRestoreChunk:
+		return "RestoreChunk"
+	case opRestoreEnd:
+		return "RestoreEnd"
+	case opSnapshot:
+		return "Snapshot"
+	case opTopK:
+		return "TopK"
+	case opTopKRows:
+		return "TopKRows"
+	case opTopKStats:
+		return "TopKStats"
 	}
 	return "op(unknown)"
 }
@@ -969,7 +1013,7 @@ func frameOp(frame []byte) (op, bool) {
 	if len(frame) < 9 {
 		return 0, false
 	}
-	return op(frame[8]), true
+	return op(frame[8] &^ opExtFlag), true
 }
 
 func putBytes(b, v []byte) []byte {
@@ -1074,15 +1118,34 @@ func (r *reader) uvarint() uint64 {
 func (r *reader) str() string { return string(r.bytesRef()) }
 func (r *reader) fail()       { r.err = errShort }
 
-// reqHeader / respHeader parse the fixed prefixes.
+// reqHeader / respHeader parse the fixed prefixes. reqHeader also removes a request's
+// extension block, so body is the same whether or not the request carried one.
 func reqHeader(frame []byte) (reqID uint64, o op, body *reader, ok bool) {
+	reqID, o, body, _, ok = reqHeaderExt(frame)
+	return reqID, o, body, ok
+}
+
+// reqHeaderExt is reqHeader returning the extension block too. ok is false only when the
+// frame is too short to name a request; a malformed extension block leaves ok true, with
+// ext.malformed set and an empty body, because the request can still be answered.
+func reqHeaderExt(frame []byte) (reqID uint64, o op, body *reader, ext frameExt, ok bool) {
 	r := &reader{b: frame}
 	reqID = r.u64()
-	o = op(r.u8())
+	raw := r.u8()
 	if r.err != nil {
-		return 0, 0, nil, false
+		return 0, 0, nil, frameExt{}, false
 	}
-	return reqID, o, r, true
+	o = op(raw &^ opExtFlag)
+	if raw&opExtFlag != 0 {
+		b, e, eok := splitExt(r.b)
+		if !eok {
+			r.b = nil
+			return reqID, o, r, frameExt{malformed: true}, true
+		}
+		r.b = b
+		ext = e
+	}
+	return reqID, o, r, ext, true
 }
 
 // respHeader parses a response frame header. reqID is returned for symmetry with reqHeader

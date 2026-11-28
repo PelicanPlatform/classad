@@ -594,7 +594,7 @@ func (c *Client) queryRawWireStream(ctx context.Context, o op, flags uint32, tab
 		}
 		return b
 	}
-	_, ch, strm, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return err
 	}

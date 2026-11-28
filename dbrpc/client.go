@@ -52,6 +52,12 @@ type Client struct {
 	// (TCP backpressure when the server stops reading), or the server+return wait --
 	// without this package depending on any metrics library. Must not block.
 	Observer func(CallStats)
+
+	// traceFn, set by WithTraceContext, reports the caller's trace context for a request.
+	// sendExt is whether to call it at all: a trace function was given AND the peer
+	// advertised the extension block. Both are fixed at construction.
+	traceFn func(context.Context) (TraceContext, bool)
+	sendExt bool
 }
 
 // CallStats is the per-call timing breakdown delivered to Client.Observer. The three
@@ -89,6 +95,7 @@ func NewClient(conn MsgConn, opts ...ClientOption) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.sendExt = c.traceFn != nil && c.SupportsNewer(FeatFrameExt)
 	go c.readLoop()
 	return c
 }
@@ -163,7 +170,7 @@ func (c *Client) Close() error { return c.conn.Close() }
 // is no implicit timeout -- the deadline is exactly whatever ctx carries.
 func (c *Client) callCtx(ctx context.Context, build func(reqID uint64) []byte) (int32, *reader, error) {
 	id := c.nextReq.Add(1)
-	ch, st, err := c.sendIDTimed(id, build, false)
+	ch, st, err := c.sendIDTimed(ctx, id, build, false)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -200,9 +207,9 @@ func (c *Client) cancelPending(id uint64) {
 // callStream issues a streaming request; the returned channel yields each result
 // frame and is closed at the stream's end (or on connection failure). The reqID is
 // returned so the caller can cancel a long-lived stream (opWatchStop).
-func (c *Client) callStream(build func(reqID uint64) []byte) (uint64, <-chan []byte, *pending, error) {
+func (c *Client) callStream(ctx context.Context, build func(reqID uint64) []byte) (uint64, <-chan []byte, *pending, error) {
 	id := c.nextReq.Add(1)
-	ch, err := c.sendID(id, build, true)
+	ch, err := c.sendID(ctx, id, build, true)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -224,8 +231,8 @@ func (c *Client) streamEnd(p *pending) error {
 	return p.broken
 }
 
-func (c *Client) sendID(id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, error) {
-	ch, _, err := c.sendIDTimed(id, build, stream)
+func (c *Client) sendID(ctx context.Context, id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, error) {
+	ch, _, err := c.sendIDTimed(ctx, id, build, stream)
 	return ch, err
 }
 
@@ -233,7 +240,10 @@ func (c *Client) sendID(id uint64, build func(reqID uint64) []byte, stream bool)
 // into the returned CallStats. callCtx completes it with the response wait and hands it to
 // the Observer; other callers ignore it. The timing reads are unconditional but trivial
 // (two time.Now calls), so there is no fast path to branch on.
-func (c *Client) sendIDTimed(id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, CallStats, error) {
+//
+// ctx is the caller's: it is consulted only for the trace context to attach (see
+// WithTraceContext), never for cancellation, which the callers handle.
+func (c *Client) sendIDTimed(ctx context.Context, id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, CallStats, error) {
 	bufSize := 1
 	if stream {
 		bufSize = 256
@@ -250,6 +260,9 @@ func (c *Client) sendIDTimed(id uint64, build func(reqID uint64) []byte, stream 
 	// Serialize the actual send: the CEDAR stream is single-writer (shared frame buffer
 	// + AES-GCM nonce), so concurrent multiplexed calls must not interleave WriteMsg.
 	frame := build(id)
+	if c.sendExt {
+		frame = c.attachExt(ctx, frame)
+	}
 	var st CallStats
 	if o, ok := frameOp(frame); ok {
 		st.Op = uint8(o)
@@ -268,6 +281,32 @@ func (c *Client) sendIDTimed(id uint64, build func(reqID uint64) []byte, stream 
 		return nil, st, err
 	}
 	return ch, st, nil
+}
+
+// attachExt appends the request's extension block to frame, when there is anything to
+// put in one. Today that is the caller's trace context, sent only when it is valid and
+// sampled, so an unsampled request leaves here unchanged.
+//
+// Some requests are never extended (see untracedOp), and neither is a frame too close to the
+// transport's message limit (see maxExtendedFrame).
+func (c *Client) attachExt(ctx context.Context, frame []byte) []byte {
+	o, ok := frameOp(frame)
+	if !ok || untracedOp(o) || len(frame) > maxExtendedFrame {
+		return frame
+	}
+	t, ok := c.traceFn(ctx)
+	if !ok || !t.IsValid() || !t.Sampled() {
+		return frame
+	}
+	return appendTraceExt(frame, t)
+}
+
+// untracedOp reports the requests a client never attaches a trace context to. Restore
+// uploads are handled inline in the server's read loop, outside the dispatch path where a
+// trace context is used. A watch lasts as long as its subscription, which can be the life
+// of the process, so a span for it would stay open, and held in the tracer, that long.
+func untracedOp(o op) bool {
+	return isRestoreOp(o) || o == opWatch || o == opWatchWire
 }
 
 // ErrBadRequest is the server's stBadReq: the request was malformed -- which is also how
@@ -514,7 +553,7 @@ func (t *Tx) NewClassAdBatchPipelined(ctx context.Context, items []AdKV, chunkSi
 		chunk := items[base:end]
 		chunkBase := base
 		id := t.c.nextReq.Add(1)
-		ch, err := t.c.sendID(id, func(id uint64) []byte {
+		ch, err := t.c.sendID(ctx, id, func(id uint64) []byte {
 			return t.newAdBatchFrame(id, chunk)
 		}, false)
 		if err != nil {
@@ -630,7 +669,7 @@ func (t *Tx) LookupClassAd(ctx context.Context, key string) (string, bool, error
 // stream frame, and the pending entry is cleaned only when the server's stream
 // terminator arrives, so we keep reading (discarding) rather than orphaning it.
 func (c *Client) streamCtx(ctx context.Context, build func(id uint64) []byte) ([]string, error) {
-	_, ch, strm, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return nil, err
 	}
@@ -705,7 +744,7 @@ func (c *Client) streamEachCursor(ctx context.Context, build func(id uint64) []b
 // onTrailer may be nil, and a trailer of any other kind is ignored, so a stream that is sent
 // one it did not ask for simply drops it.
 func (c *Client) streamEachTrailer(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, trailer int32, onTrailer func(*reader)) error {
-	_, ch, strm, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(ctx, build)
 	if err != nil {
 		return err
 	}
@@ -815,7 +854,7 @@ func (c *Client) Ordered(ctx context.Context, index int, partition string) ([]Or
 
 // OrderedTable streams one partition of an ordered index in the named table.
 func (c *Client) OrderedTable(ctx context.Context, table string, index int, partition string) ([]OrderedRow, error) {
-	_, frames, strm, err := c.callStream(func(id uint64) []byte {
+	_, frames, strm, err := c.callStream(ctx, func(id uint64) []byte {
 		return putStr(putI32(putStr(req(id, opOrdered), table), int32(index)), partition)
 	})
 	if err != nil {
@@ -910,7 +949,7 @@ func (c *Client) watchStop(id uint64, frames <-chan []byte) func() {
 
 // WatchTable streams changes to the named table.
 func (c *Client) WatchTable(ctx context.Context, table string, cursor []byte) (<-chan WatchEvent, func(), error) {
-	id, frames, _, err := c.callStream(func(rid uint64) []byte {
+	id, frames, _, err := c.callStream(ctx, func(rid uint64) []byte {
 		return putBytes(putStr(req(rid, opWatch), table), cursor)
 	})
 	if err != nil {

@@ -288,6 +288,25 @@ type ServeOptions struct {
 	// slow-query exemplar can say WHO ran the expensive query. Never used for access
 	// control -- that is ReadOnly/IncludePrivate/Privileged.
 	Peer string
+
+	// TraceRequest, if set, is called at the start of each request that arrived with a
+	// trace context (see WithTraceContext), so the embedder can record the request as a
+	// span under the caller's. It is not called for a request without one, which is
+	// every request the caller did not sample.
+	//
+	// ctx carries the trace context (TraceContextFromContext). The returned function, if
+	// non-nil, is called when the handler returns, after its last frame is written.
+	//
+	// The hook does not choose the handler's context. Handlers read their context's
+	// cancellation as the connection closing and stop without replying, so a context the
+	// hook could cancel on its own would leave the client waiting for an answer that
+	// never comes.
+	//
+	// Restore uploads are handled inline in the read loop and are never traced.
+	//
+	// Called from request goroutines concurrently; it must be safe for that and must not
+	// block.
+	TraceRequest func(ctx context.Context, req TracedRequest) func()
 }
 
 // QueryLog is one observed query, passed to ServeOptions.QueryLog.
@@ -706,8 +725,12 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 		}
 		// Restore-upload frames are handled inline (synchronously) so their chunks are
 		// spooled in receive order; every other op dispatches concurrently.
-		if reqID, o, body, ok := reqHeader(frame); ok && isRestoreOp(o) {
-			sc.handleRestore(reqID, o, body)
+		if reqID, o, body, ext, ok := reqHeaderExt(frame); ok && isRestoreOp(o) {
+			if ext.malformed {
+				sc.write(respBad(reqID))
+			} else {
+				sc.handleRestore(reqID, o, body)
+			}
 			s.endRequest()
 			continue
 		}
@@ -769,12 +792,24 @@ type serverConn struct {
 }
 
 func (sc *serverConn) dispatch(frame []byte) {
-	reqID, o, body, ok := reqHeader(frame)
+	reqID, o, body, ext, ok := reqHeaderExt(frame)
 	if !ok {
 		return // unparseable header: cannot even address a response
 	}
 	if o.recoverable() {
 		defer sc.containPanic(reqID, o)
+	}
+	if ext.malformed {
+		sc.write(respBad(reqID))
+		return
+	}
+	ctx := sc.ctx
+	if ext.hasTrace {
+		var done func()
+		ctx, done = sc.traceRequest(ctx, o, ext.trace)
+		if done != nil {
+			defer done()
+		}
 	}
 	if h := dispatchHook.Load(); h != nil {
 		(*h)(o)
@@ -792,37 +827,37 @@ func (sc *serverConn) dispatch(frame []byte) {
 	priv := sc.opts.IncludePrivate
 	switch o {
 	case opQuery:
-		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQuery(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryAsOf:
-		sc.s.streamQueryAsOf(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryAsOf(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRaw:
-		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryRaw(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProj:
-		sc.s.streamQueryRawProject(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryRawProject(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProjSeq:
-		sc.s.streamQueryRawProjectSeq(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryRawProjectSeq(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProjRefs:
-		sc.s.streamQueryRawProjectRefs(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryRawProjectRefs(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProjRefsStats:
-		sc.s.streamQueryRawProjectRefsStats(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryRawProjectRefsStats(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTopK:
-		sc.s.streamTopK(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamTopK(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTopKStats:
-		sc.s.streamTopKStats(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamTopKStats(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawWire:
-		sc.s.streamQueryRawWire(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryRawWire(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawWireOpts:
-		sc.s.streamQueryRawWireOpts(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryRawWireOpts(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opJoin:
-		sc.s.streamJoin(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
+		sc.s.streamJoin(ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinWire:
-		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
+		sc.s.streamJoinWire(ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinChain:
-		sc.s.streamJoin(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
+		sc.s.streamJoin(ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinChainWire:
-		sc.s.streamJoinWire(sc.ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
+		sc.s.streamJoinWire(ctx, reqID, body, priv, joinOpLayout(o), sc.write, sc.qlog)
 	case opJoinAgg:
-		sc.s.streamJoinAggregate(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamJoinAggregate(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opJoinExplain:
 		sc.write(sc.s.explainJoin(reqID, body, priv, joinOpLayout(o)))
 	case opJoinChainExplain:
@@ -831,13 +866,13 @@ func (sc *serverConn) dispatch(frame []byte) {
 	// build does not define is refused before any of it is interpreted as a plan.
 	case opJoinBand:
 		if l, ok := readJoinLayout(body, layoutBand); ok {
-			sc.s.streamJoin(sc.ctx, reqID, body, priv, l, sc.write, sc.qlog)
+			sc.s.streamJoin(ctx, reqID, body, priv, l, sc.write, sc.qlog)
 		} else {
 			sc.write(respBad(reqID))
 		}
 	case opJoinBandWire:
 		if l, ok := readJoinLayout(body, layoutBand); ok {
-			sc.s.streamJoinWire(sc.ctx, reqID, body, priv, l, sc.write, sc.qlog)
+			sc.s.streamJoinWire(ctx, reqID, body, priv, l, sc.write, sc.qlog)
 		} else {
 			sc.write(respBad(reqID))
 		}
@@ -848,25 +883,25 @@ func (sc *serverConn) dispatch(frame []byte) {
 			sc.write(respBad(reqID))
 		}
 	case opQueryValues:
-		sc.s.streamQueryValues(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryValues(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchSorted:
-		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamMatchSorted(ctx, reqID, body, priv, sc.write)
 	case opOrdered:
-		sc.s.streamOrdered(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamOrdered(ctx, reqID, body, priv, sc.write)
 	case opAggregate:
-		sc.s.streamAggregate(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamAggregate(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opAggregateFiltered:
-		sc.s.streamAggregateFiltered(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamAggregateFiltered(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opAggregateBucketed:
-		sc.s.streamAggregateBucketed(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamAggregateBucketed(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opAggregateNamed:
-		sc.s.streamAggregateNamed(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamAggregateNamed(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opAggregateTyped:
-		sc.s.streamAggregateTyped(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamAggregateTyped(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTopKRows:
-		sc.s.streamTopKRows(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamTopKRows(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchTables:
-		sc.s.streamMatchTables(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamMatchTables(ctx, reqID, body, priv, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body, false)
 	case opWatchWire:
@@ -890,21 +925,33 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opSetPrimaryKey:
 		sc.s.serveSetPrimaryKey(reqID, body, sc.write)
 	case opInsertSelect:
-		sc.s.serveInsertSelect(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.serveInsertSelect(ctx, reqID, body, priv, sc.write)
 	case opInsertRows:
-		sc.s.serveInsertRows(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.serveInsertRows(ctx, reqID, body, priv, sc.write)
 	case opQueryKeys:
-		sc.s.streamQueryKeys(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamQueryKeys(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTxnQuery:
-		sc.s.streamTxnQuery(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamTxnQuery(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTxnQueryKeys:
-		sc.s.streamTxnQueryKeys(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+		sc.s.streamTxnQueryKeys(ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
 	default:
 		sc.write(sc.s.handle(sc, reqID, o, body, priv, sc.opts.Privileged))
 	}
+}
+
+// traceRequest puts a request's trace context on its context and gives the embedder's
+// TraceRequest hook, if any, the chance to start a span under it. The context it returns
+// differs from ctx by that value alone, so it is cancelled exactly when ctx is.
+func (sc *serverConn) traceRequest(ctx context.Context, o op, t TraceContext) (context.Context, func()) {
+	ctx = ContextWithTraceContext(ctx, t)
+	h := sc.opts.TraceRequest
+	if h == nil {
+		return ctx, nil
+	}
+	return ctx, h(ctx, TracedRequest{Op: o.String(), Peer: sc.opts.Peer, Trace: t})
 }
 
 // cancelled reports whether ctx is done -- checked in streaming loops so a long

@@ -95,7 +95,7 @@ func (c *Client) joinAggregate(ctx context.Context, jr JoinAggRequest, rep *Join
 		return nil, err
 	}
 	nGroup, nAgg := len(jr.Spec.GroupCols), len(jr.Spec.Aggs)
-	_, frames, strm, err := c.callStream(joinAggFrame(jr, layout, wantStats))
+	_, frames, strm, err := c.callStream(ctx, joinAggFrame(jr, layout, wantStats))
 	if err != nil {
 		return nil, err
 	}
