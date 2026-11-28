@@ -80,6 +80,8 @@ An embedder using OpenTelemetry passes a three-line adapter over `trace.SpanCont
 
 `TraceContextFromContext` has the same signature as `fn`, so a process that both serves and calls dbrpc (a hub forwarding to spokes) can forward an incoming context with `WithTraceContext(dbrpc.TraceContextFromContext)` and no tracing library at all.
 
+A frame larger than 1 MiB − 4 KiB is never extended: CEDAR refuses a message over 1 MiB, and an advisory entry must not be what pushes a request over. Bulk writes already cut their frames at that size. Locating the trailer costs the same at any size: the transport delivers the whole message as one buffer, and the server reads its last two bytes.
+
 Two kinds of request are never extended. Restore uploads (`opRestore`, `opRestoreChunk`, `opRestoreEnd`) are handled inline in the server's read loop, outside the dispatch path where the hook runs. Watches (`opWatch`, `opWatchWire`) last as long as their subscription, often the life of the process, and a span held open that long is held in the tracer that long too.
 
 ## Server API

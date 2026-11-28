@@ -287,10 +287,11 @@ func (c *Client) sendIDTimed(ctx context.Context, id uint64, build func(reqID ui
 // put in one. Today that is the caller's trace context, sent only when it is valid and
 // sampled, so an unsampled request leaves here unchanged.
 //
-// Some requests are never extended; see untracedOp.
+// Some requests are never extended (see untracedOp), and neither is a frame too close to the
+// transport's message limit (see maxExtendedFrame).
 func (c *Client) attachExt(ctx context.Context, frame []byte) []byte {
 	o, ok := frameOp(frame)
-	if !ok || untracedOp(o) {
+	if !ok || untracedOp(o) || len(frame) > maxExtendedFrame {
 		return frame
 	}
 	t, ok := c.traceFn(ctx)

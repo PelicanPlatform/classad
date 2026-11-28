@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/htcondor/cedar/stream"
 )
 
 func sampledTrace() TraceContext {
@@ -346,6 +347,24 @@ func TestUntracedOpsNeverExtended(t *testing.T) {
 	}
 	if got := c.attachExt(context.Background(), req(1, opBegin)); got[8]&opExtFlag == 0 {
 		t.Error("Begin was not extended")
+	}
+}
+
+// A frame near the transport's message limit is sent without its extension: the extension
+// is advisory, so it must not be what makes CEDAR refuse a request that fits without it.
+func TestFrameNearMessageLimitNotExtended(t *testing.T) {
+	c := &Client{traceFn: func(context.Context) (TraceContext, bool) { return sampledTrace(), true }}
+	build := func(size int) []byte {
+		f := req(1, opQueryRaw)
+		return append(f, make([]byte, size-len(f))...)
+	}
+	if got := c.attachExt(context.Background(), build(maxExtendedFrame)); got[8]&opExtFlag == 0 {
+		t.Error("a frame at maxExtendedFrame was not extended")
+	} else if len(got) > stream.MaxMessageSize {
+		t.Errorf("extended frame is %d bytes, over the CEDAR limit of %d", len(got), stream.MaxMessageSize)
+	}
+	if got := c.attachExt(context.Background(), build(maxExtendedFrame+1)); got[8]&opExtFlag != 0 {
+		t.Error("a frame over maxExtendedFrame was extended")
 	}
 }
 

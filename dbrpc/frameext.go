@@ -40,6 +40,13 @@ const (
 
 const traceContextLen = 16 + 8 + 1
 
+// maxExtendedFrame is the largest request frame the client will extend. The CEDAR stream
+// refuses a message over its MaxMessageSize (1 MiB), and an extension is advisory, so it
+// must never be what pushes a request over. A frame this size or smaller has at least 4 KiB
+// of room left, the same margin bulk writes keep (maxBatchFrameBytes); a larger one is sent
+// without its extension.
+const maxExtendedFrame = maxBatchFrameBytes
+
 // TraceContext is a W3C trace context in binary form: the identity of the caller's span,
 // carried with a request so the server's work can be recorded as its child.
 //
