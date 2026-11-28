@@ -134,6 +134,13 @@ type SchemaScanInfo struct {
 	// tier or group set and are still to be brought current -- the backlog a schema change leaves,
 	// which maintenance works through ColumnarSegmentBudget segments per pass. Such a segment reads
 	// correctly under its own schema; it is only not yet accelerated the new way.
+	//
+	// It does NOT count segments that are behind only on COMPUTED CELLS -- values this build could
+	// compute into their columns but whose payload was written by a build that could not (see
+	// colSegment.computedBehind). Deciding that costs a read of the segment, and this figure is
+	// reported for every segment on a path that has to stay cheap, so convergence asks that question
+	// itself for a bounded number of segments per pass instead. Such a backlog therefore clears
+	// without ever appearing here.
 	StaleSegments int `json:"staleSegments,omitempty"`
 	// BaseChanges is the base-schema change log, oldest first: each adoption of a different base
 	// schema, with the reason it was adopted and what moved.
