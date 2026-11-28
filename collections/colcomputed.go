@@ -1198,7 +1198,7 @@ func (cs *colSegment) blockAt(i int) (*columnarBlock, int) {
 // Answering costs a record read per cell sampled, which is why this is NOT part of payloadStale:
 // that runs for every segment on a reporting path and has to stay cheap. Convergence asks this
 // instead, for a bounded number of segments per pass.
-func (cs *colSegment) computedBehind(bc *blockCache) bool {
+func (cs *colSegment) computedBehind() bool {
 	if cs == nil || cs.owner == nil || cs.arena == nil || cs.owner.intern == nil {
 		return false
 	}

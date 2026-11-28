@@ -27,9 +27,9 @@ func withoutPureFunc(t *testing.T, name string, fn func()) {
 // changed is whether those expression cells can be computed.
 func computedConvergeAd(i int) string {
 	if i%20 < 19 { // 95% literal: Need clears the 0.90 presence floor without the computed cells
-		return fmt.Sprintf(`[ Key=%d; Base=%d; Need=%d; Pad="%s" ]`, i, 100+i%50, 200+i%100, padStr(i))
+		return fmt.Sprintf(`[ Key=%d; Base=%d; Need=%d; Pad=%q ]`, i, 100+i%50, 200+i%100, padStr(i))
 	}
-	return fmt.Sprintf(`[ Key=%d; Base=%d; Need=max({200, (Base * 2)}); Pad="%s" ]`, i, 100+i%50, padStr(i))
+	return fmt.Sprintf(`[ Key=%d; Base=%d; Need=max({200, (Base * 2)}); Pad=%q ]`, i, 100+i%50, padStr(i))
 }
 
 func padStr(i int) string {

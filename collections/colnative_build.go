@@ -1006,7 +1006,7 @@ func (c *Collection) recolumnarizeStale() int {
 			if cs == nil {
 				continue
 			}
-			if cs.computedBehind(st.cache) {
+			if cs.computedBehind() {
 				srcs = append(srcs, seg)
 			} else {
 				seg.computedChecked.Store(capGen)
